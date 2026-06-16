@@ -659,6 +659,17 @@ struct JxlEncoderStruct {
   // the bytes to the output_byte_queue.
   jxl::Status ProcessOneEnqueuedInput();
 
+ private:
+  // Prepares initial headers (signature, ICC, JPEG metadata, jbrd box).
+  // Returns header_bytes for frame processing.
+  jxl::Status PrepareHeaders(jxl::PaddedBytes& header_bytes);
+
+  // Processes a single queued frame or fast lossless frame.
+  jxl::Status ProcessFrame(const jxl::PaddedBytes& header_bytes);
+
+  // Processes a single queued box.
+  jxl::Status ProcessBox();
+
   bool MustUseContainer() const {
     return use_container || (codestream_level != 5 && codestream_level != -1) ||
            store_jpeg_metadata || use_boxes;

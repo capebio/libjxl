@@ -734,356 +734,368 @@ void FastLosslessRunnerAdapter(void* void_ticket, void* opaque,
 
 }  // namespace
 
-jxl::Status JxlEncoderStruct::ProcessOneEnqueuedInput() {
-  jxl::PaddedBytes header_bytes{&memory_manager};
+jxl::Status JxlEncoderStruct::PrepareHeaders(jxl::PaddedBytes& header_bytes) {
+  if (wrote_bytes) {
+    return jxl::OkStatus();
+  }
 
   jxl::JxlEncoderQueuedInput& input = input_queue[0];
 
-  // TODO(lode): split this into 3 functions: for adding the signature and other
-  // initial headers (jbrd, ...), one for adding frame, and one for adding user
-  // box.
-
-  if (!wrote_bytes) {
-    // First time encoding any data, verify the level 5 vs level 10 settings
-    std::string level_message;
-    int required_level = VerifyLevelSettings(this, &level_message);
-    // Only level 5 and 10 are defined, and the function can return -1 to
-    // indicate full incompatibility.
-    JXL_ENSURE(required_level == -1 || required_level == 5 ||
-               required_level == 10);
-    // codestream_level == -1 means auto-set to the required level
-    if (codestream_level == -1) codestream_level = required_level;
-    if (codestream_level == 5 && required_level != 5) {
-      // If the required level is 10, return error rather than automatically
-      // setting the level to 10, to avoid inadvertently creating a level 10
-      // JXL file while intending to target a level 5 decoder.
-      return JXL_API_ERROR(
-          this, JXL_ENC_ERR_API_USAGE, "%s",
-          ("Codestream level verification for level 5 failed: " + level_message)
-              .c_str());
-    }
-    if (required_level == -1) {
-      return JXL_API_ERROR(
-          this, JXL_ENC_ERR_API_USAGE, "%s",
-          ("Codestream level verification for level 10 failed: " +
-           level_message)
-              .c_str());
-    }
-    jxl::AuxOut* aux_out =
-        input.frame ? input.frame->option_values.aux_out : nullptr;
-    jxl::BitWriter writer{&memory_manager};
-    if (!WriteCodestreamHeaders(&metadata, &writer, aux_out)) {
+  // First time encoding any data, verify the level 5 vs level 10 settings
+  std::string level_message;
+  int required_level = VerifyLevelSettings(this, &level_message);
+  // Only level 5 and 10 are defined, and the function can return -1 to
+  // indicate full incompatibility.
+  JXL_ENSURE(required_level == -1 || required_level == 5 ||
+             required_level == 10);
+  // codestream_level == -1 means auto-set to the required level
+  if (codestream_level == -1) codestream_level = required_level;
+  if (codestream_level == 5 && required_level != 5) {
+    // If the required level is 10, return error rather than automatically
+    // setting the level to 10, to avoid inadvertently creating a level 10
+    // JXL file while intending to target a level 5 decoder.
+    return JXL_API_ERROR(
+        this, JXL_ENC_ERR_API_USAGE, "%s",
+        ("Codestream level verification for level 5 failed: " + level_message)
+            .c_str());
+  }
+  if (required_level == -1) {
+    return JXL_API_ERROR(
+        this, JXL_ENC_ERR_API_USAGE, "%s",
+        ("Codestream level verification for level 10 failed: " +
+         level_message)
+            .c_str());
+  }
+  jxl::AuxOut* aux_out =
+      input.frame ? input.frame->option_values.aux_out : nullptr;
+  jxl::BitWriter writer{&memory_manager};
+  if (!WriteCodestreamHeaders(&metadata, &writer, aux_out)) {
+    return JXL_API_ERROR(this, JXL_ENC_ERR_GENERIC,
+                         "Failed to write codestream header");
+  }
+  // Only send ICC (at least several hundred bytes) if fields aren't enough.
+  if (metadata.m.color_encoding.WantICC()) {
+    if (!jxl::WriteICC(
+            jxl::Span<const uint8_t>(metadata.m.color_encoding.ICC()),
+            &writer, jxl::LayerType::Header, aux_out)) {
       return JXL_API_ERROR(this, JXL_ENC_ERR_GENERIC,
-                           "Failed to write codestream header");
+                           "Failed to write ICC profile");
     }
-    // Only send ICC (at least several hundred bytes) if fields aren't enough.
-    if (metadata.m.color_encoding.WantICC()) {
-      if (!jxl::WriteICC(
-              jxl::Span<const uint8_t>(metadata.m.color_encoding.ICC()),
-              &writer, jxl::LayerType::Header, aux_out)) {
-        return JXL_API_ERROR(this, JXL_ENC_ERR_GENERIC,
-                             "Failed to write ICC profile");
-      }
+  }
+  // TODO(lode): preview should be added here if a preview image is added
+
+  JXL_RETURN_IF_ERROR(
+      writer.WithMaxBits(8, jxl::LayerType::Header, aux_out, [&] {
+        writer.ZeroPadToByte();
+        return true;
+      }));
+
+  header_bytes = std::move(writer).TakeBytes();
+
+  // Not actually the end of frame, but the end of metadata/ICC, but helps
+  // the next frame to start here for indexing purposes.
+  codestream_bytes_written_end_of_frame += header_bytes.size();
+
+  if (MustUseContainer()) {
+    // Add "JXL " and ftyp box.
+    {
+      JXL_ASSIGN_OR_RETURN(auto buffer, output_processor.GetBuffer(
+                                            jxl::kContainerHeader.size()));
+      JXL_RETURN_IF_ERROR(buffer.append(jxl::kContainerHeader));
     }
-    // TODO(lode): preview should be added here if a preview image is added
+    if (codestream_level != 5) {
+      // Add jxll box directly after the ftyp box to indicate the codestream
+      // level.
+      JXL_ASSIGN_OR_RETURN(auto buffer, output_processor.GetBuffer(
+                                            jxl::kLevelBoxHeader.size() + 1));
+      JXL_RETURN_IF_ERROR(buffer.append(jxl::kLevelBoxHeader));
+      uint8_t cl = codestream_level;
+      JXL_RETURN_IF_ERROR(buffer.append(&cl, 1));
+    }
 
-    JXL_RETURN_IF_ERROR(
-        writer.WithMaxBits(8, jxl::LayerType::Header, aux_out, [&] {
-          writer.ZeroPadToByte();
-          return true;
-        }));
+    // Whether to write the basic info and color profile header of the
+    // codestream into an early separate jxlp box, so that it comes before
+    // metadata or jpeg reconstruction boxes. In theory this could simply
+    // always be done, but there's no reason to add an extra box with box
+    // header overhead if the codestream will already come immediately after
+    // the signature and level boxes.
+    bool partial_header =
+        store_jpeg_metadata ||
+        (use_boxes && (!input.frame && !input.fast_lossless_frame));
 
-    header_bytes = std::move(writer).TakeBytes();
-
-    // Not actually the end of frame, but the end of metadata/ICC, but helps
-    // the next frame to start here for indexing purposes.
-    codestream_bytes_written_end_of_frame += header_bytes.size();
-
-    if (MustUseContainer()) {
-      // Add "JXL " and ftyp box.
-      {
-        JXL_ASSIGN_OR_RETURN(auto buffer, output_processor.GetBuffer(
-                                              jxl::kContainerHeader.size()));
-        JXL_RETURN_IF_ERROR(buffer.append(jxl::kContainerHeader));
-      }
-      if (codestream_level != 5) {
-        // Add jxll box directly after the ftyp box to indicate the codestream
-        // level.
-        JXL_ASSIGN_OR_RETURN(auto buffer, output_processor.GetBuffer(
-                                              jxl::kLevelBoxHeader.size() + 1));
-        JXL_RETURN_IF_ERROR(buffer.append(jxl::kLevelBoxHeader));
-        uint8_t cl = codestream_level;
-        JXL_RETURN_IF_ERROR(buffer.append(&cl, 1));
-      }
-
-      // Whether to write the basic info and color profile header of the
-      // codestream into an early separate jxlp box, so that it comes before
-      // metadata or jpeg reconstruction boxes. In theory this could simply
-      // always be done, but there's no reason to add an extra box with box
-      // header overhead if the codestream will already come immediately after
-      // the signature and level boxes.
-      bool partial_header =
-          store_jpeg_metadata ||
-          (use_boxes && (!input.frame && !input.fast_lossless_frame));
-
-      if (partial_header) {
-        auto write_box = [&]() -> jxl::Status {
-          JXL_ASSIGN_OR_RETURN(
-              auto buffer, output_processor.GetBuffer(header_bytes.size() + 4));
-          JXL_RETURN_IF_ERROR(
-              WriteJxlpBoxCounter(jxlp_counter++, /*last=*/false, buffer));
-          JXL_RETURN_IF_ERROR(buffer.append(header_bytes));
-          return jxl::OkStatus();
-        };
-        JXL_RETURN_IF_ERROR(AppendBox(jxl::MakeBoxType("jxlp"),
-                                      /*unbounded=*/false,
-                                      header_bytes.size() + 4, write_box));
-        header_bytes.clear();
-      }
-
-      if (store_jpeg_metadata && !jpeg_metadata.empty()) {
+    if (partial_header) {
+      auto write_box = [&]() -> jxl::Status {
+        JXL_ASSIGN_OR_RETURN(
+            auto buffer, output_processor.GetBuffer(header_bytes.size() + 4));
         JXL_RETURN_IF_ERROR(
-            AppendBoxWithContents(jxl::MakeBoxType("jbrd"), jpeg_metadata));
+            WriteJxlpBoxCounter(jxlp_counter++, /*last=*/false, buffer));
+        JXL_RETURN_IF_ERROR(buffer.append(header_bytes));
+        return jxl::OkStatus();
+      };
+      JXL_RETURN_IF_ERROR(AppendBox(jxl::MakeBoxType("jxlp"),
+                                    /*unbounded=*/false,
+                                    header_bytes.size() + 4, write_box));
+      header_bytes.clear();
+    }
+
+    if (store_jpeg_metadata && !jpeg_metadata.empty()) {
+      JXL_RETURN_IF_ERROR(
+          AppendBoxWithContents(jxl::MakeBoxType("jbrd"), jpeg_metadata));
+    }
+  }
+  wrote_bytes = true;
+  return jxl::OkStatus();
+}
+
+jxl::Status JxlEncoderStruct::ProcessFrame(
+    const jxl::PaddedBytes& header_bytes) {
+  jxl::JxlEncoderQueuedInput& input = input_queue[0];
+
+  jxl::MemoryManagerUniquePtr<jxl::JxlEncoderQueuedFrame> input_frame =
+      std::move(input.frame);
+  jxl::FJXLFrameUniquePtr fast_lossless_frame =
+      std::move(input.fast_lossless_frame);
+  input_queue.erase(input_queue.begin());
+  num_queued_frames--;
+  if (input_frame) {
+    for (unsigned idx = 0; idx < input_frame->ec_initialized.size(); idx++) {
+      if (!input_frame->ec_initialized[idx]) {
+        return JXL_API_ERROR(this, JXL_ENC_ERR_API_USAGE,
+                             "Extra channel %u is not initialized", idx);
       }
     }
-    wrote_bytes = true;
+
+    // TODO(zond): If the input queue is empty and the frames_closed is true,
+    // then mark this frame as the last.
+
+    // TODO(zond): Handle progressive mode like EncodeFile does it.
+    // TODO(zond): Handle animation like EncodeFile does it, by checking if
+    //             JxlEncoderCloseFrames has been called and if the frame
+    //             queue is empty (to see if it's the last animation frame).
+
+    if (metadata.m.xyb_encoded) {
+      input_frame->option_values.cparams.color_transform =
+          jxl::ColorTransform::kXYB;
+    } else {
+      // TODO(zond): Figure out when to use kYCbCr instead.
+      input_frame->option_values.cparams.color_transform =
+          jxl::ColorTransform::kNone;
+    }
   }
 
-  JXL_RETURN_IF_ERROR(output_processor.SetFinalizedPosition());
+  uint32_t duration;
+  uint32_t timecode;
+  if (input_frame && metadata.m.have_animation) {
+    duration = input_frame->option_values.header.duration;
+    timecode = input_frame->option_values.header.timecode;
+  } else {
+    // If have_animation is false, the encoder should ignore the duration and
+    // timecode values. However, assigning them to ib will cause the encoder
+    // to write an invalid frame header that can't be decoded so ensure
+    // they're the default value of 0 here.
+    duration = 0;
+    timecode = 0;
+  }
 
-  // Choose frame or box processing: exactly one of the two unique pointers (box
-  // or frame) in the input queue item is non-null.
-  if (input.frame || input.fast_lossless_frame) {
-    jxl::MemoryManagerUniquePtr<jxl::JxlEncoderQueuedFrame> input_frame =
-        std::move(input.frame);
-    jxl::FJXLFrameUniquePtr fast_lossless_frame =
-        std::move(input.fast_lossless_frame);
-    input_queue.erase(input_queue.begin());
-    num_queued_frames--;
-    if (input_frame) {
-      for (unsigned idx = 0; idx < input_frame->ec_initialized.size(); idx++) {
-        if (!input_frame->ec_initialized[idx]) {
-          return JXL_API_ERROR(this, JXL_ENC_ERR_API_USAGE,
-                               "Extra channel %u is not initialized", idx);
-        }
-      }
+  const bool last_frame = frames_closed && (num_queued_frames == 0);
 
-      // TODO(zond): If the input queue is empty and the frames_closed is true,
-      // then mark this frame as the last.
+  uint32_t max_bits_per_sample = metadata.m.bit_depth.bits_per_sample;
+  for (const auto& info : metadata.m.extra_channel_info) {
+    max_bits_per_sample =
+        std::max(max_bits_per_sample, info.bit_depth.bits_per_sample);
+  }
+  // Heuristic upper bound on how many bits a single pixel in a single channel
+  // can use.
+  uint32_t bits_per_channels_estimate =
+      std::max(24u, max_bits_per_sample + 3);
+  size_t upper_bound_on_compressed_size_bits =
+      metadata.xsize() * metadata.ysize() *
+      (metadata.m.color_encoding.Channels() + metadata.m.num_extra_channels) *
+      bits_per_channels_estimate;
+  // Add a 1MB = 0x100000 for an heuristic upper bound on small sizes.
+  size_t upper_bound_on_compressed_size_bytes =
+      0x100000 + (upper_bound_on_compressed_size_bits >> 3);
+  bool use_large_box = upper_bound_on_compressed_size_bytes >=
+                       jxl::kLargeBoxContentSizeThreshold;
+  size_t box_header_size =
+      use_large_box ? jxl::kLargeBoxHeaderSize : jxl::kSmallBoxHeaderSize;
 
-      // TODO(zond): Handle progressive mode like EncodeFile does it.
-      // TODO(zond): Handle animation like EncodeFile does it, by checking if
-      //             JxlEncoderCloseFrames has been called and if the frame
-      //             queue is empty (to see if it's the last animation frame).
+  const size_t frame_start_pos = output_processor.CurrentPosition();
+  if (MustUseContainer()) {
+    if (!last_frame || jxlp_counter > 0) {
+      // If this is the last frame and no jxlp boxes were used yet, it's
+      // slightly more efficient to write a jxlc box since it has 4 bytes
+      // less overhead.
+      box_header_size += 4;  // jxlp_counter field
+    }
+    JXL_RETURN_IF_ERROR(
+        output_processor.Seek(frame_start_pos + box_header_size));
+  }
+  const size_t frame_codestream_start = output_processor.CurrentPosition();
 
-      if (metadata.m.xyb_encoded) {
-        input_frame->option_values.cparams.color_transform =
-            jxl::ColorTransform::kXYB;
-      } else {
-        // TODO(zond): Figure out when to use kYCbCr instead.
-        input_frame->option_values.cparams.color_transform =
-            jxl::ColorTransform::kNone;
-      }
+  JXL_RETURN_IF_ERROR(AppendData(output_processor, header_bytes));
+
+  if (input_frame) {
+    frame_index_box.AddFrame(codestream_bytes_written_end_of_frame, duration,
+                             input_frame->option_values.frame_index_box);
+
+    size_t save_as_reference =
+        input_frame->option_values.header.layer_info.save_as_reference;
+    if (save_as_reference >= 3) {
+      return JXL_API_ERROR(
+          this, JXL_ENC_ERR_API_USAGE,
+          "Cannot use save_as_reference values >=3 (found: %d)",
+          static_cast<int>(save_as_reference));
     }
 
-    uint32_t duration;
-    uint32_t timecode;
-    if (input_frame && metadata.m.have_animation) {
-      duration = input_frame->option_values.header.duration;
-      timecode = input_frame->option_values.header.timecode;
-    } else {
-      // If have_animation is false, the encoder should ignore the duration and
-      // timecode values. However, assigning them to ib will cause the encoder
-      // to write an invalid frame header that can't be decoded so ensure
-      // they're the default value of 0 here.
-      duration = 0;
-      timecode = 0;
+    jxl::FrameInfo frame_info;
+    frame_info.is_last = last_frame;
+    frame_info.save_as_reference = save_as_reference;
+    frame_info.source =
+        input_frame->option_values.header.layer_info.blend_info.source;
+    frame_info.clamp = FROM_JXL_BOOL(
+        input_frame->option_values.header.layer_info.blend_info.clamp);
+    frame_info.alpha_channel =
+        input_frame->option_values.header.layer_info.blend_info.alpha;
+    frame_info.extra_channel_blending_info.resize(
+        metadata.m.num_extra_channels);
+    // If extra channel blend info has not been set, use the blend mode from
+    // the layer_info.
+    JxlBlendInfo default_blend_info =
+        input_frame->option_values.header.layer_info.blend_info;
+    for (size_t i = 0; i < metadata.m.num_extra_channels; ++i) {
+      auto& to = frame_info.extra_channel_blending_info[i];
+      const auto& from =
+          i < input_frame->option_values.extra_channel_blend_info.size()
+              ? input_frame->option_values.extra_channel_blend_info[i]
+              : default_blend_info;
+      to.mode = static_cast<jxl::BlendMode>(from.blendmode);
+      to.source = from.source;
+      to.alpha_channel = from.alpha;
+      to.clamp = (from.clamp != 0);
     }
+    frame_info.origin.x0 =
+        input_frame->option_values.header.layer_info.crop_x0;
+    frame_info.origin.y0 =
+        input_frame->option_values.header.layer_info.crop_y0;
+    frame_info.blendmode = static_cast<jxl::BlendMode>(
+        input_frame->option_values.header.layer_info.blend_info.blendmode);
+    frame_info.blend =
+        input_frame->option_values.header.layer_info.blend_info.blendmode !=
+        JXL_BLEND_REPLACE;
+    frame_info.image_bit_depth = input_frame->option_values.image_bit_depth;
+    frame_info.duration = duration;
+    frame_info.timecode = timecode;
+    frame_info.name = input_frame->option_values.frame_name;
 
-    const bool last_frame = frames_closed && (num_queued_frames == 0);
-
-    uint32_t max_bits_per_sample = metadata.m.bit_depth.bits_per_sample;
-    for (const auto& info : metadata.m.extra_channel_info) {
-      max_bits_per_sample =
-          std::max(max_bits_per_sample, info.bit_depth.bits_per_sample);
-    }
-    // Heuristic upper bound on how many bits a single pixel in a single channel
-    // can use.
-    uint32_t bits_per_channels_estimate =
-        std::max(24u, max_bits_per_sample + 3);
-    size_t upper_bound_on_compressed_size_bits =
-        metadata.xsize() * metadata.ysize() *
-        (metadata.m.color_encoding.Channels() + metadata.m.num_extra_channels) *
-        bits_per_channels_estimate;
-    // Add a 1MB = 0x100000 for an heuristic upper bound on small sizes.
-    size_t upper_bound_on_compressed_size_bytes =
-        0x100000 + (upper_bound_on_compressed_size_bits >> 3);
-    bool use_large_box = upper_bound_on_compressed_size_bytes >=
-                         jxl::kLargeBoxContentSizeThreshold;
-    size_t box_header_size =
-        use_large_box ? jxl::kLargeBoxHeaderSize : jxl::kSmallBoxHeaderSize;
-
-    const size_t frame_start_pos = output_processor.CurrentPosition();
-    if (MustUseContainer()) {
-      if (!last_frame || jxlp_counter > 0) {
-        // If this is the last frame and no jxlp boxes were used yet, it's
-        // slightly more efficient to write a jxlc box since it has 4 bytes
-        // less overhead.
-        box_header_size += 4;  // jxlp_counter field
-      }
-      JXL_RETURN_IF_ERROR(
-          output_processor.Seek(frame_start_pos + box_header_size));
-    }
-    const size_t frame_codestream_start = output_processor.CurrentPosition();
-
-    JXL_RETURN_IF_ERROR(AppendData(output_processor, header_bytes));
-
-    if (input_frame) {
-      frame_index_box.AddFrame(codestream_bytes_written_end_of_frame, duration,
-                               input_frame->option_values.frame_index_box);
-
-      size_t save_as_reference =
-          input_frame->option_values.header.layer_info.save_as_reference;
-      if (save_as_reference >= 3) {
-        return JXL_API_ERROR(
-            this, JXL_ENC_ERR_API_USAGE,
-            "Cannot use save_as_reference values >=3 (found: %d)",
-            static_cast<int>(save_as_reference));
-      }
-
-      jxl::FrameInfo frame_info;
-      frame_info.is_last = last_frame;
-      frame_info.save_as_reference = save_as_reference;
-      frame_info.source =
-          input_frame->option_values.header.layer_info.blend_info.source;
-      frame_info.clamp = FROM_JXL_BOOL(
-          input_frame->option_values.header.layer_info.blend_info.clamp);
-      frame_info.alpha_channel =
-          input_frame->option_values.header.layer_info.blend_info.alpha;
-      frame_info.extra_channel_blending_info.resize(
-          metadata.m.num_extra_channels);
-      // If extra channel blend info has not been set, use the blend mode from
-      // the layer_info.
-      JxlBlendInfo default_blend_info =
-          input_frame->option_values.header.layer_info.blend_info;
-      for (size_t i = 0; i < metadata.m.num_extra_channels; ++i) {
-        auto& to = frame_info.extra_channel_blending_info[i];
-        const auto& from =
-            i < input_frame->option_values.extra_channel_blend_info.size()
-                ? input_frame->option_values.extra_channel_blend_info[i]
-                : default_blend_info;
-        to.mode = static_cast<jxl::BlendMode>(from.blendmode);
-        to.source = from.source;
-        to.alpha_channel = from.alpha;
-        to.clamp = (from.clamp != 0);
-      }
-      frame_info.origin.x0 =
-          input_frame->option_values.header.layer_info.crop_x0;
-      frame_info.origin.y0 =
-          input_frame->option_values.header.layer_info.crop_y0;
-      frame_info.blendmode = static_cast<jxl::BlendMode>(
-          input_frame->option_values.header.layer_info.blend_info.blendmode);
-      frame_info.blend =
-          input_frame->option_values.header.layer_info.blend_info.blendmode !=
-          JXL_BLEND_REPLACE;
-      frame_info.image_bit_depth = input_frame->option_values.image_bit_depth;
-      frame_info.duration = duration;
-      frame_info.timecode = timecode;
-      frame_info.name = input_frame->option_values.frame_name;
-
-      if (!jxl::EncodeFrame(&memory_manager, input_frame->option_values.cparams,
-                            frame_info, &metadata, input_frame->frame_data, cms,
-                            thread_pool.get(), &output_processor,
-                            input_frame->option_values.aux_out)) {
-        return JXL_API_ERROR(this, JXL_ENC_ERR_GENERIC,
-                             "Failed to encode frame");
-      }
-    } else {
-      JXL_ENSURE(fast_lossless_frame);
-      RunnerTicket ticket{thread_pool.get()};
-      bool ok = JxlFastLosslessProcessFrame(
-          fast_lossless_frame.get(), last_frame, &ticket,
-          &FastLosslessRunnerAdapter, &output_processor);
-      if (!ok || ticket.has_error) {
-        return JXL_API_ERROR(this, JXL_ENC_ERR_GENERIC,
-                             "Internal: JxlFastLosslessProcessFrame failed");
-      }
-    }
-
-    const size_t frame_codestream_end = output_processor.CurrentPosition();
-    const size_t frame_codestream_size =
-        frame_codestream_end - frame_codestream_start;
-
-    codestream_bytes_written_end_of_frame +=
-        frame_codestream_size - header_bytes.size();
-
-    if (MustUseContainer()) {
-      JXL_RETURN_IF_ERROR(output_processor.Seek(frame_start_pos));
-      std::vector<uint8_t> box_header(box_header_size);
-      if (!use_large_box &&
-          frame_codestream_size >= jxl::kLargeBoxContentSizeThreshold) {
-        // Assuming our upper bound estimate is correct, this should never
-        // happen.
-        return JXL_API_ERROR(
-            this, JXL_ENC_ERR_GENERIC,
-            "Box size was estimated to be small, but turned out to be large. "
-            "Please file this error in size estimation as a bug.");
-      }
-      if (last_frame && jxlp_counter == 0) {
-        size_t n = jxl::WriteBoxHeader(
-            jxl::MakeBoxType("jxlc"), frame_codestream_size,
-            /*unbounded=*/false, use_large_box, box_header.data());
-        JXL_ENSURE(n == box_header_size);
-      } else {
-        size_t n = jxl::WriteBoxHeader(
-            jxl::MakeBoxType("jxlp"), frame_codestream_size + 4,
-            /*unbounded=*/false, use_large_box, box_header.data());
-        JXL_ENSURE(n == box_header_size - 4);
-        WriteJxlpBoxCounter(jxlp_counter++, last_frame,
-                            &box_header[box_header_size - 4]);
-      }
-      JXL_RETURN_IF_ERROR(AppendData(output_processor, box_header));
-      JXL_ENSURE(output_processor.CurrentPosition() == frame_codestream_start);
-      JXL_RETURN_IF_ERROR(output_processor.Seek(frame_codestream_end));
-    }
-    JXL_RETURN_IF_ERROR(output_processor.SetFinalizedPosition());
-    if (input_frame) {
-      last_used_cparams = input_frame->option_values.cparams;
-    }
-    if (last_frame && frame_index_box.StoreFrameIndexBox()) {
-      std::vector<uint8_t> index_box_content;
-      // Enough buffer has been allocated, this function should never fail in
-      // writing.
-      JXL_ENSURE(EncodeFrameIndexBox(frame_index_box, index_box_content));
-      JXL_RETURN_IF_ERROR(AppendBoxWithContents(jxl::MakeBoxType("jxli"),
-                                                jxl::Bytes(index_box_content)));
+    if (!jxl::EncodeFrame(&memory_manager, input_frame->option_values.cparams,
+                          frame_info, &metadata, input_frame->frame_data, cms,
+                          thread_pool.get(), &output_processor,
+                          input_frame->option_values.aux_out)) {
+      return JXL_API_ERROR(this, JXL_ENC_ERR_GENERIC,
+                           "Failed to encode frame");
     }
   } else {
-    // Not a frame, so is a box instead
-    jxl::MemoryManagerUniquePtr<jxl::JxlEncoderQueuedBox> box =
-        std::move(input.box);
-    input_queue.erase(input_queue.begin());
-    num_queued_boxes--;
-
-    if (box->compress_box) {
-      jxl::PaddedBytes compressed(&memory_manager);
-      // Prepend the original box type in the brob box contents
-      JXL_RETURN_IF_ERROR(compressed.append(box->type));
-      if (JXL_ENC_SUCCESS !=
-          BrotliCompress((brotli_effort >= 0 ? brotli_effort : 4),
-                         box->contents.data(), box->contents.size(),
-                         &compressed)) {
-        return JXL_API_ERROR(this, JXL_ENC_ERR_GENERIC,
-                             "Brotli compression for brob box failed");
-      }
-
-      JXL_RETURN_IF_ERROR(
-          AppendBoxWithContents(jxl::MakeBoxType("brob"), compressed));
-    } else {
-      JXL_RETURN_IF_ERROR(AppendBoxWithContents(box->type, box->contents));
+    JXL_ENSURE(fast_lossless_frame);
+    RunnerTicket ticket{thread_pool.get()};
+    bool ok = JxlFastLosslessProcessFrame(
+        fast_lossless_frame.get(), last_frame, &ticket,
+        &FastLosslessRunnerAdapter, &output_processor);
+    if (!ok || ticket.has_error) {
+      return JXL_API_ERROR(this, JXL_ENC_ERR_GENERIC,
+                           "Internal: JxlFastLosslessProcessFrame failed");
     }
   }
 
+  const size_t frame_codestream_end = output_processor.CurrentPosition();
+  const size_t frame_codestream_size =
+      frame_codestream_end - frame_codestream_start;
+
+  codestream_bytes_written_end_of_frame +=
+      frame_codestream_size - header_bytes.size();
+
+  if (MustUseContainer()) {
+    JXL_RETURN_IF_ERROR(output_processor.Seek(frame_start_pos));
+    std::vector<uint8_t> box_header(box_header_size);
+    if (!use_large_box &&
+        frame_codestream_size >= jxl::kLargeBoxContentSizeThreshold) {
+      // Assuming our upper bound estimate is correct, this should never
+      // happen.
+      return JXL_API_ERROR(
+          this, JXL_ENC_ERR_GENERIC,
+          "Box size was estimated to be small, but turned out to be large. "
+          "Please file this error in size estimation as a bug.");
+    }
+    if (last_frame && jxlp_counter == 0) {
+      size_t n = jxl::WriteBoxHeader(
+          jxl::MakeBoxType("jxlc"), frame_codestream_size,
+          /*unbounded=*/false, use_large_box, box_header.data());
+      JXL_ENSURE(n == box_header_size);
+    } else {
+      size_t n = jxl::WriteBoxHeader(
+          jxl::MakeBoxType("jxlp"), frame_codestream_size + 4,
+          /*unbounded=*/false, use_large_box, box_header.data());
+      JXL_ENSURE(n == box_header_size - 4);
+      WriteJxlpBoxCounter(jxlp_counter++, last_frame,
+                          &box_header[box_header_size - 4]);
+    }
+    JXL_RETURN_IF_ERROR(AppendData(output_processor, box_header));
+    JXL_ENSURE(output_processor.CurrentPosition() == frame_codestream_start);
+    JXL_RETURN_IF_ERROR(output_processor.Seek(frame_codestream_end));
+  }
+  JXL_RETURN_IF_ERROR(output_processor.SetFinalizedPosition());
+  if (input_frame) {
+    last_used_cparams = input_frame->option_values.cparams;
+  }
+  if (last_frame && frame_index_box.StoreFrameIndexBox()) {
+    std::vector<uint8_t> index_box_content;
+    // Enough buffer has been allocated, this function should never fail in
+    // writing.
+    JXL_ENSURE(EncodeFrameIndexBox(frame_index_box, index_box_content));
+    JXL_RETURN_IF_ERROR(AppendBoxWithContents(jxl::MakeBoxType("jxli"),
+                                              jxl::Bytes(index_box_content)));
+  }
+  return jxl::OkStatus();
+}
+
+jxl::Status JxlEncoderStruct::ProcessBox() {
+  jxl::JxlEncoderQueuedInput& input = input_queue[0];
+
+  jxl::MemoryManagerUniquePtr<jxl::JxlEncoderQueuedBox> box =
+      std::move(input.box);
+  input_queue.erase(input_queue.begin());
+  num_queued_boxes--;
+
+  if (box->compress_box) {
+    jxl::PaddedBytes compressed(&memory_manager);
+    // Prepend the original box type in the brob box contents
+    JXL_RETURN_IF_ERROR(compressed.append(box->type));
+    if (JXL_ENC_SUCCESS !=
+        BrotliCompress((brotli_effort >= 0 ? brotli_effort : 4),
+                       box->contents.data(), box->contents.size(),
+                       &compressed)) {
+      return JXL_API_ERROR(this, JXL_ENC_ERR_GENERIC,
+                           "Brotli compression for brob box failed");
+    }
+
+    JXL_RETURN_IF_ERROR(
+        AppendBoxWithContents(jxl::MakeBoxType("brob"), compressed));
+  } else {
+    JXL_RETURN_IF_ERROR(AppendBoxWithContents(box->type, box->contents));
+  }
+  return jxl::OkStatus();
+}
+
+jxl::Status JxlEncoderStruct::ProcessOneEnqueuedInput() {
+  jxl::PaddedBytes header_bytes{&memory_manager};
+  JXL_RETURN_IF_ERROR(PrepareHeaders(header_bytes));
+  JXL_RETURN_IF_ERROR(output_processor.SetFinalizedPosition());
+
+  if (input_queue[0].frame || input_queue[0].fast_lossless_frame) {
+    JXL_RETURN_IF_ERROR(ProcessFrame(header_bytes));
+  } else {
+    JXL_RETURN_IF_ERROR(ProcessBox());
+  }
   return jxl::OkStatus();
 }
 
