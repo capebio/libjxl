@@ -38,6 +38,9 @@
 #include "lib/jxl/padded_bytes.h"
 
 namespace jxl {
+// Forward declaration so friend class jxl::ProcessFrameTest (below) is valid
+// even when BUILD_TESTING=OFF and the test header is not included.
+class ProcessFrameTest;
 
 /* Frame index box 'jxli' will start with Varint() for
 NF: has type Varint(): number of frames listed in the index.
@@ -80,7 +83,7 @@ typedef struct JxlEncoderFrameIndexBoxStruct {
 
   int64_t NF() const { return entries.size(); }
   bool StoreFrameIndexBox() {
-    for (auto e : entries) {
+    for (const auto& e : entries) {
       if (e.to_be_indexed) {
         return true;
       }

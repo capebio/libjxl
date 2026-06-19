@@ -921,7 +921,8 @@ jxl::Status JxlEncoderStruct::ProcessFrame(
       use_large_box ? jxl::kLargeBoxHeaderSize : jxl::kSmallBoxHeaderSize;
 
   const size_t frame_start_pos = output_processor.CurrentPosition();
-  if (MustUseContainer()) {
+  const bool container_mode = MustUseContainer();  // cached; value is stable across ProcessFrame
+  if (container_mode) {
     if (!last_frame || jxlp_counter > 0) {
       // If this is the last frame and no jxlp boxes were used yet, it's
       // slightly more efficient to write a jxlc box since it has 4 bytes
@@ -986,7 +987,7 @@ jxl::Status JxlEncoderStruct::ProcessFrame(
     frame_info.image_bit_depth = input_frame->option_values.image_bit_depth;
     frame_info.duration = duration;
     frame_info.timecode = timecode;
-    frame_info.name = input_frame->option_values.frame_name;
+    frame_info.name = std::move(input_frame->option_values.frame_name);
 
     if (!jxl::EncodeFrame(&memory_manager, input_frame->option_values.cparams,
                           frame_info, &metadata, input_frame->frame_data, cms,
@@ -1014,9 +1015,11 @@ jxl::Status JxlEncoderStruct::ProcessFrame(
   codestream_bytes_written_end_of_frame +=
       frame_codestream_size - header_bytes.size();
 
-  if (MustUseContainer()) {
+  if (container_mode) {
     JXL_RETURN_IF_ERROR(output_processor.Seek(frame_start_pos));
-    std::vector<uint8_t> box_header(box_header_size);
+    // Stack buffer avoids one heap alloc per frame; 20B covers largest header
+    // (kLargeBoxHeaderSize=16 + 4-byte jxlp counter).
+    std::array<uint8_t, 20> box_header{};
     if (!use_large_box &&
         frame_codestream_size >= jxl::kLargeBoxContentSizeThreshold) {
       // Assuming our upper bound estimate is correct, this should never
@@ -1039,7 +1042,7 @@ jxl::Status JxlEncoderStruct::ProcessFrame(
       WriteJxlpBoxCounter(jxlp_counter++, last_frame,
                           &box_header[box_header_size - 4]);
     }
-    JXL_RETURN_IF_ERROR(AppendData(output_processor, box_header));
+    JXL_RETURN_IF_ERROR(AppendData(output_processor, jxl::Bytes(box_header.data(), box_header_size)));
     JXL_ENSURE(output_processor.CurrentPosition() == frame_codestream_start);
     JXL_RETURN_IF_ERROR(output_processor.Seek(frame_codestream_end));
   }
