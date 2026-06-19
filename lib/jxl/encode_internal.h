@@ -659,7 +659,7 @@ struct JxlEncoderStruct {
   // the bytes to the output_byte_queue.
   jxl::Status ProcessOneEnqueuedInput();
 
-  friend class ProcessFrameTest;  // Allow unit tests to access private methods
+  friend class jxl::ProcessFrameTest;  // Allow unit tests to access private methods
 
  private:
   // Prepares initial headers (signature, ICC, JPEG metadata, jbrd box).

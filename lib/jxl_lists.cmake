@@ -598,6 +598,7 @@ set(JPEGXL_INTERNAL_TESTS
   jxl/enc_linalg_test.cc
   jxl/enc_optimize_test.cc
   jxl/enc_photon_noise_test.cc
+  jxl/encode_process_frame_test.cc
   jxl/encode_test.cc
   jxl/entropy_coder_test.cc
   jxl/fast_math_test.cc

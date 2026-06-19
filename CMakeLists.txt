@@ -314,8 +314,10 @@ set(JPEGXL_COVERAGE_FLAGS)
 set(JPEGXL_COVERAGE_LINK_FLAGS)
 
 if (MSVC)
-  # TODO(janwas): add flags
   add_definitions(-D_CRT_SECURE_NO_WARNINGS)
+  if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(/O2 /Ob2)
+  endif()
 else ()
   # Global compiler flags for all targets here and in subdirectories.
   add_definitions(
