@@ -1902,6 +1902,7 @@ void RemoveUnusedHistograms(std::vector<uint8_t>& context_map,
                             EntropyEncodingData& codes) {
   std::vector<int> remap(256, -1);
   std::vector<uint8_t> inv_remap;
+  inv_remap.reserve(std::min(size_t(256), context_map.size()));
   for (uint8_t& context : context_map) {
     const uint8_t histo_ix = context;
     if (remap[histo_ix] == -1) {

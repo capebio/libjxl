@@ -103,6 +103,9 @@ Status EncodeContextMap(const std::vector<uint8_t>& context_map,
   }
   bool use_mtf = mtf_cost < ans_cost;
   // Rebuild token list.
+  // NOTE: BuildAndEncodeHistograms (above) takes tokens by non-const ref and
+  // may replace it with LZ77-encoded tokens (tokens = std::move(tokens_lz77)).
+  // Rebuild is required to restore clean, non-LZ77 tokens for the final encode.
   tokens[0].clear();
   for (size_t i = 0; i < transformed_symbols.size(); i++) {
     tokens[0].emplace_back(0,

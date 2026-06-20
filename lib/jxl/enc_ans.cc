@@ -942,6 +942,11 @@ void ApplyLZ77_RLE(const HistogramParams& params, size_t num_contexts,
   tokens_lz77.resize(tokens.size());
   std::vector<float> sym_cost;
   HybridUintConfig uint_config;
+  {
+    size_t max_sz = 0;
+    for (const auto& s : tokens) if (s.size() > max_sz) max_sz = s.size();
+    sym_cost.reserve(max_sz + 1);
+  }
   for (size_t stream = 0; stream < tokens.size(); stream++) {
     size_t distance_multiplier =
         params.image_widths.size() > stream ? params.image_widths[stream] : 0;
@@ -1282,6 +1287,11 @@ void ApplyLZ77_LZ77(const HistogramParams& params, size_t num_contexts,
   tokens_lz77.resize(tokens.size());
   HybridUintConfig uint_config;
   std::vector<float> sym_cost;
+  {
+    size_t max_sz = 0;
+    for (const auto& s : tokens) if (s.size() > max_sz) max_sz = s.size();
+    sym_cost.reserve(max_sz + 1);
+  }
   for (size_t stream = 0; stream < tokens.size(); stream++) {
     size_t distance_multiplier =
         params.image_widths.size() > stream ? params.image_widths[stream] : 0;
@@ -1391,6 +1401,11 @@ void ApplyLZ77_Optimal(const HistogramParams& params, size_t num_contexts,
   HybridUintConfig uint_config;
   std::vector<float> sym_cost;
   std::vector<uint32_t> dist_symbols;
+  {
+    size_t max_sz = 0;
+    for (const auto& s : tokens) if (s.size() > max_sz) max_sz = s.size();
+    sym_cost.reserve(max_sz + 1);
+  }
   for (size_t stream = 0; stream < tokens.size(); stream++) {
     size_t distance_multiplier =
         params.image_widths.size() > stream ? params.image_widths[stream] : 0;
