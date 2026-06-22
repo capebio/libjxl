@@ -37,7 +37,9 @@ enum class LayerType : uint8_t;
 struct ANSEncSymbolInfo {
   // ANS
   uint16_t freq_;
-  std::vector<uint16_t> reverse_map_;
+  // Non-owning view into the owning ANSEncHistogram::reverse_map_pool (a single
+  // per-histogram allocation, rather than one std::vector per symbol).
+  uint16_t* reverse_map_ = nullptr;
 #ifdef USE_MULT_BY_RECIPROCAL
   uint64_t ifreq_;
 #endif
@@ -93,8 +95,20 @@ struct SizeWriter {
   void Write(size_t num, size_t bits) { size += num; }
 };
 
+// One per clustered histogram: the per-symbol encoding info plus a single
+// backing buffer for all of that histogram's ANS reverse maps. Each
+// ANSEncSymbolInfo::reverse_map_ points into `reverse_map_pool`. Bundling the
+// pool with `info` keeps those pointers valid across the std::move()s in
+// RemoveUnusedHistograms — moving a vector preserves its data pointer. These
+// objects must only be moved, never copied: a copy would leave reverse_map_
+// dangling into the source's pool.
+struct ANSEncHistogram {
+  std::vector<ANSEncSymbolInfo> info;
+  std::vector<uint16_t> reverse_map_pool;
+};
+
 struct EntropyEncodingData {
-  std::vector<std::vector<ANSEncSymbolInfo>> encoding_info;
+  std::vector<ANSEncHistogram> encoding_info;
   bool use_prefix_code;
   std::vector<HybridUintConfig> uint_config;
   size_t log_alpha_size;

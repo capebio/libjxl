@@ -131,11 +131,22 @@ class ANSEncodingHistogram {
 
     // Here min 2 symbols
     ANSEncodingHistogram normalized = result;
+    // The initial (pre-quantization) target count of each bin does not depend
+    // on `shift`, but `RebalanceHistogram` runs once per shift. Hoist the
+    // shift-invariant rounding (a `round()` libcall per symbol) out of the
+    // per-shift loop and compute it once here.
+    const double norm = double{ANS_TAB_SIZE} / histo.total_count;
+    std::vector<ANSHistBin> base_counts(result.alphabet_size_);
+    for (size_t n = 0; n < result.alphabet_size_; ++n) {
+      ANSHistBin freq = histo.counts[n];
+      ANSHistBin count = std::max<ANSHistBin>(round(freq * norm), freq > 0);
+      base_counts[n] = std::min<ANSHistBin>(count, ANS_TAB_SIZE - 1);
+    }
     auto try_shift = [&](uint32_t shift) -> Status {
       // `shift = 12` and `shift = 11` are the same
       normalized.method_ = std::min(shift, ANS_LOG_TAB_SIZE - 1) + 1;
 
-      if (!normalized.RebalanceHistogram(histo)) {
+      if (!normalized.RebalanceHistogram(histo, base_counts)) {
         return JXL_FAILURE("Logic error: couldn't rebalance a histogram");
       }
       SizeWriter writer;
@@ -327,8 +338,11 @@ class ANSEncodingHistogram {
   }
 
   void ANSBuildInfoTable(const AliasTable::Entry* table, size_t log_alpha_size,
-                         ANSEncSymbolInfo* info) {
-    // Create valid alias table for empty streams
+                         ANSEncSymbolInfo* info, uint16_t* pool) {
+    // `pool` holds ANS_TAB_SIZE entries; partition it into per-symbol reverse
+    // maps by cumulative frequency (sum of all freqs == ANS_TAB_SIZE) instead
+    // of allocating one std::vector per symbol. Also handles empty streams.
+    size_t pool_pos = 0;
     for (size_t s = 0; s < std::max(size_t{1}, alphabet_size_); ++s) {
       const ANSHistBin freq = s == alphabet_size_ ? ANS_TAB_SIZE : counts_[s];
       info[s].freq_ = static_cast<uint16_t>(freq);
@@ -341,7 +355,8 @@ class ANSEncodingHistogram {
             1;  // Shouldn't matter (symbol shouldn't occur), but...
       }
 #endif
-      info[s].reverse_map_.resize(freq);
+      info[s].reverse_map_ = pool + pool_pos;
+      pool_pos += freq;
     }
     size_t log_entry_size = ANS_LOG_TAB_SIZE - log_alpha_size;
     size_t entry_size_minus_1 = (1 << log_entry_size) - 1;
@@ -413,7 +428,8 @@ class ANSEncodingHistogram {
   // arithmetic is integer besides initial approximation. Sum of `freq` and each
   // of `lg2[counts]` are supposed to be limited to `int32_t` range, so that the
   // sum of their products should not exceed `int64_t`.
-  bool RebalanceHistogram(const Histogram& histo) {
+  bool RebalanceHistogram(const Histogram& histo,
+                          const std::vector<ANSHistBin>& base_counts) {
     constexpr ANSHistBin table_size = ANS_TAB_SIZE;
     uint32_t shift = method_ - 1;
 
@@ -467,10 +483,9 @@ class ANSEncodingHistogram {
         max_freq = freq;
       }
 
-      double target = freq * norm;  // rounding
-      // Keep zeros and clamp nonzero freq counts to [1, table_size)
-      ANSHistBin count = std::max<ANSHistBin>(round(target), freq > 0);
-      count = std::min<ANSHistBin>(count, table_size - 1);
+      double target = freq * norm;  // used only for the `> 1.0` test below
+      // Shift-invariant rounding/clamping precomputed once in `ComputeBest`.
+      ANSHistBin count = base_counts[n];
       uint32_t step_log = SmallestIncrementLog(count, shift);
       ANSHistBin inc = 1 << step_log;
       count &= ~(inc - 1);
@@ -633,7 +648,7 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreANSEncodingData(
     JxlMemoryManager* memory_manager,
     HistogramParams::ANSHistogramStrategy ans_histogram_strategy,
     const Histogram& histogram, BitWriter* writer) {
-  ANSEncSymbolInfo* info = encoding_info.back().data();
+  ANSEncSymbolInfo* info = encoding_info.back().info.data();
   size_t size = histogram.alphabet_size();
   if (use_prefix_code) {
     size_t cost = 0;
@@ -679,7 +694,11 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreANSEncodingData(
 
   JXL_RETURN_IF_ERROR(
       InitAliasTable(normalized.Counts(), ANS_LOG_TAB_SIZE, log_alpha_size, a));
-  normalized.ANSBuildInfoTable(a, log_alpha_size, info);
+  // One backing allocation for all of this histogram's reverse maps, owned by
+  // the ANSEncHistogram so it travels with `info` on move.
+  std::vector<uint16_t>& reverse_map_pool = encoding_info.back().reverse_map_pool;
+  reverse_map_pool.assign(ANS_TAB_SIZE, 0);
+  normalized.ANSBuildInfoTable(a, log_alpha_size, info, reverse_map_pool.data());
   if (writer != nullptr) {
     // size_t start = writer->BitsWritten();
     JXL_RETURN_IF_ERROR(normalized.Encode(writer));
@@ -921,7 +940,7 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
   std::vector<Histogram> clustered_histograms;
   for (size_t i = 0; i < prev_histograms; ++i) {
     clustered_histograms.push_back(
-        HistogramFromSymbolInfo(encoding_info[i], use_prefix_code));
+        HistogramFromSymbolInfo(encoding_info[i].info, use_prefix_code));
   }
   size_t context_offset = context_map.size();
   context_map.resize(context_offset + builder.size());
@@ -991,7 +1010,7 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
   for (size_t c = prev_histograms; c < clustered_histograms.size(); ++c) {
     size_t alphabet_size = clustered_histograms[c].alphabet_size();
     encoding_info.emplace_back();
-    encoding_info.back().resize(alphabet_size);
+    encoding_info.back().info.resize(alphabet_size);
     BitWriter* histo_writer = writer;
     if (params.streaming_mode) {
       encoded_histograms.emplace_back(memory_manager);
@@ -1067,8 +1086,8 @@ Status EncodeHistograms(const EntropyEncodingData& codes, BitWriter* writer,
         }
         EncodeUintConfigs(codes.uint_config, writer, log_alpha_size);
         if (codes.use_prefix_code) {
-          for (const auto& info : codes.encoding_info) {
-            StoreVarLenUint16(info.size() - 1, writer);
+          for (const auto& eh : codes.encoding_info) {
+            StoreVarLenUint16(eh.info.size() - 1, writer);
           }
         }
         for (const auto& histo_writer : codes.encoded_histograms) {
@@ -1194,7 +1213,7 @@ StatusOr<size_t> BuildAndEncodeHistograms(
       static_assert(ANS_MAX_ALPHABET_SIZE <= ANS_TAB_SIZE,
                     "Alphabet does not fit table");
       codes->encoding_info.emplace_back();
-      codes->encoding_info.back().resize(alphabet_size);
+      codes->encoding_info.back().info.resize(alphabet_size);
       codes->encoded_histograms.emplace_back(memory_manager);
       BitWriter* histo_writer = &codes->encoded_histograms.back();
       JXL_RETURN_IF_ERROR(histo_writer->WithMaxBits(
@@ -1247,21 +1266,27 @@ size_t WriteTokens(const std::vector<Token>& tokens,
           .Encode(token.value, &tok, &nbits, &bits);
       tok += token.is_lz77_length ? codes.lz77.min_symbol : 0;
       // Combine two calls to the BitWriter. Equivalent to:
-      // writer->Write(codes.encoding_info[histo][tok].depth,
-      //               codes.encoding_info[histo][tok].bits);
+      // writer->Write(codes.encoding_info[histo].info[tok].depth,
+      //               codes.encoding_info[histo].info[tok].bits);
       // writer->Write(nbits, bits);
-      uint64_t data = codes.encoding_info[histo][tok].bits;
-      data |= static_cast<uint64_t>(bits)
-              << codes.encoding_info[histo][tok].depth;
-      writer->Write(codes.encoding_info[histo][tok].depth + nbits, data);
+      const ANSEncSymbolInfo& info = codes.encoding_info[histo].info[tok];
+      uint64_t data = info.bits;
+      data |= static_cast<uint64_t>(bits) << info.depth;
+      writer->Write(info.depth + nbits, data);
       num_extra_bits += nbits;
     }
     return num_extra_bits;
   }
   std::vector<uint64_t> out;
   std::vector<uint8_t> out_nbits;
-  out.reserve(tokens.size());
-  out_nbits.reserve(tokens.size());
+  // A flush only happens once the 56-bit accumulator fills, so the number of
+  // entries is far below one-per-token (a single token contributes <= 16 ANS
+  // bits + <= 31 extra bits). Reserve a realistic fraction instead of
+  // `tokens.size()` (which over-reserves ~3-5x); std::vector still grows
+  // correctly in the rare high-entropy case.
+  const size_t out_reserve = tokens.size() / 3 + 64;
+  out.reserve(out_reserve);
+  out_nbits.reserve(out_reserve);
   uint64_t allbits = 0;
   size_t numallbits = 0;
   // Writes in *reversed* order.
@@ -1281,15 +1306,17 @@ size_t WriteTokens(const std::vector<Token>& tokens,
   const int end = tokens.size();
   ANSCoder ans;
   if (codes.lz77.enabled || codes.context_map.size() > 1) {
+    // Hoist loop-invariant base pointers out of the hot reverse loop.
+    const uint8_t* JXL_RESTRICT cmap = codes.context_map.data() + context_offset;
+    const HybridUintConfig* JXL_RESTRICT ucfg = codes.uint_config.data();
     for (int i = end - 1; i >= 0; --i) {
       const Token token = tokens[i];
-      const uint8_t histo = codes.context_map[context_offset + token.context];
+      const uint8_t histo = cmap[token.context];
       uint32_t tok, nbits, bits;
-      (token.is_lz77_length ? codes.lz77.length_uint_config
-                            : codes.uint_config[histo])
-          .Encode(tokens[i].value, &tok, &nbits, &bits);
+      (token.is_lz77_length ? codes.lz77.length_uint_config : ucfg[histo])
+          .Encode(token.value, &tok, &nbits, &bits);
       tok += token.is_lz77_length ? codes.lz77.min_symbol : 0;
-      const ANSEncSymbolInfo& info = codes.encoding_info[histo][tok];
+      const ANSEncSymbolInfo& info = codes.encoding_info[histo].info[tok];
       JXL_DASSERT(info.freq_ > 0);
       // Extra bits first as this is reversed.
       addbits(bits, nbits);
@@ -1299,10 +1326,15 @@ size_t WriteTokens(const std::vector<Token>& tokens,
       addbits(ans_bits, ans_nbits);
     }
   } else {
+    // Single context: both the uint config and the symbol-info table are
+    // loop-invariant. Hoist them so the inner loop avoids re-indexing vectors.
+    const HybridUintConfig cfg = codes.uint_config[0];
+    const ANSEncSymbolInfo* JXL_RESTRICT info0 =
+        codes.encoding_info[0].info.data();
     for (int i = end - 1; i >= 0; --i) {
       uint32_t tok, nbits, bits;
-      codes.uint_config[0].Encode(tokens[i].value, &tok, &nbits, &bits);
-      const ANSEncSymbolInfo& info = codes.encoding_info[0][tok];
+      cfg.Encode(tokens[i].value, &tok, &nbits, &bits);
+      const ANSEncSymbolInfo& info = info0[tok];
       // Extra bits first as this is reversed.
       addbits(bits, nbits);
       num_extra_bits += nbits;
