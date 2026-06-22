@@ -348,6 +348,13 @@ set(JPEGXL_COVERAGE_LINK_FLAGS)
 if (MSVC)
   # TODO(janwas): add flags
   add_definitions(-D_CRT_SECURE_NO_WARNINGS)
+  # Local patch: cmake-rs clobbers MSVC's default /O2 under the ClangCL
+  # multi-config generator, building libjxl unoptimized (the "0.11 ~30x
+  # enc/dec regression"). Force it back. /Ob2 = full inlining. Mirrors the
+  # guard in external/libjxl/CMakeLists.txt and jxl-ffi/build.rs.
+  if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(/O2 /Ob2)
+  endif()
 else ()
   # Global compiler flags for all targets here and in subdirectories.
   add_definitions(
