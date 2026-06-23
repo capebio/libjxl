@@ -67,8 +67,7 @@ struct AcStrategyHeuristics {
                                 const CompressParams& cparams)
       : memory_manager(memory_manager),
         cparams(cparams),
-        mem_per_thread(0),
-        qmem_per_thread(0) {}
+        mem_per_thread(0) {}
   Status Init(const Image3F& src, const Rect& rect_in,
               const ImageF& quant_field, const ImageF& mask,
               const ImageF& mask1x1, DequantMatrices* matrices);
@@ -82,8 +81,6 @@ struct AcStrategyHeuristics {
   ACSConfig config = {};
   size_t mem_per_thread;
   AlignedMemory mem;
-  size_t qmem_per_thread;
-  AlignedMemory qmem;
 };
 
 }  // namespace jxl
