@@ -111,7 +111,12 @@ StatusOr<float> EstimateCost(const Image& img) {
   const auto kSplit = Set(du, 16);
   const auto kExpOffset2 = Set(du, 129);  // 127 + 2
   const auto kTokenBias = Set(du, 8);
-  const auto kTokenMul = Set(du, 4);
+  // Token field multiplier is 4 == 1<<kTokenShift (msb_in_token=2). Use an
+  // explicit ShiftLeft rather than Mul by 4: a vector Mul by a power-of-two
+  // constant is mis-lowered by the x86 backend to a vpsllq + shuffle + blend
+  // sequence, whereas ShiftLeft emits a single vpslld. (No-op on wasm, where
+  // the backend already strength-reduces the multiply.)
+  constexpr int kTokenShift = 2;
   const auto kMsbMask = Set(du, 3);
   const auto kMaxDiffCap = Set(du, estimate_cost_detail::kLastThreshold - 1);
   const auto kLanes = Set(du, Lanes(du));
@@ -164,7 +169,7 @@ StatusOr<float> EstimateCost(const Image& img) {
       const auto v = BitCast(du, ConvertTo(df, packed_fixed));
       const auto eb_raw = Sub(ShiftRight<23>(v), kExpOffset2);
       const auto eb = IfThenElse(is_large, Add(eb_raw, kLargeShift), eb_raw);
-      const auto token = Add(Add(kTokenBias, Mul(eb, kTokenMul)),
+      const auto token = Add(Add(kTokenBias, ShiftLeft<kTokenShift>(eb)),
                              And(ShiftRight<21>(v), kMsbMask));
       const auto tail_mask = Lt(pos, last_pos);
       const auto eb_fixed = IfThenElseZero(not_literal, eb);
@@ -217,7 +222,7 @@ StatusOr<float> EstimateCost(const Image& img) {
         const auto v = BitCast(du, ConvertTo(df, packed_fixed));
         const auto eb_raw = Sub(ShiftRight<23>(v), kExpOffset2);
         const auto eb = IfThenElse(is_large, Add(eb_raw, kLargeShift), eb_raw);
-        const auto token = Add(Add(kTokenBias, Mul(eb, kTokenMul)),
+        const auto token = Add(Add(kTokenBias, ShiftLeft<kTokenShift>(eb)),
                                And(ShiftRight<21>(v), kMsbMask));
         const auto tail_mask = Lt(pos, last_pos);
         const auto eb_fixed = IfThenElseZero(not_literal, eb);

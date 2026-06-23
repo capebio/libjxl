@@ -15,6 +15,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>   // JXL_STAGE_TIMERS: encode stage profiling diagnostic
+#include <cstdio>   // JXL_STAGE_TIMERS
+#include <cstdlib>  // JXL_STAGE_TIMERS (getenv)
 #include <memory>
 #include <numeric>
 #include <utility>
@@ -1653,17 +1656,36 @@ Status ComputeEncodingData(
       JXL_RETURN_IF_ERROR(ComputeJPEGTranscodingData(
           *jpeg_data, frame_header, pool, &enc_modular, &enc_state));
     } else {
+      // TEMP JXL_STAGE_TIMERS: ComputeVarDCTEncodingData = XYB + adaptive-quant
+      // + AC-strategy + chroma-from-luma + DCT (the heuristics+coeff block).
+      const bool kStageTimers = std::getenv("JXL_STAGE_TIMERS") != nullptr;
+      auto t_vd0 = std::chrono::steady_clock::now();
       JXL_RETURN_IF_ERROR(ComputeVarDCTEncodingData(
           frame_header, linear, &color, group_rect, cms, pool, &enc_modular,
           &enc_state, aux_out));
+      if (kStageTimers) {
+        auto ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t_vd0).count();
+        std::fprintf(stderr, "[stage] ComputeVarDCTEncodingData %.2f ms\n", ms);
+      }
     }
     JXL_RETURN_IF_ERROR(ComputeAllCoeffOrders(enc_state, frame_dim));
     if (!enc_state.streaming_mode) {
       shared.num_histograms = 1;
       enc_state.histogram_idx.resize(frame_dim.num_groups);
     }
-    JXL_RETURN_IF_ERROR(
-        TokenizeAllCoefficients(frame_header, pool, &enc_state));
+    {
+      // TEMP JXL_STAGE_TIMERS: tokenize coefficients (entropy-prep).
+      const bool kStageTimers = std::getenv("JXL_STAGE_TIMERS") != nullptr;
+      auto t_tok0 = std::chrono::steady_clock::now();
+      JXL_RETURN_IF_ERROR(
+          TokenizeAllCoefficients(frame_header, pool, &enc_state));
+      if (kStageTimers) {
+        auto ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t_tok0).count();
+        std::fprintf(stderr, "[stage] TokenizeAllCoefficients %.2f ms\n", ms);
+      }
+    }
   }
 
   if (cparams.modular_mode || !extra_channels.empty()) {
@@ -1692,8 +1714,19 @@ Status ComputeEncodingData(
                                     FrameHeader::kSplines);
   }
 
-  JXL_RETURN_IF_ERROR(EncodeGroups(frame_header, &enc_state, &enc_modular, pool,
-                                   group_codes, aux_out));
+  {
+    // JXL_STAGE_TIMERS: EncodeGroups = BuildAndEncodeHistograms (enc_ans/
+    // enc_cluster) + per-AC-group rANS token encode. The encode cost center.
+    const bool kEgTimer = std::getenv("JXL_STAGE_TIMERS") != nullptr;
+    auto t_eg0 = std::chrono::steady_clock::now();
+    JXL_RETURN_IF_ERROR(EncodeGroups(frame_header, &enc_state, &enc_modular, pool,
+                                     group_codes, aux_out));
+    if (kEgTimer) {
+      auto ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_eg0).count();
+      std::fprintf(stderr, "[stage] EncodeGroups %.2f ms\n", ms);
+    }
+  }
   if (enc_state.streaming_mode) {
     const size_t group_index = enc_state.dc_group_index;
     enc_modular.ClearStreamData(ModularStreamId::VarDCTDC(group_index));
@@ -2140,10 +2173,20 @@ JXL_NOINLINE Status EncodeFrameStreaming(
     enc_state->histogram_idx =
         std::vector<size_t>(group_xsize * group_ysize, i);
     std::vector<std::unique_ptr<BitWriter>> group_codes;
+    // JXL_STAGE_TIMERS: whole ComputeEncodingData per DC group. Subtract the
+    // inner ComputeVarDCTEncodingData + TokenizeAllCoefficients timers to isolate
+    // the histogram-build + AC-group entropy-encode tail (enc_ans/enc_cluster).
+    const bool kCedTimer = std::getenv("JXL_STAGE_TIMERS") != nullptr;
+    auto t_ced0 = std::chrono::steady_clock::now();
     JXL_RETURN_IF_ERROR(ComputeEncodingData(
         cparams, frame_info, metadata, frame_data, jpeg_data.get(), x0, y0,
         xsize, ysize, cms, pool, frame_header, *enc_modular, *enc_state,
         &group_codes, aux_out));
+    if (kCedTimer) {
+      auto ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_ced0).count();
+      std::fprintf(stderr, "[stage] ComputeEncodingData TOTAL %.2f ms\n", ms);
+    }
     JXL_ENSURE(enc_state->special_frames.empty());
     if (i == 0) {
       BitWriter writer{memory_manager};

@@ -136,7 +136,10 @@ class ANSEncodingHistogram {
     // shift-invariant rounding (a `round()` libcall per symbol) out of the
     // per-shift loop and compute it once here.
     const double norm = double{ANS_TAB_SIZE} / histo.total_count;
-    std::vector<ANSHistBin> base_counts(result.alphabet_size_);
+    // `alphabet_size_ <= ANS_MAX_ALPHABET_SIZE` (checked above), so a fixed
+    // stack buffer suffices — avoids one heap allocation per normalization.
+    // Only [0, alphabet_size_) is written and read, so no zero-init needed.
+    std::array<ANSHistBin, ANS_MAX_ALPHABET_SIZE> base_counts;
     for (size_t n = 0; n < result.alphabet_size_; ++n) {
       ANSHistBin freq = histo.counts[n];
       ANSHistBin count = std::max<ANSHistBin>(round(freq * norm), freq > 0);
@@ -146,7 +149,7 @@ class ANSEncodingHistogram {
       // `shift = 12` and `shift = 11` are the same
       normalized.method_ = std::min(shift, ANS_LOG_TAB_SIZE - 1) + 1;
 
-      if (!normalized.RebalanceHistogram(histo, base_counts)) {
+      if (!normalized.RebalanceHistogram(histo, base_counts.data())) {
         return JXL_FAILURE("Logic error: couldn't rebalance a histogram");
       }
       SizeWriter writer;
@@ -429,7 +432,7 @@ class ANSEncodingHistogram {
   // of `lg2[counts]` are supposed to be limited to `int32_t` range, so that the
   // sum of their products should not exceed `int64_t`.
   bool RebalanceHistogram(const Histogram& histo,
-                          const std::vector<ANSHistBin>& base_counts) {
+                          const ANSHistBin* JXL_RESTRICT base_counts) {
     constexpr ANSHistBin table_size = ANS_TAB_SIZE;
     uint32_t shift = method_ - 1;
 
@@ -802,7 +805,6 @@ Status EntropyEncodingData::ChooseUintConfigs(
   }
 
   size_t num_histo = clustered_histograms.size();
-  std::vector<uint8_t> is_valid(num_histo);
   std::vector<size_t> histo_volume(2 * num_histo);
   std::vector<size_t> histo_offset(2 * num_histo + 1);
   std::vector<uint32_t> max_value_per_histo(2 * num_histo);
@@ -836,11 +838,6 @@ Status EntropyEncodingData::ChooseUintConfigs(
   for (size_t h = 0; h < 2 * num_histo; ++h) {
     max_value_per_histo[h] =
         MaxValue(transposed.data() + histo_offset[h], histo_volume[h]);
-  }
-  uint32_t max_lz77 = 0;
-  for (size_t h = num_histo; h < 2 * num_histo; ++h) {
-    max_lz77 = std::max(max_lz77, MaxValue(transposed.data() + histo_offset[h],
-                                           histo_volume[h]));
   }
 
   // Wider histograms are assigned max cost in PopulationCost anyway
@@ -1148,9 +1145,10 @@ StatusOr<size_t> BuildAndEncodeHistograms(
       uint_config = HybridUintConfig(10, 0, 0);
     }
     for (const auto& stream : tokens) {
+      // Token count is just the stream length; hoist out of the per-token loop.
+      total_tokens += stream.size();
       if (codes->lz77.enabled) {
         for (const auto& token : stream) {
-          total_tokens++;
           uint32_t tok, nbits, bits;
           (token.is_lz77_length ? codes->lz77.length_uint_config : uint_config)
               .Encode(token.value, &tok, &nbits, &bits);
@@ -1160,14 +1158,12 @@ StatusOr<size_t> BuildAndEncodeHistograms(
         }
       } else if (num_contexts == 1) {
         for (const auto& token : stream) {
-          total_tokens++;
           uint32_t tok, nbits, bits;
           uint_config.Encode(token.value, &tok, &nbits, &bits);
           builder[0].Add(tok);
         }
       } else {
         for (const auto& token : stream) {
-          total_tokens++;
           uint32_t tok, nbits, bits;
           uint_config.Encode(token.value, &tok, &nbits, &bits);
           JXL_DASSERT(token.context < num_contexts);

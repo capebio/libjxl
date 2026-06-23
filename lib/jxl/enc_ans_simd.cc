@@ -32,9 +32,9 @@ using hwy::HWY_NAMESPACE::IfThenElseZero;
 using hwy::HWY_NAMESPACE::Iota;
 using hwy::HWY_NAMESPACE::LoadU;
 using hwy::HWY_NAMESPACE::Lt;
-using hwy::HWY_NAMESPACE::Mul;
 using hwy::HWY_NAMESPACE::Or;
 using hwy::HWY_NAMESPACE::Set;
+using hwy::HWY_NAMESPACE::ShiftLeft;
 using hwy::HWY_NAMESPACE::ShiftRight;
 using hwy::HWY_NAMESPACE::Store;
 using hwy::HWY_NAMESPACE::Sub;
@@ -50,7 +50,6 @@ uint32_t EstimateTokenCostImpl(uint32_t* JXL_RESTRICT values, size_t len,
   const auto kExpOffset = Set(du, 127);
   const auto kEBOffset = Set(du, 127 + M + L);
   const auto kBase = Set(du, static_cast<uint32_t>((1 << E) - (E << (M + L))));
-  const auto kMulN = Set(du, 1 << (M + L));
   const auto kMaskL = Set(du, (1 << L) - 1);
   const auto kMaskM = Set(du, ((1 << M) - 1) << L);
   const auto kLargeThreshold = Set(du, (1 << 22) - 1);
@@ -72,7 +71,7 @@ uint32_t EstimateTokenCostImpl(uint32_t* JXL_RESTRICT values, size_t len,
     const auto n = Sub(exp_fixed, kExpOffset);
     const auto eb = Sub(exp_fixed, kEBOffset);
     const auto m = ShiftRight<23 - M - L>(b);
-    const auto a = Add(kBase, Mul(n, kMulN));
+    const auto a = Add(kBase, ShiftLeft<M + L>(n));
     const auto d = And(m, kMaskM);
     const auto eb_fixed = IfThenElseZero(not_literal, eb);
     const auto c = Or(a, l);
@@ -81,6 +80,12 @@ uint32_t EstimateTokenCostImpl(uint32_t* JXL_RESTRICT values, size_t len,
     const auto t_fixed = IfThenElse(not_literal, t, val);
     Store(t_fixed, du, out + i);
   }
+  // Remainder: a single full-width vector starting at `last_full`. This reads
+  // `values` and writes `out` up to Lanes-1 elements past `len`; both buffers
+  // are over-allocated by MaxVectorSize() bytes by the caller (see
+  // `transposed` and `tmp` allocations in enc_ans.cc). The `take` mask zeroes
+  // extra-bits contributions from the padding lanes so the returned cost is
+  // exact.
   if (last_full < len) {
     const auto stop = Set(du, len);
     const auto fence = Iota(du, last_full);
@@ -97,7 +102,7 @@ uint32_t EstimateTokenCostImpl(uint32_t* JXL_RESTRICT values, size_t len,
     const auto n = Sub(exp_fixed, kExpOffset);
     const auto eb = Sub(exp_fixed, kEBOffset);
     const auto m = ShiftRight<23 - M - L>(b);
-    const auto a = Add(kBase, Mul(n, kMulN));
+    const auto a = Add(kBase, ShiftLeft<M + L>(n));
     const auto d = And(m, kMaskM);
     const auto eb_fixed = IfThenElseZero(not_literal, eb);
     const auto eb_masked = IfThenElseZero(take, eb_fixed);
