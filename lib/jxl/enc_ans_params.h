@@ -133,6 +133,14 @@ struct Histogram {
   }
   // Just increment symbol counter; caller must stretch Histogram beforehead.
   void FastAdd(size_t symbol) { (*(counts.data() + symbol))++; }
+  // Add `count` occurrences of `symbol` in a single update. Used to flush a
+  // run-coalesced FastAdd sequence: repeatedly incrementing the same counts
+  // slot serializes on store-to-load forwarding, so callers that detect runs
+  // of an identical symbol accumulate the run and flush it here. Like FastAdd,
+  // caller must stretch the histogram beforehand and call Condition() after.
+  void FastAddN(size_t symbol, ANSHistBin count) {
+    *(counts.data() + symbol) += count;
+  }
   // Should be called after sequence of FastAdd to actualize total_count.
   void Condition();
 

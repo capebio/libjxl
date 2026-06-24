@@ -48,7 +48,6 @@ using hwy::HWY_NAMESPACE::LoadU;
 using hwy::HWY_NAMESPACE::Lt;
 using hwy::HWY_NAMESPACE::Max;
 using hwy::HWY_NAMESPACE::Min;
-using hwy::HWY_NAMESPACE::Mul;
 using hwy::HWY_NAMESPACE::Not;
 using hwy::HWY_NAMESPACE::Set;
 using hwy::HWY_NAMESPACE::ShiftLeft;
@@ -68,7 +67,9 @@ StatusOr<float> EstimateCost(const Image& img) {
   HybridUintConfig config;
   uint32_t cutoffs[] = {0,  1,  3,  5,   7,   11,  15,  23, 31,
                         47, 63, 95, 127, 191, 255, 392, 500};
-  constexpr size_t nc = sizeof(cutoffs) / sizeof(*cutoffs) + 1;
+  // One context per cutoff (17). Matches estimate_cost_detail::kLastCtx + 1 and
+  // the SIMD ContextMap; the old "+ 1" produced an unused 18th histogram.
+  constexpr size_t nc = sizeof(cutoffs) / sizeof(*cutoffs);
   Histogram histo[nc] = {};
   for (const Channel& ch : img.channel) {
     const ptrdiff_t onerow = ch.plane.PixelsPerRow();
@@ -80,9 +81,12 @@ StatusOr<float> EstimateCost(const Image& img) {
         pixel_type_w topleft = (x && y ? *(r + x - 1 - onerow) : left);
         size_t max_diff =
             std::max({left, top, topleft}) - std::min({left, top, topleft});
+        // ctx = highest cutoff index whose cutoff <= max_diff (small diffs ->
+        // low ctx), matching the SIMD ContextMap ordering. The scalar path
+        // previously used (max_diff < c), which reversed the numbering.
         size_t ctx = 0;
-        for (uint32_t c : cutoffs) {
-          ctx += (max_diff < c) ? 1 : 0;
+        for (size_t i = 1; i < nc; i++) {
+          ctx += (max_diff >= cutoffs[i]) ? 1 : 0;
         }
         pixel_type res = r[x] - ClampedGradient(top, left, topleft);
         uint32_t token;
@@ -119,7 +123,6 @@ StatusOr<float> EstimateCost(const Image& img) {
   constexpr int kTokenShift = 2;
   const auto kMsbMask = Set(du, 3);
   const auto kMaxDiffCap = Set(du, estimate_cost_detail::kLastThreshold - 1);
-  const auto kLanes = Set(du, Lanes(du));
   const auto kIota = Iota(du, 0);
   const auto kLargeThreshold = Set(du, (1 << 22) - 1);
   constexpr size_t kLargeShiftVal = 10;
@@ -130,6 +133,7 @@ StatusOr<float> EstimateCost(const Image& img) {
     if (ch.h == 0) continue;
     max_w = std::max(max_w, ch.w);
   }
+  if (max_w == 0) return 0.0f;
   max_w = RoundUpTo(max_w, Lanes(du));
   max_w = std::max(max_w, 2 * Lanes(du));
 
@@ -141,10 +145,19 @@ StatusOr<float> EstimateCost(const Image& img) {
   int32_t* primer = buffer.address<int32_t>();
   int32_t* top_primer = primer + max_w;
 
-  HybridUintConfig config;
-
   Histogram histo[estimate_cost_detail::kLastCtx + 1] = {};
+  // extra_bits_lanes is a uint32 vector; each lane accumulates per-vector
+  // extra-bit counts. On large/high-entropy inputs a lane can wrap before the
+  // final SumOfLanes, undercounting by whole multiples of 2^32. Flush into the
+  // size_t accumulator periodically so the running per-lane sum stays small.
   auto extra_bits_lanes = Zero(du);
+  uint32_t vectors_since_flush = 0;
+  constexpr uint32_t kExtraBitsFlushPeriod = 1u << 12;
+  const auto FlushExtraBits = [&] {
+    extra_bits += static_cast<size_t>(GetLane(SumOfLanes(du, extra_bits_lanes)));
+    extra_bits_lanes = Zero(du);
+    vectors_since_flush = 0;
+  };
   for (const Channel& ch : img.channel) {
     if (ch.h == 0 || ch.w == 0) continue;
     for (auto& h : histo) {
@@ -154,8 +167,6 @@ StatusOr<float> EstimateCost(const Image& img) {
     const pixel_type* JXL_RESTRICT last = primer;
     primer[0] = 0;
     StoreU(Load(di, r), di, primer + 1);
-    auto pos = kIota;
-    const auto last_pos = Set(du, ch.w);
     for (size_t x = 0; x < ch.w; x += Lanes(di)) {
       const auto left = LoadU(di, last);
       const auto central = Load(di, r + x);
@@ -171,17 +182,37 @@ StatusOr<float> EstimateCost(const Image& img) {
       const auto eb = IfThenElse(is_large, Add(eb_raw, kLargeShift), eb_raw);
       const auto token = Add(Add(kTokenBias, ShiftLeft<kTokenShift>(eb)),
                              And(ShiftRight<21>(v), kMsbMask));
-      const auto tail_mask = Lt(pos, last_pos);
       const auto eb_fixed = IfThenElseZero(not_literal, eb);
       const auto token_fixed = IfThenElse(not_literal, token, packed);
-      extra_bits_lanes =
-          Add(extra_bits_lanes, IfThenElseZero(tail_mask, eb_fixed));
+      if (x + Lanes(di) <= ch.w) {
+        extra_bits_lanes = Add(extra_bits_lanes, eb_fixed);
+      } else {
+        const auto tail_mask =
+            Lt(kIota, Set(du, static_cast<uint32_t>(ch.w - x)));
+        extra_bits_lanes =
+            Add(extra_bits_lanes, IfThenElseZero(tail_mask, eb_fixed));
+      }
       Store(token_fixed, du, token_row + x);
-      pos = Add(pos, kLanes);
       last = r + x + Lanes(di) - 1;
+      if (++vectors_since_flush == kExtraBitsFlushPeriod) FlushExtraBits();
     }
-    for (size_t x = 0; x < ch.w; x++) {
-      histo[0].FastAdd(token_row[x]);
+    {
+      // Coalesce runs of identical tokens before updating the histogram:
+      // repeated FastAdd to the same counts slot serializes on store-to-load
+      // forwarding. Row 0 has no max_diff context, so every token is ctx 0.
+      uint32_t run = 0;
+      uint32_t last_tok = token_row[0];
+      for (size_t x = 0; x < ch.w; x++) {
+        const uint32_t tok = token_row[x];
+        if (tok == last_tok) {
+          run++;
+        } else {
+          histo[0].FastAddN(last_tok, run);
+          last_tok = tok;
+          run = 1;
+        }
+      }
+      histo[0].FastAddN(last_tok, run);
     }
     for (size_t y = 1; y < ch.h; y++) {
       r = ch.Row(y);
@@ -192,15 +223,13 @@ StatusOr<float> EstimateCost(const Image& img) {
       top_primer[0] = t[0];
       StoreU(Load(di, t), di, top_primer + 1);
       const pixel_type* JXL_RESTRICT top_last = top_primer;
-      pos = kIota;
       for (size_t x = 0; x < ch.w; x += Lanes(di)) {
         const auto left = LoadU(di, last);
         const auto central = Load(di, r + x);
         const auto topleft = LoadU(di, top_last);
         const auto top = Load(di, t + x);
-        const auto l_ge_t = Ge(left, top);
-        const auto m = IfThenElse(l_ge_t, top, left);
-        const auto M = IfThenElse(l_ge_t, left, top);
+        const auto m = Min(left, top);
+        const auto M = Max(left, top);
         const auto maxx = Max(topleft, M);
         const auto minn = Min(topleft, m);
         const auto max_diff = BitCast(du, Sub(maxx, minn));
@@ -224,19 +253,41 @@ StatusOr<float> EstimateCost(const Image& img) {
         const auto eb = IfThenElse(is_large, Add(eb_raw, kLargeShift), eb_raw);
         const auto token = Add(Add(kTokenBias, ShiftLeft<kTokenShift>(eb)),
                                And(ShiftRight<21>(v), kMsbMask));
-        const auto tail_mask = Lt(pos, last_pos);
         const auto eb_fixed = IfThenElseZero(not_literal, eb);
         const auto token_fixed = IfThenElse(not_literal, token, packed);
-        extra_bits_lanes =
-            Add(extra_bits_lanes, IfThenElseZero(tail_mask, eb_fixed));
+        if (x + Lanes(di) <= ch.w) {
+          extra_bits_lanes = Add(extra_bits_lanes, eb_fixed);
+        } else {
+          const auto tail_mask =
+              Lt(kIota, Set(du, static_cast<uint32_t>(ch.w - x)));
+          extra_bits_lanes =
+              Add(extra_bits_lanes, IfThenElseZero(tail_mask, eb_fixed));
+        }
         Store(token_fixed, du, token_row + x);
-        pos = Add(pos, kLanes);
         last = r + x + Lanes(di) - 1;
         top_last = t + x + Lanes(di) - 1;
+        if (++vectors_since_flush == kExtraBitsFlushPeriod) FlushExtraBits();
       }
-      for (size_t x = 0; x < ch.w; x++) {
-        size_t ctx = ctx_map[max_diff_row[x]];
-        histo[ctx].FastAdd(token_row[x]);
+      {
+        // Coalesce runs of identical (ctx, token) keys (see row 0). The token
+        // fits in 8 bits (default hybrid-uint max token is 127), so pack
+        // ctx in the high bits and token in the low byte to compare in one op.
+        uint32_t run = 0;
+        uint32_t last_key =
+            (static_cast<uint32_t>(ctx_map[max_diff_row[0]]) << 8) | token_row[0];
+        for (size_t x = 0; x < ch.w; x++) {
+          const uint32_t key =
+              (static_cast<uint32_t>(ctx_map[max_diff_row[x]]) << 8) |
+              token_row[x];
+          if (key == last_key) {
+            run++;
+          } else {
+            histo[last_key >> 8].FastAddN(last_key & 0xff, run);
+            last_key = key;
+            run = 1;
+          }
+        }
+        histo[last_key >> 8].FastAddN(last_key & 0xff, run);
       }
     }
     for (auto& h : histo) {
@@ -248,7 +299,7 @@ StatusOr<float> EstimateCost(const Image& img) {
       h.Clear();
     }
   }
-  extra_bits = GetLane(SumOfLanes(du, extra_bits_lanes));
+  FlushExtraBits();
 #endif
   size_t total_cost =
       extra_bits + histo_cost + static_cast<size_t>(histo_cost_frac);
@@ -272,7 +323,7 @@ StatusOr<float> EstimateCost(const Image& img) {
 namespace estimate_cost_detail {
 /*
 cutoffs = [0, 1, 3, 5, 7, 11, 15, 23, 31, 47, 63, 95, 127, 191, 255, 392, 500]
-ctx_map = [[c for c,v in enumerate(cutoffs) if v <= i][0] for i in range(501)]
+ctx_map = [max(c for c, cutoff in enumerate(cutoffs) if cutoff <= i) for i in range(501)]
 */
 const std::array<uint8_t, kLastThreshold>& ContextMap() {
   static const std::array<uint8_t, kLastThreshold> kCtxMap = {
