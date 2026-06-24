@@ -36,7 +36,10 @@ constexpr size_t kMaxBlocks = 32;
 // ToBlock adaptor that writes DCT output row `i` directly to coefficient row
 // `(base_row + i * row_step)` of the 8-wide coefficient block. Passed as the
 // `final_to` sink in the 4-arg ComputeScaledDCT overload to eliminate the
-// intermediate block[] copy and the caller scatter loop for DCT8X4/DCT4X8.
+// intermediate block[] copy and the caller scatter loop for DCT8X4.
+// (DCT4X8 uses a scalar Transpose<8,4> as its final step; writing directly to
+// non-contiguous coefficients there is ~10% slower than scatter, so that case
+// retains the old two-phase approach.)
 class CoeffRowSinkTo {
  public:
   CoeffRowSinkTo(float* JXL_RESTRICT coeffs, size_t base_row, size_t row_step)
@@ -580,7 +583,12 @@ HWY_MAYBE_UNUSED void TransformFromPixels(const AcStrategyType strategy,
         HWY_ALIGN float block[4 * 8];
         ComputeScaledDCT<4, 8>()(
             DCTFrom(pixels + y * 4 * pixels_stride, pixels_stride), block,
-            CoeffRowSinkTo(coefficients, y, 2), scratch_space);
+            scratch_space);
+        for (size_t iy = 0; iy < 4; iy++) {
+          for (size_t ix = 0; ix < kBlockDim; ix++) {
+            coefficients[(y + iy * 2) * kBlockDim + ix] = block[iy * 8 + ix];
+          }
+        }
       }
       float block0 = coefficients[0];
       float block1 = coefficients[8];
