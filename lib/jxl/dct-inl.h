@@ -348,6 +348,37 @@ struct IDCT1D {
   }
 };
 
+// Like DCTFrom, but multiplies every loaded value by `scale`. Lets the final
+// 1/N DCT scale be folded into the transpose's load, so the forward DCT's scaled
+// output feeds Transpose straight out of the DCT scratch — no intermediate `to`
+// round-trip.
+class ScaledDCTFrom {
+ public:
+  ScaledDCTFrom(const float* data, size_t stride, float scale)
+      : stride_(stride), scale_(scale), data_(data) {}
+
+  template <typename D>
+  HWY_INLINE auto LoadPart(D d, const size_t row, size_t i) const {
+    return Mul(Set(d, scale_), LoadU(d, Address(row, i)));
+  }
+
+  HWY_INLINE float Read(const size_t row, const size_t i) const {
+    return *Address(row, i) * scale_;
+  }
+
+  constexpr HWY_INLINE const float* Address(const size_t row,
+                                            const size_t i) const {
+    return data_ + row * stride_ + i;
+  }
+
+  size_t Stride() const { return stride_; }
+
+ private:
+  size_t stride_;
+  float scale_;
+  const float* JXL_RESTRICT data_;
+};
+
 // Computes the maybe-transposed, scaled DCT of a block, that needs to be
 // HWY_ALIGN'ed.
 template <size_t ROWS, size_t COLS>
@@ -364,6 +395,23 @@ struct ComputeScaledDCT {
       Transpose<ROWS, COLS>::Run(DCTFrom(block, COLS), DCTTo(to, ROWS));
       DCT1D<COLS, ROWS>()(DCTFrom(to, ROWS), DCTTo(block, ROWS), tmp);
       Transpose<COLS, ROWS>::Run(DCTFrom(block, ROWS), DCTTo(to, COLS));
+    } else if (COLS <= Lanes(HWY_FULL(float)())) {
+      // Wide-vector fast path (one SIMD vector spans the COLS-wide row, e.g.
+      // AVX2 / AVX-512 for DCT8x8): fold the 1/ROWS scale into the transpose's
+      // load (ScaledDCTFrom) so the first DCT's scaled output feeds Transpose
+      // straight out of `tmp` — skipping StoreToBlockAndScale's write to `to`
+      // and the transpose's re-read of `to`. Byte-identical (same 1/ROWS multiply
+      // per element, same transpose permutation).
+      //
+      // Narrow targets (4-lane SSE/WASM/NEON) deliberately fall back to the
+      // staged path: a chunked CL=4 variant measured a ~10% REGRESSION on WASM
+      // (Transpose<8,4> scalarizes there) even though it gained on x86 SSE — so
+      // the fusion is restricted to the wide-vector (Lanes>=COLS) case.
+      CoeffBundle<ROWS, COLS>::LoadFromBlock(from, 0, tmp);
+      DCT1DImpl<ROWS, COLS>()(tmp, tmp + ROWS * COLS);
+      Transpose<ROWS, COLS>::Run(ScaledDCTFrom(tmp, COLS, 1.0f / ROWS),
+                                 DCTTo(block, ROWS));
+      DCT1D<COLS, ROWS>()(DCTFrom(block, ROWS), DCTTo(to, ROWS), tmp);
     } else {
       DCT1D<ROWS, COLS>()(from, DCTTo(to, COLS), tmp);
       Transpose<ROWS, COLS>::Run(DCTFrom(to, COLS), DCTTo(block, ROWS));
