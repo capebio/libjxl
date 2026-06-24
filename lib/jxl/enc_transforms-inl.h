@@ -29,7 +29,39 @@ enum class AcStrategyType : uint32_t;
 namespace HWY_NAMESPACE {
 namespace {
 
+using hwy::HWY_NAMESPACE::Vec;
+
 constexpr size_t kMaxBlocks = 32;
+
+// ToBlock adaptor that writes DCT output row `i` directly to coefficient row
+// `(base_row + i * row_step)` of the 8-wide coefficient block. Passed as the
+// `final_to` sink in the 4-arg ComputeScaledDCT overload to eliminate the
+// intermediate block[] copy and the caller scatter loop for DCT8X4/DCT4X8.
+class CoeffRowSinkTo {
+ public:
+  CoeffRowSinkTo(float* JXL_RESTRICT coeffs, size_t base_row, size_t row_step)
+      : coeffs_(coeffs), base_row_(base_row), row_step_(row_step) {}
+
+  template <typename D>
+  HWY_INLINE void StorePart(D d, const Vec<D>& v, size_t row, size_t off) const {
+    StoreU(v, d, Address(row, off));
+  }
+
+  HWY_INLINE void Write(float v, size_t row, size_t off) const {
+    *Address(row, off) = v;
+  }
+
+  HWY_INLINE float* Address(size_t row, size_t off) const {
+    return coeffs_ + (base_row_ + row * row_step_) * kBlockDim + off;
+  }
+
+  size_t Stride() const { return kBlockDim; }
+
+ private:
+  float* JXL_RESTRICT coeffs_;
+  size_t base_row_;
+  size_t row_step_;
+};
 
 // Inverse of ReinterpretingDCT.
 template <size_t DCT_ROWS, size_t DCT_COLS, size_t LF_ROWS, size_t LF_COLS,
@@ -63,41 +95,81 @@ HWY_INLINE void ReinterpretingIDCT(const float* input,
                                   scratch_space);
 }
 
-template <size_t S>
-void DCT2TopBlock(const float* block, size_t stride, float* out) {
-  static_assert(kBlockDim % S == 0, "S should be a divisor of kBlockDim");
-  static_assert(S % 2 == 0, "S should be even");
-  float temp[kDCTBlockSize];
-  constexpr size_t num_2x2 = S / 2;
-  for (size_t y = 0; y < num_2x2; y++) {
-    for (size_t x = 0; x < num_2x2; x++) {
-      float c00 = block[y * 2 * stride + x * 2];
-      float c01 = block[y * 2 * stride + x * 2 + 1];
-      float c10 = block[(y * 2 + 1) * stride + x * 2];
-      float c11 = block[(y * 2 + 1) * stride + x * 2 + 1];
-      float r00 = c00 + c01 + c10 + c11;
-      float r01 = c00 + c01 - c10 - c11;
-      float r10 = c00 - c01 + c10 - c11;
-      float r11 = c00 - c01 - c10 + c11;
-      r00 *= 0.25f;
-      r01 *= 0.25f;
-      r10 *= 0.25f;
-      r11 *= 0.25f;
-      temp[y * kBlockDim + x] = r00;
-      temp[y * kBlockDim + num_2x2 + x] = r01;
-      temp[(y + num_2x2) * kBlockDim + x] = r10;
-      temp[(y + num_2x2) * kBlockDim + num_2x2 + x] = r11;
-    }
-  }
-  for (size_t y = 0; y < S; y++) {
-    for (size_t x = 0; x < S; x++) {
-      out[y * kBlockDim + x] = temp[y * kBlockDim + x];
-    }
-  }
+struct DCT2x2Result {
+  float r00;
+  float r01;
+  float r10;
+  float r11;
+};
+
+// Keep these expressions left-associative. Do not rewrite using pairwise partial
+// sums: that changes float rounding and breaks byte-exact output.
+HWY_INLINE DCT2x2Result ComputeDCT2x2(const float c00, const float c01,
+                                       const float c10, const float c11) {
+  DCT2x2Result result;
+  result.r00 = (c00 + c01 + c10 + c11) * 0.25f;
+  result.r01 = (c00 + c01 - c10 - c11) * 0.25f;
+  result.r10 = (c00 - c01 + c10 - c11) * 0.25f;
+  result.r11 = (c00 - c01 - c10 + c11) * 0.25f;
+  return result;
 }
 
-void AFVDCT4x4(const float* JXL_RESTRICT pixels, float* JXL_RESTRICT coeffs) {
-  HWY_ALIGN static constexpr float k4x4AFVBasisTranspose[16][16] = {
+// Fused 8x8 DCT2 multilevel kernel. Writes high-frequency bands directly and
+// retains only the four values needed for each subsequent level, eliminating
+// the three-pass materialisation of 64+16+4 temporary coefficients.
+HWY_INLINE void DCT2Transform8x8(const float* input, const size_t stride,
+                                  float* output) {
+  static_assert(kBlockDim == 8, "This is the fixed 8x8 DCT2 layout");
+  constexpr size_t kHalf = kBlockDim / 2;    // 4
+  constexpr size_t kQuarter = kHalf / 2;     // 2
+
+  float level2[kQuarter * kQuarter];
+
+  for (size_t y2 = 0; y2 < kQuarter; ++y2) {
+    for (size_t x2 = 0; x2 < kQuarter; ++x2) {
+      float level1[4];
+
+      for (size_t dy = 0; dy < 2; ++dy) {
+        for (size_t dx = 0; dx < 2; ++dx) {
+          const size_t block_y = 2 * y2 + dy;
+          const size_t block_x = 2 * x2 + dx;
+          const size_t src = 2 * block_y * stride + 2 * block_x;
+
+          const DCT2x2Result stage1 =
+              ComputeDCT2x2(input[src], input[src + 1],
+                            input[src + stride], input[src + stride + 1]);
+
+          level1[dy * 2 + dx] = stage1.r00;
+
+          // Stage-1 LH / HL / HH written directly to output.
+          output[block_y * kBlockDim + kHalf + block_x] = stage1.r01;
+          output[(kHalf + block_y) * kBlockDim + block_x] = stage1.r10;
+          output[(kHalf + block_y) * kBlockDim + kHalf + block_x] = stage1.r11;
+        }
+      }
+
+      const DCT2x2Result stage2 =
+          ComputeDCT2x2(level1[0], level1[1], level1[2], level1[3]);
+
+      level2[y2 * kQuarter + x2] = stage2.r00;
+
+      // Stage-2 LH / HL / HH inside the top-left 4x4 region.
+      output[y2 * kBlockDim + kQuarter + x2] = stage2.r01;
+      output[(kQuarter + y2) * kBlockDim + x2] = stage2.r10;
+      output[(kQuarter + y2) * kBlockDim + kQuarter + x2] = stage2.r11;
+    }
+  }
+
+  const DCT2x2Result stage3 =
+      ComputeDCT2x2(level2[0], level2[1], level2[2], level2[3]);
+
+  output[0] = stage3.r00;
+  output[1] = stage3.r01;
+  output[kBlockDim] = stage3.r10;
+  output[kBlockDim + 1] = stage3.r11;
+}
+
+HWY_ALIGN static constexpr float k4x4AFVBasisTranspose[16][16] = {
       {
           0.2500000000000000,
           0.8769029297991420f,
@@ -388,6 +460,7 @@ void AFVDCT4x4(const float* JXL_RESTRICT pixels, float* JXL_RESTRICT coeffs) {
       },
   };
 
+void AFVDCT4x4(const float* JXL_RESTRICT pixels, float* JXL_RESTRICT coeffs) {
   const HWY_CAPPED(float, 16) d;
   for (size_t i = 0; i < 16; i += Lanes(d)) {
     auto scalar = Zero(d);
@@ -397,6 +470,45 @@ void AFVDCT4x4(const float* JXL_RESTRICT pixels, float* JXL_RESTRICT coeffs) {
       scalar = MulAdd(px, basis, scalar);
     }
     Store(scalar, d, coeffs + i);
+  }
+}
+
+// Variant of AFVDCT4x4 that reads the oriented 4x4 quadrant directly from the
+// strided 8x8 pixel block, eliminating the intermediate block[] copy.
+// afv_kind encodes which quadrant (bit 0 = flip-x, bit 1 = flip-y).
+template <size_t afv_kind>
+HWY_INLINE void AFVDCT4x4Strided(const float* JXL_RESTRICT pixels,
+                                  const size_t pixels_stride,
+                                  float* JXL_RESTRICT coeffs) {
+  static_assert(afv_kind < 4, "Invalid AFV kind");
+
+  constexpr bool kFlipX = (afv_kind & 1) != 0;
+  constexpr bool kFlipY = (afv_kind & 2) != 0;
+
+  const ptrdiff_t row_step =
+      kFlipY ? -static_cast<ptrdiff_t>(pixels_stride)
+             : static_cast<ptrdiff_t>(pixels_stride);
+  const ptrdiff_t col_step = kFlipX ? -1 : 1;
+
+  // When kFlipX, afv_x==1, so the quadrant starts at column 4 and is reversed:
+  // first sampled column = 4+3=7. When !kFlipX, afv_x==0, first column = 0.
+  // Same logic for rows via kFlipY.
+  const float* const first =
+      pixels + (kFlipY ? 7 * pixels_stride : 0) + (kFlipX ? 7 : 0);
+
+  const HWY_CAPPED(float, 16) d;
+  for (size_t i = 0; i < 16; i += Lanes(d)) {
+    auto sum = Zero(d);
+    size_t j = 0;
+    for (size_t y = 0; y < 4; ++y) {
+      const float* const row = first + static_cast<ptrdiff_t>(y) * row_step;
+      for (size_t x = 0; x < 4; ++x, ++j) {
+        const auto px = Set(d, row[static_cast<ptrdiff_t>(x) * col_step]);
+        const auto basis = Load(d, k4x4AFVBasisTranspose[j] + i);
+        sum = MulAdd(px, basis, sum);
+      }
+    }
+    Store(sum, d, coeffs + i);
   }
 }
 
@@ -411,29 +523,25 @@ void AFVTransformFromPixels(const float* JXL_RESTRICT pixels,
   HWY_ALIGN float scratch_space[4 * 8 * 5];
   size_t afv_x = afv_kind & 1;
   size_t afv_y = afv_kind / 2;
-  HWY_ALIGN float block[4 * 8] = {};
-  for (size_t iy = 0; iy < 4; iy++) {
-    for (size_t ix = 0; ix < 4; ix++) {
-      block[(afv_y == 1 ? 3 - iy : iy) * 4 + (afv_x == 1 ? 3 - ix : ix)] =
-          pixels[(iy + 4 * afv_y) * pixels_stride + ix + 4 * afv_x];
-    }
-  }
-  // AFV coefficients in (even, even) positions.
+  // Read directly from the strided source: no intermediate block[] copy needed.
   HWY_ALIGN float coeff[4 * 4];
-  AFVDCT4x4(block, coeff);
+  AFVDCT4x4Strided<afv_kind>(pixels, pixels_stride, coeff);
+  // AFV coefficients in (even, even) positions.
   for (size_t iy = 0; iy < 4; iy++) {
     for (size_t ix = 0; ix < 4; ix++) {
       coefficients[iy * 2 * 8 + ix * 2] = coeff[iy * 4 + ix];
     }
   }
   // 4x4 DCT of the block with same y and different x.
+  HWY_ALIGN float block[4 * 8];
   ComputeScaledDCT<4, 4>()(
       DCTFrom(pixels + afv_y * 4 * pixels_stride + (afv_x == 1 ? 0 : 4),
               pixels_stride),
       block, scratch_space);
-  // ... in (odd, even) positions.
+  // ... in (odd, even) positions. ix >= 4 writes positions that the 4x8 DCT
+  // below always overwrites before any caller can observe them.
   for (size_t iy = 0; iy < 4; iy++) {
-    for (size_t ix = 0; ix < 8; ix++) {
+    for (size_t ix = 0; ix < 4; ix++) {
       coefficients[iy * 2 * 8 + ix * 2 + 1] = block[iy * 4 + ix];
     }
   }
@@ -497,13 +605,8 @@ HWY_MAYBE_UNUSED void TransformFromPixels(const AcStrategyType strategy,
       for (size_t x = 0; x < 2; x++) {
         HWY_ALIGN float block[4 * 8];
         ComputeScaledDCT<8, 4>()(DCTFrom(pixels + x * 4, pixels_stride), block,
+                                 CoeffRowSinkTo(coefficients, x, 2),
                                  scratch_space);
-        for (size_t iy = 0; iy < 4; iy++) {
-          for (size_t ix = 0; ix < 8; ix++) {
-            // Store transposed.
-            coefficients[(x + iy * 2) * 8 + ix] = block[iy * 8 + ix];
-          }
-        }
       }
       float block0 = coefficients[0];
       float block1 = coefficients[8];
@@ -516,12 +619,7 @@ HWY_MAYBE_UNUSED void TransformFromPixels(const AcStrategyType strategy,
         HWY_ALIGN float block[4 * 8];
         ComputeScaledDCT<4, 8>()(
             DCTFrom(pixels + y * 4 * pixels_stride, pixels_stride), block,
-            scratch_space);
-        for (size_t iy = 0; iy < 4; iy++) {
-          for (size_t ix = 0; ix < 8; ix++) {
-            coefficients[(y + iy * 2) * 8 + ix] = block[iy * 8 + ix];
-          }
-        }
+            CoeffRowSinkTo(coefficients, y, 2), scratch_space);
       }
       float block0 = coefficients[0];
       float block1 = coefficients[8];
@@ -554,9 +652,7 @@ HWY_MAYBE_UNUSED void TransformFromPixels(const AcStrategyType strategy,
       break;
     }
     case Type::DCT2X2: {
-      DCT2TopBlock<8>(pixels, pixels_stride, coefficients);
-      DCT2TopBlock<4>(coefficients, kBlockDim, coefficients);
-      DCT2TopBlock<2>(coefficients, kBlockDim, coefficients);
+      DCT2Transform8x8(pixels, pixels_stride, coefficients);
       break;
     }
     case Type::DCT16X16: {

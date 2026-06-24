@@ -370,6 +370,29 @@ struct ComputeScaledDCT {
       DCT1D<COLS, ROWS>()(DCTFrom(block, ROWS), DCTTo(to, ROWS), tmp);
     }
   }
+
+  // Variant that writes final-stage output to a custom ToBlock sink instead of
+  // the `to` buffer. `intermediate` is working storage for intermediate DCT
+  // stages and must hold at least ROWS*COLS HWY_ALIGN'd floats. The sink
+  // receives (row, col) writes in the same layout as the standard overload
+  // would produce in `to`.
+  template <class From, class FinalTo>
+  HWY_MAYBE_UNUSED void operator()(const From& from, float* intermediate,
+                                   const FinalTo& final_to,
+                                   float* JXL_RESTRICT scratch_space) {
+    float* JXL_RESTRICT block = scratch_space;
+    float* JXL_RESTRICT tmp = scratch_space + ROWS * COLS;
+    if (ROWS < COLS) {
+      DCT1D<ROWS, COLS>()(from, DCTTo(block, COLS), tmp);
+      Transpose<ROWS, COLS>::Run(DCTFrom(block, COLS), DCTTo(intermediate, ROWS));
+      DCT1D<COLS, ROWS>()(DCTFrom(intermediate, ROWS), DCTTo(block, ROWS), tmp);
+      Transpose<COLS, ROWS>::Run(DCTFrom(block, ROWS), final_to);
+    } else {
+      DCT1D<ROWS, COLS>()(from, DCTTo(intermediate, COLS), tmp);
+      Transpose<ROWS, COLS>::Run(DCTFrom(intermediate, COLS), DCTTo(block, ROWS));
+      DCT1D<COLS, ROWS>()(DCTFrom(block, ROWS), final_to, tmp);
+    }
+  }
 };
 // Computes the maybe-transposed, scaled IDCT of a block, that needs to be
 // HWY_ALIGN'ed.
