@@ -184,7 +184,7 @@ include(jxl_cms.cmake)
 include(jxl.cmake)
 
 # Other libraries outside the core jxl library.
-if(JPEGXL_ENABLE_TOOLS OR BUILD_TESTING)
+if(JPEGXL_ENABLE_TOOLS OR BUILD_TESTING OR JPEGXL_ENABLE_BENCHMARK)
   include(jxl_extras.cmake)
 endif()
 include(jxl_threads.cmake)
@@ -199,7 +199,7 @@ install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/jxl
 # Tests for the jxl library.
 include(jxl_tests.cmake)
 
-if(BUILD_TESTING AND JPEGXL_ENABLE_BENCHMARK)
+if(JPEGXL_ENABLE_BENCHMARK)
   # Google benchmark for the jxl library
   include(jxl_benchmark.cmake)
 endif()

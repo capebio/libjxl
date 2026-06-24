@@ -449,6 +449,7 @@ set(JPEGXL_INTERNAL_GBENCH_SOURCES
   jxl/dct_gbench.cc
   jxl/dec_external_image_gbench.cc
   jxl/enc_external_image_gbench.cc
+  jxl/enc_transforms_gbench.cc
   jxl/splines_gbench.cc
   jxl/tf_gbench.cc
 )

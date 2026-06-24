@@ -95,78 +95,38 @@ HWY_INLINE void ReinterpretingIDCT(const float* input,
                                   scratch_space);
 }
 
-struct DCT2x2Result {
-  float r00;
-  float r01;
-  float r10;
-  float r11;
-};
-
-// Keep these expressions left-associative. Do not rewrite using pairwise partial
-// sums: that changes float rounding and breaks byte-exact output.
-HWY_INLINE DCT2x2Result ComputeDCT2x2(const float c00, const float c01,
-                                       const float c10, const float c11) {
-  DCT2x2Result result;
-  result.r00 = (c00 + c01 + c10 + c11) * 0.25f;
-  result.r01 = (c00 + c01 - c10 - c11) * 0.25f;
-  result.r10 = (c00 - c01 + c10 - c11) * 0.25f;
-  result.r11 = (c00 - c01 - c10 + c11) * 0.25f;
-  return result;
-}
-
-// Fused 8x8 DCT2 multilevel kernel. Writes high-frequency bands directly and
-// retains only the four values needed for each subsequent level, eliminating
-// the three-pass materialisation of 64+16+4 temporary coefficients.
-HWY_INLINE void DCT2Transform8x8(const float* input, const size_t stride,
-                                  float* output) {
-  static_assert(kBlockDim == 8, "This is the fixed 8x8 DCT2 layout");
-  constexpr size_t kHalf = kBlockDim / 2;    // 4
-  constexpr size_t kQuarter = kHalf / 2;     // 2
-
-  float level2[kQuarter * kQuarter];
-
-  for (size_t y2 = 0; y2 < kQuarter; ++y2) {
-    for (size_t x2 = 0; x2 < kQuarter; ++x2) {
-      float level1[4];
-
-      for (size_t dy = 0; dy < 2; ++dy) {
-        for (size_t dx = 0; dx < 2; ++dx) {
-          const size_t block_y = 2 * y2 + dy;
-          const size_t block_x = 2 * x2 + dx;
-          const size_t src = 2 * block_y * stride + 2 * block_x;
-
-          const DCT2x2Result stage1 =
-              ComputeDCT2x2(input[src], input[src + 1],
-                            input[src + stride], input[src + stride + 1]);
-
-          level1[dy * 2 + dx] = stage1.r00;
-
-          // Stage-1 LH / HL / HH written directly to output.
-          output[block_y * kBlockDim + kHalf + block_x] = stage1.r01;
-          output[(kHalf + block_y) * kBlockDim + block_x] = stage1.r10;
-          output[(kHalf + block_y) * kBlockDim + kHalf + block_x] = stage1.r11;
-        }
-      }
-
-      const DCT2x2Result stage2 =
-          ComputeDCT2x2(level1[0], level1[1], level1[2], level1[3]);
-
-      level2[y2 * kQuarter + x2] = stage2.r00;
-
-      // Stage-2 LH / HL / HH inside the top-left 4x4 region.
-      output[y2 * kBlockDim + kQuarter + x2] = stage2.r01;
-      output[(kQuarter + y2) * kBlockDim + x2] = stage2.r10;
-      output[(kQuarter + y2) * kBlockDim + kQuarter + x2] = stage2.r11;
+// Applies one level of the DCT2 butterfly to the top-left S×S sub-block.
+// Reads from block[y*stride + x], writes to out[y*kBlockDim + x].
+// Three calls (S=8,4,2) implement the full 8×8 DCT2 transform.
+//
+// A single-pass fused kernel was benchmarked (enc_transforms_gbench.cc) and
+// found to be ~24% slower: the three-pass structure auto-vectorizes cleanly
+// inside HWY_NAMESPACE (inner loop over x is independent), whereas a fused
+// kernel scatters to non-contiguous output positions that defeat auto-vec.
+template <size_t S>
+HWY_INLINE void DCT2TopBlock(const float* block, size_t stride, float* out) {
+  static_assert(kBlockDim % S == 0, "S must divide kBlockDim");
+  static_assert(S % 2 == 0, "S must be even");
+  float temp[kDCTBlockSize];
+  constexpr size_t num_2x2 = S / 2;
+  for (size_t y = 0; y < num_2x2; y++) {
+    for (size_t x = 0; x < num_2x2; x++) {
+      float c00 = block[y * 2 * stride + x * 2];
+      float c01 = block[y * 2 * stride + x * 2 + 1];
+      float c10 = block[(y * 2 + 1) * stride + x * 2];
+      float c11 = block[(y * 2 + 1) * stride + x * 2 + 1];
+      temp[y * kBlockDim + x] = (c00 + c01 + c10 + c11) * 0.25f;
+      temp[y * kBlockDim + num_2x2 + x] = (c00 + c01 - c10 - c11) * 0.25f;
+      temp[(y + num_2x2) * kBlockDim + x] = (c00 - c01 + c10 - c11) * 0.25f;
+      temp[(y + num_2x2) * kBlockDim + num_2x2 + x] =
+          (c00 - c01 - c10 + c11) * 0.25f;
     }
   }
-
-  const DCT2x2Result stage3 =
-      ComputeDCT2x2(level2[0], level2[1], level2[2], level2[3]);
-
-  output[0] = stage3.r00;
-  output[1] = stage3.r01;
-  output[kBlockDim] = stage3.r10;
-  output[kBlockDim + 1] = stage3.r11;
+  for (size_t y = 0; y < S; y++) {
+    for (size_t x = 0; x < S; x++) {
+      out[y * kBlockDim + x] = temp[y * kBlockDim + x];
+    }
+  }
 }
 
 HWY_ALIGN static constexpr float k4x4AFVBasisTranspose[16][16] = {
@@ -476,6 +436,7 @@ void AFVDCT4x4(const float* JXL_RESTRICT pixels, float* JXL_RESTRICT coeffs) {
 // Variant of AFVDCT4x4 that reads the oriented 4x4 quadrant directly from the
 // strided 8x8 pixel block, eliminating the intermediate block[] copy.
 // afv_kind encodes which quadrant (bit 0 = flip-x, bit 1 = flip-y).
+// Benchmarked ~7% faster than the copy+AFVDCT4x4 path (enc_transforms_gbench.cc).
 template <size_t afv_kind>
 HWY_INLINE void AFVDCT4x4Strided(const float* JXL_RESTRICT pixels,
                                   const size_t pixels_stride,
@@ -652,7 +613,9 @@ HWY_MAYBE_UNUSED void TransformFromPixels(const AcStrategyType strategy,
       break;
     }
     case Type::DCT2X2: {
-      DCT2Transform8x8(pixels, pixels_stride, coefficients);
+      DCT2TopBlock<8>(pixels, pixels_stride, coefficients);
+      DCT2TopBlock<4>(coefficients, kBlockDim, coefficients);
+      DCT2TopBlock<2>(coefficients, kBlockDim, coefficients);
       break;
     }
     case Type::DCT16X16: {
