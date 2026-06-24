@@ -75,6 +75,32 @@ void QuantizeBlockAC(const Quantizer& quantizer, const bool error_diffusion,
   HWY_CAPPED(int32_t, kBlockDim) di;
   HWY_CAPPED(uint32_t, kBlockDim) du;
   const auto quantv = Set(df, qac * qm_multiplier);
+  // Fast path for the dominant wide-vector case where one SIMD vector spans the
+  // full kBlockDim-wide row (AVX2, or AVX-512 capped to kBlockDim). There the
+  // per-quadrant threshold vectors are loop-invariant, so build them once instead
+  // of re-loading the column mask and re-broadcasting the thresholds on every row.
+  // Byte-identical to the general path below (verified: max_abs_diff == 0).
+  if (xsize == 1 && Lanes(df) >= kBlockDim) {
+    HWY_ALIGN static const uint32_t kMask[kBlockDim] = {0, 0, 0, 0,
+                                                        ~0u, ~0u, ~0u, ~0u};
+    const auto mask = MaskFromVec(BitCast(df, Load(du, kMask)));
+    const auto thr_top =
+        IfThenElse(mask, Set(df, thresholds[1]), Set(df, thresholds[0]));
+    const auto thr_bot =
+        IfThenElse(mask, Set(df, thresholds[3]), Set(df, thresholds[2]));
+    for (size_t y = 0; y < ysize * kBlockDim; y++) {
+      const size_t yfix = static_cast<size_t>(y >= ysize * kBlockDim / 2) * 2;
+      const size_t off = y * kBlockDim;  // xsize == 1
+      const auto threshold = (yfix == 0) ? thr_top : thr_bot;
+      const auto q = Mul(Load(df, qm + off), quantv);
+      const auto in = Load(df, block_in + off);
+      const auto val = Mul(q, in);
+      const auto nzero_mask = Ge(Abs(val), threshold);
+      const auto v = ConvertTo(di, IfThenElseZero(nzero_mask, Round(val)));
+      Store(v, di, block_out + off);
+    }
+    return;
+  }
   for (size_t y = 0; y < ysize * kBlockDim; y++) {
     size_t yfix = static_cast<size_t>(y >= ysize * kBlockDim / 2) * 2;
     const size_t off = y * kBlockDim * xsize;
