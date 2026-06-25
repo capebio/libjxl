@@ -517,15 +517,6 @@ Status DecodeACVarBlock(size_t ctx_offset, size_t log2_covered_blocks,
 // image provided by the encoder.
 
 struct GetBlockFromBitstream : public GetBlock {
-  // Function pointer type for the instantiated DecodeACVarBlock. Selected once
-  // per pass in Init() — avoids repeated conditional selection per coded block.
-  using DecodeACFn = Status (*)(size_t, size_t, int32_t*, const int32_t*,
-                                size_t, size_t, size_t, size_t, size_t,
-                                AcStrategy, const coeff_order_t*, BitReader*,
-                                ANSSymbolReader*, const std::vector<uint8_t>&,
-                                const uint8_t*, const int32_t*,
-                                const BlockCtxMap&, ACPtr, size_t);
-
   void StartRow(size_t by) override {
     qf_row = rect.ConstRow(*qf, by);
     quant_dc_row = quant_dc->ConstRow(rect.y0() + by) + rect.x0();
@@ -543,16 +534,22 @@ struct GetBlockFromBitstream : public GetBlock {
 
   Status LoadBlock(size_t bx, size_t by, const AcStrategy& acs, size_t size,
                    size_t log2_covered_blocks, ACPtr block[3],
-                   ACType /*ac_type*/) override {
+                   ACType ac_type) override {
     for (size_t c : {1, 0, 2}) {
-      const size_t sbx = bx >> hshift[c];
-      const size_t sby = by >> vshift[c];
+      size_t sbx = bx >> hshift[c];
+      size_t sby = by >> vshift[c];
       if (JXL_UNLIKELY((sbx << hshift[c] != bx) || (sby << vshift[c] != by))) {
         continue;
       }
 
-      for (size_t pass = 0; JXL_UNLIKELY(pass < num_passes); ++pass) {
-        JXL_RETURN_IF_ERROR(decode_ac[pass](
+      for (size_t pass = 0; JXL_UNLIKELY(pass < num_passes); pass++) {
+        auto decode_ac_varblock =
+            decoders[pass].UsesLZ77()
+                ? (ac_type == ACType::k16 ? DecodeACVarBlock<ACType::k16, 1>
+                                          : DecodeACVarBlock<ACType::k32, 1>)
+                : (ac_type == ACType::k16 ? DecodeACVarBlock<ACType::k16, 0>
+                                          : DecodeACVarBlock<ACType::k32, 0>);
+        JXL_RETURN_IF_ERROR(decode_ac_varblock(
             ctx_offset[pass], log2_covered_blocks, row_nzeros[pass][c],
             row_nzeros_top[pass][c], nzeros_stride, c, sbx, sby, bx, acs,
             &coeff_orders[pass * coeff_order_size], readers[pass],
@@ -585,9 +582,7 @@ struct GetBlockFromBitstream : public GetBlock {
     qf = &dec_state->shared->raw_quant_field;
     quant_dc = &dec_state->shared->quant_dc;
 
-    const ACType ac_type = dec_state->coefficients->Type();
-
-    for (size_t pass = 0; pass < num_passes; ++pass) {
+    for (size_t pass = 0; pass < num_passes; pass++) {
       // Select which histogram set to use among those of the current pass.
       size_t cur_histogram = 0;
       if (histo_selector_bits != 0) {
@@ -602,15 +597,6 @@ struct GetBlockFromBitstream : public GetBlock {
           decoders[pass],
           ANSSymbolReader::Create(&dec_state->code[pass + first_pass],
                                   readers[pass]));
-
-      // Cache function pointer: ac_type and lz77 usage are pass-invariant
-      // within a group, so select once rather than per coded block.
-      decode_ac[pass] =
-          decoders[pass].UsesLZ77()
-              ? (ac_type == ACType::k16 ? &DecodeACVarBlock<ACType::k16, 1>
-                                        : &DecodeACVarBlock<ACType::k32, 1>)
-              : (ac_type == ACType::k16 ? &DecodeACVarBlock<ACType::k16, 0>
-                                        : &DecodeACVarBlock<ACType::k32, 0>);
     }
     nzeros_stride = group_dec_cache->num_nzeroes[0].PixelsPerRow();
     for (size_t i = 0; i < num_passes; i++) {
@@ -626,7 +612,6 @@ struct GetBlockFromBitstream : public GetBlock {
   size_t coeff_order_size;
   const std::vector<uint8_t>* JXL_RESTRICT context_map;
   ANSSymbolReader decoders[kMaxNumPasses];
-  DecodeACFn decode_ac[kMaxNumPasses];  // cached once in Init per pass
   BitReader* JXL_RESTRICT* JXL_RESTRICT readers;
   size_t num_passes;
   size_t ctx_offset[kMaxNumPasses];
