@@ -369,12 +369,12 @@ void EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
   float* scratch_space = full_scratch_space + AcStrategy::kMaxCoeffArea;
   const size_t size = (1 << acs.log2_covered_blocks()) * kDCTBlockSize;
 
-  // Apply transform.
-  for (size_t c = 0; c < 3; c++) {
-    float* JXL_RESTRICT block_c = block + size * c;
-    TransformFromPixels(acs.Strategy(), &config.Pixel(c, x, y),
-                        config.src_stride, block_c, scratch_space);
-  }
+  // Lazy-B: transform Y (c=1) and X (c=0) upfront; defer B (c=2) until both
+  // survive per-channel rate pruning below.
+  TransformFromPixels(acs.Strategy(), &config.Pixel(1, x, y),
+                      config.src_stride, block + size, scratch_space);
+  TransformFromPixels(acs.Strategy(), &config.Pixel(0, x, y),
+                      config.src_stride, block, scratch_space);
   HWY_FULL(float) df;
 
   const size_t num_blocks = acs.covered_blocks_x() * acs.covered_blocks_y();
@@ -411,19 +411,24 @@ void EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
     quant_norm16 = FastPowf(quant_norm16, 1.0f / 16.0f);
   }
   const auto quant = Set(df, quant_norm16);
+  const size_t coeff_total = num_blocks * kDCTBlockSize;
+  const float w_large =
+      num_blocks >= 2
+          ? 1.0f + static_cast<float>(std::min(3.0, num_blocks / 8.0))
+          : 1.0f;
 
-  // Compute entropy. Rate first, loss second, so a candidate whose rate-only
-  // lower bound already reaches the incumbent (`prune_threshold`) can be dropped
-  // before the expensive inverse transform + masking walk. The spatial-loss term
-  // is non-negative, so rate*entropy_mul is a true lower bound on the final
-  // score; pruning is byte-exact because such a candidate would have scored
-  // >= the incumbent anyway, callers compare with strict <, and a pruned
-  // candidate never becomes the incumbent itself (its under-estimate is dropped).
+  // Compute entropy.
   const HWY_CAPPED(float, 8) df8;
 
-  // --- Phase 1: rate (entropy) for all three channels, no loss. ---
+  auto loss = Zero(df8);
   for (size_t c = 0; c < 3; c++) {
+    // Lazy-B: defer B (c=2) transform until X and Y pass per-channel pruning.
+    if (c == 2) {
+      TransformFromPixels(acs.Strategy(), &config.Pixel(2, x, y),
+                          config.src_stride, block + 2 * size, scratch_space);
+    }
     const float* inv_matrix = config.dequant->InvMatrix(acs.Strategy(), c);
+    const float* matrix = config.dequant->Matrix(acs.Strategy(), c);
     // The Y channel (c == 1) has a fixed zero color-correlation factor
     // (cmap_factors[1] == 0.0f), so `in - Y * 0 == in` for finite coefficients:
     // skip the redundant Y load + subtract on that third of the work.
@@ -432,7 +437,7 @@ void EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
 
     auto entropy_v = Zero(df);
     auto nzeros_v = Zero(df);
-    for (size_t i = 0; i < num_blocks * kDCTBlockSize; i += Lanes(df)) {
+    for (size_t i = 0; i < coeff_total; i += Lanes(df)) {
       const auto in = Load(df, block + c * size + i);
       const auto im = Load(df, inv_matrix + i);
       const auto scaled = Mul(im, quant);
@@ -441,6 +446,9 @@ void EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
                : Mul(Sub(in, Mul(Load(df, block + size + i), cmap_factor)),
                      scaled);
       const auto rval = Round(val);
+      const auto diff = Sub(val, rval);
+      const auto m = Load(df, matrix + i);
+      Store(Mul(m, diff), df, &mem[i]);
       const auto q = Abs(rval);
       const auto q_is_zero = Eq(q, Zero(df));
       // We used to have q * C here, but that cost model seems to
@@ -448,57 +456,27 @@ void EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
       // to avoid large values less aggressively.
       entropy_v = Add(Sqrt(q), entropy_v);
       nzeros_v = Add(nzeros_v, IfThenZeroElse(q_is_zero, Set(df, 1.0f)));
-    }
-    entropy += config.cost_delta * GetLane(SumOfLanes(df, entropy_v));
-    size_t num_nzeros = GetLane(SumOfLanes(df, nzeros_v));
-    // Add #bit of num_nonzeros, as an estimate of the cost for encoding the
-    // number of non-zeros of the block.
-    size_t nbits = CeilLog2Nonzero(num_nzeros + 1) + 1;
-    // Also add #bit of #bit of num_nonzeros, to estimate the ANS cost, with a
-    // bias.
-    entropy += config.zeros_mul * (CeilLog2Nonzero(nbits + 17) + nbits);
-    if (c == 0 && num_blocks >= 2) {
-      // It is X channel (red-green) and we often see ringing
-      // in the large blocks. Let's punish that more here.
-      float w = 1.0 + std::min(3.0, num_blocks / 8.0);
-      entropy *= w;
-    }
-  }
-
-  // --- Rate-only lower bound: prune if it cannot beat the incumbent. ---
-  // Compared in double against `prune_threshold` (the caller's double incumbent)
-  // so the prune decision matches the caller's `entropy < best` comparison.
-  const float rate_bound = entropy * entropy_mul;
-  if (static_cast<double>(rate_bound) >= prune_threshold) {
-    entropy = rate_bound;
-    return;
-  }
-
-  // --- Phase 2: spatial-loss term (inverse transform + masking walk). ---
-  // Recompute the per-channel dequantized residual `mem` (bit-identical to what
-  // phase 1 would have stored). `block` holds the forward coefficients on entry
-  // and is reused as the IDCT output, exactly as in the original fused loop, so
-  // the block/mem access pattern — and the result — is unchanged.
-  auto loss = Zero(df8);
-  if (config.mask1x1_xsize != 0) {
-    for (size_t c = 0; c < 3; c++) {
-      const float* inv_matrix = config.dequant->InvMatrix(acs.Strategy(), c);
-      const float* matrix = config.dequant->Matrix(acs.Strategy(), c);
-      const bool is_y = (c == 1);
-      const auto cmap_factor = Set(df, cmap_factors[c]);
-      for (size_t i = 0; i < num_blocks * kDCTBlockSize; i += Lanes(df)) {
-        const auto in = Load(df, block + c * size + i);
-        const auto im = Load(df, inv_matrix + i);
-        const auto scaled = Mul(im, quant);
-        const auto val =
-            is_y ? Mul(in, scaled)
-                 : Mul(Sub(in, Mul(Load(df, block + size + i), cmap_factor)),
-                       scaled);
-        const auto rval = Round(val);
-        const auto diff = Sub(val, rval);
-        const auto m = Load(df, matrix + i);
-        Store(Mul(m, diff), df, &mem[i]);
+      // Intra-channel lower-bound at 8×8 block boundaries. partial*w_large
+      // (c=0) or entropy+partial (c>0) lower-bounds the final score because
+      // all remaining channel contributions are non-negative.
+      const size_t next_i = i + Lanes(df);
+      if (num_blocks > 1 && next_i < coeff_total &&
+          (next_i & (kDCTBlockSize - 1)) == 0) {
+        const float partial =
+            config.cost_delta * GetLane(SumOfLanes(df, entropy_v));
+        const float lb = (c == 0) ? partial * w_large : entropy + partial;
+        const float lb_rate = lb * entropy_mul;
+        if (static_cast<double>(lb_rate) >= prune_threshold) {
+          entropy = lb_rate;
+          return;
+        }
       }
+    }
+
+    // When there is no 1x1 masking field, every iteration of the loop below is
+    // out of bounds and contributes nothing: `loss` stays exactly Zero. Skip
+    // the inverse transform and the whole masking walk in that case.
+    if (config.mask1x1_xsize != 0) {
       float masku_lut[3] = {
           12.0,
           0.0,
@@ -539,9 +517,30 @@ void EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
       };
       lossc = Mul(Set(df8, kChannelMul[c]), lossc);
       loss = Add(loss, lossc);
-      if (c == 0 && num_blocks >= 2) {
-        float w = 1.0 + std::min(3.0, num_blocks / 8.0);
-        loss = Mul(loss, Set(df8, w));
+    }
+    entropy += config.cost_delta * GetLane(SumOfLanes(df, entropy_v));
+    size_t num_nzeros = GetLane(SumOfLanes(df, nzeros_v));
+    // Add #bit of num_nonzeros, as an estimate of the cost for encoding the
+    // number of non-zeros of the block.
+    size_t nbits = CeilLog2Nonzero(num_nzeros + 1) + 1;
+    // Also add #bit of #bit of num_nonzeros, to estimate the ANS cost, with a
+    // bias.
+    entropy += config.zeros_mul * (CeilLog2Nonzero(nbits + 17) + nbits);
+    if (c == 0 && num_blocks >= 2) {
+      // It is X channel (red-green) and we often see ringing
+      // in the large blocks. Let's punish that more here.
+      float w = 1.0 + std::min(3.0, num_blocks / 8.0);
+      entropy *= w;
+      loss = Mul(loss, Set(df8, w));
+    }
+    // Per-channel rate prune: accumulated rate for channels 0..c already
+    // exceeds the incumbent → skip remaining channels (including lazy-B
+    // transform). Admissible: all remaining contributions are non-negative.
+    if (c < 2) {
+      const float rate_c = entropy * entropy_mul;
+      if (static_cast<double>(rate_c) >= prune_threshold) {
+        entropy = rate_c;
+        return;
       }
     }
   }
@@ -720,9 +719,6 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
       entropy_mul += kAvoidEntropyOfTransforms * mul;
     }
     float entropy;
-    // Pass the incumbent as a prune threshold: a candidate whose rate-only lower
-    // bound already reaches `best` cannot win, so EstimateEntropy may skip its
-    // inverse transforms + masking walk. Selection is unchanged (strict <).
     EstimateEntropy(acs, entropy_mul, x, y, config, cmap_factors, block,
                     scratch_space, entropy, best);
     if (entropy < best) {
