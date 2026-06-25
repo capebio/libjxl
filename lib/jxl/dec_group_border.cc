@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -22,19 +23,18 @@ void GroupBorderAssigner::Init(const FrameDimensions& frame_dim) {
   frame_dim_ = frame_dim;
   size_t x_size = frame_dim_.xsize_groups;
   size_t y_size = frame_dim_.ysize_groups;
-  counters_.resize(y_size + 1);
-  // Initialize counters.
-  for (auto& current_row : counters_) {
-    std::vector<std::atomic<uint32_t>> row((x_size + 1 + 7) / 8);
-    for (auto& v : row) {
-      v = 0;
-    }
-    row.swap(current_row);
+  // Flat 1D allocation: row y, word w → counters_[y * counters_stride_ + w].
+  // Eliminates one pointer dereference per GroupDone atomic op vs nested vectors.
+  counters_stride_ = (x_size + 1 + 7) / 8;
+  const size_t n = (y_size + 1) * counters_stride_;
+  counters_ = std::make_unique<std::atomic<uint32_t>[]>(n);
+  for (size_t i = 0; i < n; ++i) {
+    counters_[i] = 0;
   }
   // Counters at image borders don't have anything on the other side, we
   // pre-fill their value to have more uniform handling afterwards.
   auto set = [this](size_t x, size_t y, uint32_t corners) {
-    counters_[y][x / 8] |= corners << (4 * (x & 7u));
+    counters_[y * counters_stride_ + x / 8] |= corners << (4 * (x & 7u));
   };
   for (size_t x = 0; x < x_size + 1; x++) {
     set(x, 0, kTopLeft | kTopRight);
@@ -48,7 +48,8 @@ void GroupBorderAssigner::Init(const FrameDimensions& frame_dim) {
 
 void GroupBorderAssigner::ClearDone(size_t group_id) {
   auto clear = [this](size_t x, size_t y, uint32_t corners) {
-    counters_[y][x / 8].fetch_and(~(corners << (4 * (x & 7u))));
+    counters_[y * counters_stride_ + x / 8].fetch_and(
+        ~(corners << (4 * (x & 7u))), std::memory_order_release);
   };
   size_t x = group_id % frame_dim_.xsize_groups;
   size_t y = group_id / frame_dim_.xsize_groups;
@@ -81,7 +82,8 @@ void GroupBorderAssigner::GroupDone(size_t group_id, size_t padx, size_t pady,
     // Note that the acq-rel semantics of this fetch are actually needed to
     // ensure that the pixel data of the group is already written to memory.
     size_t shift = 4 * (x & 7u);
-    size_t status = counters_[y][x / 8].fetch_or(bit << shift);
+    size_t status =
+        counters_[y * counters_stride_ + x / 8].fetch_or(bit << shift);
     status >>= shift;
     JXL_DASSERT((bit & status) == 0);
     return (bit | status) & 0xF;

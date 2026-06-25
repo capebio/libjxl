@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "lib/jxl/base/rect.h"
@@ -32,7 +33,8 @@ class GroupBorderAssigner {
 
  private:
   FrameDimensions frame_dim_;
-  std::vector<std::vector<std::atomic<uint32_t>>> counters_;
+  std::unique_ptr<std::atomic<uint32_t>[]> counters_;
+  size_t counters_stride_ = 0;
 
   // Constants to identify group positions relative to the corners.
   static constexpr uint8_t kTopLeft = 0x01;

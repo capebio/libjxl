@@ -481,25 +481,27 @@ Status DecodeACVarBlock(size_t ctx_offset, size_t log2_covered_blocks,
       ctx_offset + block_ctx_map.ZeroDensityContextsOffset(block_ctx);
 
   size_t prev = (nzeros > size / 16 ? 0 : 1);
-  for (size_t k = covered_blocks; k < size && nzeros != 0; ++k) {
-    const size_t ctx =
-        histo_offset + ZeroDensityContext(nzeros, k, covered_blocks,
-                                          log2_covered_blocks, prev);
-    const size_t u_coeff =
-        decoder->ReadHybridUintInlined<uses_lz77>(ctx, br, context_map);
-    // Hand-rolled version of UnpackSigned, shifting before the conversion to
-    // signed integer to avoid undefined behavior of shifting negative numbers.
-    const size_t magnitude = u_coeff >> 1;
-    const size_t neg_sign = (~u_coeff) & 1;
-    const ptrdiff_t coeff =
-        static_cast<ptrdiff_t>((magnitude ^ (neg_sign - 1)) << shift);
-    if (ac_type == ACType::k16) {
-      block.ptr16[order[k]] += coeff;
-    } else {
-      block.ptr32[order[k]] += coeff;
+  if (JXL_LIKELY(nzeros != 0)) {
+    for (size_t k = covered_blocks; k < size && nzeros != 0; ++k) {
+      const size_t ctx =
+          histo_offset + ZeroDensityContext(nzeros, k, covered_blocks,
+                                            log2_covered_blocks, prev);
+      const size_t u_coeff =
+          decoder->ReadHybridUintInlined<uses_lz77>(ctx, br, context_map);
+      // Hand-rolled version of UnpackSigned, shifting before the conversion to
+      // signed integer to avoid undefined behavior of shifting negative numbers.
+      const size_t magnitude = u_coeff >> 1;
+      const size_t neg_sign = (~u_coeff) & 1;
+      const ptrdiff_t coeff =
+          static_cast<ptrdiff_t>((magnitude ^ (neg_sign - 1)) << shift);
+      if (ac_type == ACType::k16) {
+        block.ptr16[order[k]] += coeff;
+      } else {
+        block.ptr32[order[k]] += coeff;
+      }
+      prev = static_cast<size_t>(u_coeff != 0);
+      nzeros -= prev;
     }
-    prev = static_cast<size_t>(u_coeff != 0);
-    nzeros -= prev;
   }
   if (JXL_UNLIKELY(nzeros != 0)) {
     return JXL_FAILURE("Invalid AC: nzeros at end of block is %" PRIuS
@@ -542,7 +544,7 @@ struct GetBlockFromBitstream : public GetBlock {
         continue;
       }
 
-      for (size_t pass = 0; JXL_UNLIKELY(pass < num_passes); pass++) {
+      for (size_t pass = 0; pass < num_passes; pass++) {
         auto decode_ac_varblock =
             decoders[pass].UsesLZ77()
                 ? (ac_type == ACType::k16 ? DecodeACVarBlock<ACType::k16, 1>
