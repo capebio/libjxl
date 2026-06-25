@@ -184,9 +184,15 @@ void DequantBlock(float inv_global_scale, int quant, float x_dm_multiplier,
                          dequant_matrices, size, k, x_cc_mul, b_cc_mul, biases,
                          qblock, block);
   }
-  for (size_t c = 0; c < 3; c++) {
-    LowestFrequenciesFromDC(kind, dc_row[c] + sbx[c], dc_stride,
-                            block + c * size, scratch);
+  if (JXL_LIKELY(covered_blocks == 1)) {
+    block[0]        = dc_row[0][sbx[0]];
+    block[size]     = dc_row[1][sbx[1]];
+    block[2 * size] = dc_row[2][sbx[2]];
+  } else {
+    for (size_t c = 0; c < 3; c++) {
+      LowestFrequenciesFromDC(kind, dc_row[c] + sbx[c], dc_stride,
+                              block + c * size, scratch);
+    }
   }
 }
 

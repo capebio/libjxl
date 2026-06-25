@@ -67,7 +67,7 @@ template <size_t S>
 void IDCT2TopBlock(const float* block, size_t stride_out, float* out) {
   static_assert(kBlockDim % S == 0, "S should be a divisor of kBlockDim");
   static_assert(S % 2 == 0, "S should be even");
-  float temp[kDCTBlockSize];
+  float temp[S * kBlockDim];
   constexpr size_t num_2x2 = S / 2;
   for (size_t y = 0; y < num_2x2; y++) {
     for (size_t x = 0; x < num_2x2; x++) {
@@ -75,10 +75,12 @@ void IDCT2TopBlock(const float* block, size_t stride_out, float* out) {
       float c01 = block[y * kBlockDim + num_2x2 + x];
       float c10 = block[(y + num_2x2) * kBlockDim + x];
       float c11 = block[(y + num_2x2) * kBlockDim + num_2x2 + x];
-      float r00 = c00 + c01 + c10 + c11;
-      float r01 = c00 + c01 - c10 - c11;
-      float r10 = c00 - c01 + c10 - c11;
-      float r11 = c00 - c01 - c10 + c11;
+      float plus  = c00 + c01;
+      float minus = c00 - c01;
+      float r00 = (plus  + c10) + c11;
+      float r01 = (plus  - c10) - c11;
+      float r10 = (minus + c10) - c11;
+      float r11 = (minus - c10) + c11;
       temp[y * 2 * kBlockDim + x * 2] = r00;
       temp[y * 2 * kBlockDim + x * 2 + 1] = r01;
       temp[(y * 2 + 1) * kBlockDim + x * 2] = r10;
@@ -400,14 +402,15 @@ template <size_t afv_kind>
 void AFVTransformToPixels(const float* JXL_RESTRICT coefficients,
                           float* JXL_RESTRICT pixels, size_t pixels_stride) {
   HWY_ALIGN float scratch_space[4 * 8 * 4];
-  size_t afv_x = afv_kind & 1;
-  size_t afv_y = afv_kind / 2;
+  constexpr size_t afv_x = afv_kind & 1;
+  constexpr size_t afv_y = afv_kind / 2;
   float dcs[3] = {};
   float block00 = coefficients[0];
   float block01 = coefficients[1];
   float block10 = coefficients[8];
-  dcs[0] = (block00 + block10 + block01) * 4.0f;
-  dcs[1] = (block00 + block10 - block01);
+  const float afv_sum = block00 + block10;
+  dcs[0] = (afv_sum + block01) * 4.0f;
+  dcs[1] = afv_sum - block01;
   dcs[2] = block00 - block10;
   // IAFV: (even, even) positions.
   HWY_ALIGN float coeff[4 * 4];
@@ -466,10 +469,12 @@ HWY_MAYBE_UNUSED void TransformToPixels(const AcStrategyType strategy,
       float block01 = coefficients[1];
       float block10 = coefficients[8];
       float block11 = coefficients[9];
-      dcs[0] = block00 + block01 + block10 + block11;
-      dcs[1] = block00 + block01 - block10 - block11;
-      dcs[2] = block00 - block01 + block10 - block11;
-      dcs[3] = block00 - block01 - block10 + block11;
+      float dc_plus  = block00 + block01;
+      float dc_minus = block00 - block01;
+      dcs[0] = (dc_plus  + block10) + block11;
+      dcs[1] = (dc_plus  - block10) - block11;
+      dcs[2] = (dc_minus + block10) - block11;
+      dcs[3] = (dc_minus - block10) + block11;
       for (size_t y = 0; y < 2; y++) {
         for (size_t x = 0; x < 2; x++) {
           float block_dc = dcs[y * 2 + x];
@@ -480,19 +485,17 @@ HWY_MAYBE_UNUSED void TransformToPixels(const AcStrategyType strategy,
               residual_sum += coefficients[(y + iy * 2) * 8 + x + ix * 2];
             }
           }
-          pixels[(4 * y + 1) * pixels_stride + 4 * x + 1] =
-              block_dc - residual_sum * (1.0f / 16);
+          const float center = block_dc - residual_sum * (1.0f / 16);
+          pixels[(4 * y + 1) * pixels_stride + 4 * x + 1] = center;
           for (size_t iy = 0; iy < 4; iy++) {
             for (size_t ix = 0; ix < 4; ix++) {
               if (ix == 1 && iy == 1) continue;
               pixels[(y * 4 + iy) * pixels_stride + x * 4 + ix] =
-                  coefficients[(y + iy * 2) * 8 + x + ix * 2] +
-                  pixels[(4 * y + 1) * pixels_stride + 4 * x + 1];
+                  coefficients[(y + iy * 2) * 8 + x + ix * 2] + center;
             }
           }
           pixels[y * 4 * pixels_stride + x * 4] =
-              coefficients[(y + 2) * 8 + x + 2] +
-              pixels[(4 * y + 1) * pixels_stride + 4 * x + 1];
+              coefficients[(y + 2) * 8 + x + 2] + center;
         }
       }
       break;
@@ -505,13 +508,11 @@ HWY_MAYBE_UNUSED void TransformToPixels(const AcStrategyType strategy,
       dcs[1] = block0 - block1;
       for (size_t x = 0; x < 2; x++) {
         HWY_ALIGN float block[4 * 8];
-        block[0] = dcs[x];
         for (size_t iy = 0; iy < 4; iy++) {
-          for (size_t ix = 0; ix < 8; ix++) {
-            if (ix == 0 && iy == 0) continue;
-            block[iy * 8 + ix] = coefficients[(x + iy * 2) * 8 + ix];
-          }
+          memcpy(block + iy * 8, coefficients + (x + iy * 2) * 8,
+                 8 * sizeof(float));
         }
+        block[0] = dcs[x];
         ComputeScaledIDCT<8, 4>()(block, DCTTo(pixels + x * 4, pixels_stride),
                                   scratch_space);
       }
@@ -525,13 +526,11 @@ HWY_MAYBE_UNUSED void TransformToPixels(const AcStrategyType strategy,
       dcs[1] = block0 - block1;
       for (size_t y = 0; y < 2; y++) {
         HWY_ALIGN float block[4 * 8];
-        block[0] = dcs[y];
         for (size_t iy = 0; iy < 4; iy++) {
-          for (size_t ix = 0; ix < 8; ix++) {
-            if (ix == 0 && iy == 0) continue;
-            block[iy * 8 + ix] = coefficients[(y + iy * 2) * 8 + ix];
-          }
+          memcpy(block + iy * 8, coefficients + (y + iy * 2) * 8,
+                 8 * sizeof(float));
         }
+        block[0] = dcs[y];
         ComputeScaledIDCT<4, 8>()(
             block, DCTTo(pixels + y * 4 * pixels_stride, pixels_stride),
             scratch_space);
@@ -544,10 +543,12 @@ HWY_MAYBE_UNUSED void TransformToPixels(const AcStrategyType strategy,
       float block01 = coefficients[1];
       float block10 = coefficients[8];
       float block11 = coefficients[9];
-      dcs[0] = block00 + block01 + block10 + block11;
-      dcs[1] = block00 + block01 - block10 - block11;
-      dcs[2] = block00 - block01 + block10 - block11;
-      dcs[3] = block00 - block01 - block10 + block11;
+      float dc_plus  = block00 + block01;
+      float dc_minus = block00 - block01;
+      dcs[0] = (dc_plus  + block10) + block11;
+      dcs[1] = (dc_plus  - block10) - block11;
+      dcs[2] = (dc_minus + block10) - block11;
+      dcs[3] = (dc_minus - block10) + block11;
       for (size_t y = 0; y < 2; y++) {
         for (size_t x = 0; x < 2; x++) {
           HWY_ALIGN float block[4 * 4];
@@ -573,9 +574,8 @@ HWY_MAYBE_UNUSED void TransformToPixels(const AcStrategyType strategy,
       IDCT2TopBlock<4>(coeffs, kBlockDim, coeffs);
       IDCT2TopBlock<8>(coeffs, kBlockDim, coeffs);
       for (size_t y = 0; y < kBlockDim; y++) {
-        for (size_t x = 0; x < kBlockDim; x++) {
-          pixels[y * pixels_stride + x] = coeffs[y * kBlockDim + x];
-        }
+        memcpy(pixels + y * pixels_stride, coeffs + y * kBlockDim,
+               kBlockDim * sizeof(float));
       }
       break;
     }
