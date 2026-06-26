@@ -17,6 +17,9 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#ifdef JXL_DEC_TRANSFORM_STATS
+#include <atomic>
+#endif
 
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/chroma_from_luma.h"
@@ -86,6 +89,118 @@ struct JpegGroupParams {
   std::array<int, 3> dc_offset;
   bool is_gray = false;
 };
+
+#ifdef JXL_DEC_TRANSFORM_STATS
+// Compile-gated decode-path counters.  Enable with -DJXL_DEC_TRANSFORM_STATS.
+// Dumped to stderr at program exit via the static destructor.
+struct DecTransformStats {
+  static constexpr size_t kMaxStrats = 32;
+  static constexpr size_t kNzBuckets = 7;  // 0 | 1-2 | 3-4 | 5-8 | 9-16 | 17-32 | >32
+
+  static size_t NzBucket(size_t nz) {
+    if (nz == 0) return 0;
+    if (nz <= 2) return 1;
+    if (nz <= 4) return 2;
+    if (nz <= 8) return 3;
+    if (nz <= 16) return 4;
+    if (nz <= 32) return 5;
+    return 6;
+  }
+
+  std::atomic<uint64_t> block_count{0};
+  // strategy histogram
+  std::atomic<uint64_t> strat_blocks[kMaxStrats]{};
+  std::atomic<uint64_t> strat_coeffs[kMaxStrats]{};
+  // active component mask: bit0=X_active bit1=B_active (Y always active)
+  // slot 0=Y-only  1=X+Y  2=Y+B  3=X+Y+B
+  std::atomic<uint64_t> comp_mask[4]{};
+  // AC nzeros histogram per channel (0=X 1=Y 2=B)
+  std::atomic<uint64_t> nz_hist[3][kNzBuckets]{};
+  // CfL mode per block: bit0=x_cfl_active bit1=b_cfl_active
+  std::atomic<uint64_t> cfl_mode[4]{};
+  // coefficient pass mode
+  std::atomic<uint64_t> accumulate_blocks{0};
+  std::atomic<uint64_t> single_pass_blocks{0};
+  // dequant work ledger (coefficient slots = blocks * 64 per channel)
+  std::atomic<uint64_t> slots_total{0};    // 3 * size per block (always 3 channels)
+  std::atomic<uint64_t> slots_rendered{0}; // channels that pass the activity check
+  std::atomic<uint64_t> slots_inactive{0}; // channels that are skipped by IDCT/render
+
+  static DecTransformStats& Get() {
+    static DecTransformStats s;
+    return s;
+  }
+
+  ~DecTransformStats() { Print(); }
+
+  void Print() const {
+    const uint64_t total = block_count.load(std::memory_order_relaxed);
+    fprintf(stderr, "\n=== JXL_DEC_TRANSFORM_STATS: %llu blocks ===\n",
+            (unsigned long long)total);
+    if (total == 0) return;
+
+    fprintf(stderr, "--- Strategy (count | coeff_vol | %%blocks) ---\n");
+    for (size_t i = 0; i < kMaxStrats; i++) {
+      uint64_t bc = strat_blocks[i].load(std::memory_order_relaxed);
+      if (bc == 0) continue;
+      uint64_t cv = strat_coeffs[i].load(std::memory_order_relaxed);
+      fprintf(stderr, "  [%2zu] %8llu blk  %12llu coeff  %5.1f%%\n",
+              i, (unsigned long long)bc, (unsigned long long)cv,
+              100.0 * bc / total);
+    }
+
+    fprintf(stderr, "--- Active component mask ---\n");
+    static const char* const kMaskName[] = {"Y-only", "X+Y", "Y+B", "X+Y+B"};
+    for (int i = 0; i < 4; i++) {
+      uint64_t c = comp_mask[i].load(std::memory_order_relaxed);
+      if (c == 0) continue;
+      fprintf(stderr, "  %-8s %8llu  %5.1f%%\n", kMaskName[i],
+              (unsigned long long)c, 100.0 * c / total);
+    }
+
+    static const char* const kChName[] = {"X", "Y", "B"};
+    static const char* const kNzName[] = {"0","1-2","3-4","5-8","9-16","17-32",">32"};
+    fprintf(stderr, "--- AC nzeros histogram ---\n");
+    for (int c = 0; c < 3; c++) {
+      uint64_t ch_total = 0;
+      for (size_t b = 0; b < kNzBuckets; b++)
+        ch_total += nz_hist[c][b].load(std::memory_order_relaxed);
+      if (ch_total == 0) continue;
+      fprintf(stderr, "  %s:", kChName[c]);
+      for (size_t b = 0; b < kNzBuckets; b++) {
+        uint64_t cnt = nz_hist[c][b].load(std::memory_order_relaxed);
+        if (cnt == 0) continue;
+        fprintf(stderr, "  %s=%.1f%%", kNzName[b], 100.0 * cnt / ch_total);
+      }
+      fprintf(stderr, "\n");
+    }
+
+    fprintf(stderr, "--- CfL mode ---\n");
+    static const char* const kCflName[] = {"none","X-only","B-only","X+B"};
+    for (int i = 0; i < 4; i++) {
+      uint64_t c = cfl_mode[i].load(std::memory_order_relaxed);
+      if (c == 0) continue;
+      fprintf(stderr, "  %-8s %8llu  %5.1f%%\n", kCflName[i],
+              (unsigned long long)c, 100.0 * c / total);
+    }
+
+    uint64_t acc = accumulate_blocks.load(std::memory_order_relaxed);
+    uint64_t sp  = single_pass_blocks.load(std::memory_order_relaxed);
+    fprintf(stderr, "--- Pass mode ---\n");
+    fprintf(stderr, "  accumulate %llu  single-pass %llu\n",
+            (unsigned long long)acc, (unsigned long long)sp);
+
+    uint64_t sd = slots_total.load(std::memory_order_relaxed);
+    uint64_t sr = slots_rendered.load(std::memory_order_relaxed);
+    uint64_t si = slots_inactive.load(std::memory_order_relaxed);
+    fprintf(stderr, "--- Dequant work ledger ---\n");
+    fprintf(stderr, "  total=%llu  rendered=%llu (%.1f%%)  inactive=%llu (%.1f%%)\n",
+            (unsigned long long)sd,
+            (unsigned long long)sr, sd ? 100.0 * sr / sd : 0.0,
+            (unsigned long long)si, sd ? 100.0 * si / sd : 0.0);
+  }
+};
+#endif  // JXL_DEC_TRANSFORM_STATS
 
 }  // namespace jxl
 #endif  // LIB_JXL_DEC_GROUP_CC
@@ -424,6 +539,61 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
             TransformToPixels(acs.Strategy(), block + c * size, idct_pos,
                               idct_stride[c], group_dec_cache->scratch_space);
           }
+
+#ifdef JXL_DEC_TRANSFORM_STATS
+          {
+            auto& st = jxl::DecTransformStats::Get();
+            st.block_count.fetch_add(1, std::memory_order_relaxed);
+
+            // Strategy histogram.
+            const size_t strat_idx =
+                static_cast<size_t>(acs.Strategy()) % DecTransformStats::kMaxStrats;
+            st.strat_blocks[strat_idx].fetch_add(1, std::memory_order_relaxed);
+            st.strat_coeffs[strat_idx].fetch_add(size, std::memory_order_relaxed);
+
+            // Active component mask (Y always active; track X and B).
+            int cmask = 0;
+            if ((sbx[0] << hshift[0] == bx) && (sby[0] << vshift[0] == by)) cmask |= 1;
+            if ((sbx[2] << hshift[2] == bx) && (sby[2] << vshift[2] == by)) cmask |= 2;
+            st.comp_mask[cmask].fetch_add(1, std::memory_order_relaxed);
+
+            // AC nzeros per channel (skip LLF slots [0..covered_blocks)).
+            for (size_t c = 0; c < 3; c++) {
+              size_t nz = 0;
+              if (ac_type == ACType::k16) {
+                for (size_t k = covered_blocks; k < size; k++)
+                  if (qblock[c].ptr16[k]) nz++;
+              } else {
+                for (size_t k = covered_blocks; k < size; k++)
+                  if (qblock[c].ptr32[k]) nz++;
+              }
+              st.nz_hist[c][DecTransformStats::NzBucket(nz)]
+                  .fetch_add(1, std::memory_order_relaxed);
+            }
+
+            // CfL mode (nonzero cmap entry = active).
+            int cfl_mask = (row_cmap[0][abs_tx] != 0 ? 1 : 0) |
+                           (row_cmap[2][abs_tx] != 0 ? 2 : 0);
+            st.cfl_mode[cfl_mask].fetch_add(1, std::memory_order_relaxed);
+
+            // Pass mode.
+            if (accumulate) {
+              st.accumulate_blocks.fetch_add(1, std::memory_order_relaxed);
+            } else {
+              st.single_pass_blocks.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            // Dequant work ledger: always dequant 3 channels × size coeffs.
+            st.slots_total.fetch_add(3 * size, std::memory_order_relaxed);
+            for (size_t c = 0; c < 3; c++) {
+              if ((sbx[c] << hshift[c] == bx) && (sby[c] << vshift[c] == by)) {
+                st.slots_rendered.fetch_add(size, std::memory_order_relaxed);
+              } else {
+                st.slots_inactive.fetch_add(size, std::memory_order_relaxed);
+              }
+            }
+          }
+#endif  // JXL_DEC_TRANSFORM_STATS
         }
         bx += llf_x;
       }
