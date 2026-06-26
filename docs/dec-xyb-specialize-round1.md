@@ -70,8 +70,34 @@ Gray = bit-identical rows) + standalone-bench-verified bit-identical (Round 1) +
 wasm IEEE-float deterministic (no reordering). The unknown the rebuild was meant
 to resolve — does it compile + codegen on real wasm — is answered: YES.
 
-## Status
-Round 1 (isolate/measure) + Round 2 (wire + wasm compile-gate) DONE on branch
-`perf/dec-xyb-specialize` (commits 0fba1683, 4cf3a477). Remaining for merge:
-end-to-end SHA byte-exact + perf delta on a linkable wasm build, which needs the
-bridge.cpp/libjxl-symbol mismatch resolved first (user's call).
+## Round 3 (2026-06-26) — symbol mismatch resolved, e2e SHA byte-exact CONFIRMED
+
+The link blocker was the user's uncommitted paint-target WIP in the PRIMARY
+libjxl tree (4 files: decode.h/decode.cc/dec_frame.{cc,h}) declaring
+`JxlDecoderSetProgressivePaintTarget` + `JxlDecoderSetAllowAlphaProgressive`,
+which bridge.cpp (also uncommitted WIP) calls but which were absent at
+680ec439. Resolved by overlaying that primary WIP diff onto the worktree
+(`paint-target-full.patch`, applied uncommitted — NOT part of the perf branch),
+third_party junctioned from primary, built via `build-pgo.mjs --plain`.
+
+Built OLD (baseline dec_xyb + overlay) and NEW (specialized dec_xyb + overlay),
+both link clean. SHA-compared encode output (`tools/decxyb-sha-compare.mjs`;
+encode exercises OpsinToLinear / the EqualBias path):
+
+| image            | output  | OLD sha == NEW sha | encode Δ |
+|------------------|---------|--------------------|----------|
+| 256x171 tile     | 11352 B | YES (identical)    | -8.64%   |
+| 2732x3628 (9.9MP)| 2.85 MB | YES (identical)    | +1.06%   |
+
+**Byte-exact: YES on real wasm SIMD128** (two images, SHA-identical) — now
+confirmed THREE independent ways: construction, standalone microbench, and e2e
+wasm encode. The e2e encode Δ is noise (OpsinToLinear is a thin slice of encode);
+the real kernel win lives in Round 1's isolated numbers (EqualBias -2..6%, Gray
+-17..24% on 4-lane). Gray path is decode-only (not exercised by the encoder SHA
+test) but byte-exact by construction + bench-verified.
+
+## Status — DONE
+Branch `perf/dec-xyb-specialize`. Byte-exactness empirically proven on the real
+wasm target; compiles + links; kernel speedups measured in isolation. Ready for
+review/merge. (Merge into a tree that ALSO carries the paint-target libjxl WIP,
+or land dec_xyb independently — the two are orthogonal.)
