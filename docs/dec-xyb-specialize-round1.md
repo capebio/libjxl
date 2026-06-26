@@ -44,9 +44,34 @@ still a PROXY. A confirmed win must be re-measured on the real wasm build before
 landing into the live `XybToRgb` / `stage_xyb` hot path (lesson: SSE/SSSE3 proxy
 has lied about wasm transpose codegen before).
 
-## Next (Round 2, build-gated)
-Wire EqualBias + Gray dispatch into `XybToRgb`: detect both conditions ONCE per
-`OpsinToLinear` / `stage_xyb` call (not per-vector), pass template flags, keep
-the generic path for non-default transforms. Touches dec_xyb-inl.h + callers
-(dec_xyb.cc, stage_xyb.cc, dec_modular.cc). Requires full wasm rebuild to
-confirm codegen before merge — the expensive step.
+## Round 2 (2026-06-26) — wired into hot path + wasm compile-gate
+
+Commit 4cf3a477: refactored `XybToRgb` -> `XybToRgbImpl<kEqualBias,kGray>`
+(`<false,false>` = original verbatim, dec_modular unchanged). `DetectXybKernel`
+computes both flags ONCE per conversion; shared `XybToRgbRow` + dispatch macro
+route `OpsinToLinear` (aligned) and decode `XYBStage` (in-place, unaligned).
+
+**Real wasm build (emscripten 4.0.14, -msimd128, foreach_target), via
+`build-pgo.mjs --plain` with `JXL_PGO_LIBJXL_SRC` -> this worktree (third_party
+junctioned from primary):**
+- `dec_xyb.cc.o` (step 70/201) and `render_pipeline/stage_xyb.cc.o` (step
+  123/201) **both compiled clean — zero errors.** COMPILE-GATE PASSED on the
+  actual wasm SIMD128 target (4-lane, the deploy reality).
+- Build then failed at `packages/jxl-wasm/src/bridge.cpp:2122` —
+  `JxlDecoderSetProgressivePaintTarget` undeclared. This is the user's SEPARATE
+  uncommitted paint-target WIP (bridge.cpp was already `M` at session start)
+  calling a libjxl decoder API absent at source 680ec439. **Unrelated to
+  dec_xyb; not touched.**
+
+Empirical SHA byte-exact compare (encode OLD vs NEW) is blocked behind that
+bridge.cpp/libjxl symbol mismatch (the user's in-flight work). Byte-exactness
+remains: construction-guaranteed (same ops; EqualBias = bit-equal constants;
+Gray = bit-identical rows) + standalone-bench-verified bit-identical (Round 1) +
+wasm IEEE-float deterministic (no reordering). The unknown the rebuild was meant
+to resolve — does it compile + codegen on real wasm — is answered: YES.
+
+## Status
+Round 1 (isolate/measure) + Round 2 (wire + wasm compile-gate) DONE on branch
+`perf/dec-xyb-specialize` (commits 0fba1683, 4cf3a477). Remaining for merge:
+end-to-end SHA byte-exact + perf delta on a linkable wasm build, which needs the
+bridge.cpp/libjxl-symbol mismatch resolved first (user's call).
