@@ -38,8 +38,6 @@ struct CfLHeuristics {
   explicit CfLHeuristics(JxlMemoryManager* memory_manager)
       : memory_manager(memory_manager) {}
 
-  Status Init(const Rect& rect);
-
   Status PrepareForThreads(size_t num_threads) {
     size_t mem_bytes = num_threads * ItemsPerThread() * sizeof(float);
     JXL_ASSIGN_OR_RETURN(mem, AlignedMemory::Create(memory_manager, mem_bytes));
@@ -53,19 +51,16 @@ struct CfLHeuristics {
                      bool fast, size_t thread, ColorCorrelationMap* cmap);
 
   JxlMemoryManager* memory_manager;
-  ImageF dc_values;
   AlignedMemory mem;
 
   // Working set is too large for stack; allocate dynamically.
   static size_t ItemsPerThread() {
     const size_t dct_scratch_size =
         3 * (MaxVectorSize() / sizeof(float)) * AcStrategy::kMaxBlockDim;
-    const size_t dc_scratch_size =
-        3 * AcStrategy::kMaxCoeffBlocks * AcStrategy::kMaxCoeffBlocks;
-    return AcStrategy::kMaxCoeffArea * 3        // Blocks
-           + kColorTileDim * kColorTileDim * 4  // AC coeff storage
+    return AcStrategy::kMaxCoeffArea * 3        // Blocks (Y, X, B)
+           + kColorTileDim * kColorTileDim * 4  // AC residual coeff storage
            + AcStrategy::kMaxCoeffArea * 2      // Scratch space
-           + dct_scratch_size + dc_scratch_size;
+           + dct_scratch_size;
   }
 };
 

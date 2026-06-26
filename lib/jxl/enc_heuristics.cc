@@ -1147,7 +1147,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
         memory_manager, cparams, modular_frame_encoder, &matrices));
   }
 
-  JXL_RETURN_IF_ERROR(cfl_heuristics.Init(rect));
   JXL_RETURN_IF_ERROR(acs_heuristics.Init(*opsin, rect, initial_quant_field,
                                           initial_quant_masking,
                                           initial_quant_masking1x1, &matrices));

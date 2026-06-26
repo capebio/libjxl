@@ -55,13 +55,17 @@ static HWY_FULL(float) df;
 struct CFLFunction {
   static constexpr float kCoeff = 1.f / 3;
   static constexpr float kThres = 100.0f;
-  static constexpr float kInvColorFactor = 1.0f / kDefaultColorFactor;
-  CFLFunction(const float* values_m, const float* values_s, size_t num,
-              float base, float distance_mul)
-      : values_m(values_m),
-        values_s(values_s),
+  // values_a/values_b are the precomputed residual coefficients: the color
+  // residual is values_a[i] * x + values_b[i], with
+  //   values_a = luma / color_factor,  values_b = base * luma - chroma.
+  // Folding a/b into the producer loop keeps the 20 Newton iterations a pure
+  // load (no per-iteration Mul/Sub re-derivation) and is bit-identical to the
+  // previous in-solver recomputation.
+  CFLFunction(const float* values_a, const float* values_b, size_t num,
+              float distance_mul)
+      : values_a(values_a),
+        values_b(values_b),
         num(num),
-        base(base),
         distance_mul(distance_mul) {
     JXL_DASSERT(num % Lanes(df) == 0);
   }
@@ -73,12 +77,10 @@ struct CFLFunction {
     float first_derivative_peps = 2 * distance_mul * num * (x + eps);
     float first_derivative_meps = 2 * distance_mul * num * (x - eps);
 
-    const auto inv_color_factor = Set(df, kInvColorFactor);
     const auto thres = Set(df, kThres);
     const auto coeffx2 = Set(df, kCoeff * 2.0f);
     const auto one = Set(df, 1.0f);
     const auto zero = Set(df, 0.0f);
-    const auto base_v = Set(df, base);
     const auto x_v = Set(df, x);
     const auto xpe_v = Set(df, x + eps);
     const auto xme_v = Set(df, x - eps);
@@ -88,9 +90,8 @@ struct CFLFunction {
 
     for (size_t i = 0; i < num; i += Lanes(df)) {
       // color residual = ax + b
-      const auto a = Mul(inv_color_factor, Load(df, values_m + i));
-      const auto b =
-          Sub(Mul(base_v, Load(df, values_m + i)), Load(df, values_s + i));
+      const auto a = Load(df, values_a + i);
+      const auto b = Load(df, values_b + i);
       const auto v = MulAdd(a, x_v, b);
       const auto vpe = MulAdd(a, xpe_v, b);
       const auto vme = MulAdd(a, xme_v, b);
@@ -116,57 +117,15 @@ struct CFLFunction {
     return first_derivative + GetLane(SumOfLanes(df, fd_v));
   }
 
-  const float* JXL_RESTRICT values_m;
-  const float* JXL_RESTRICT values_s;
+  const float* JXL_RESTRICT values_a;
+  const float* JXL_RESTRICT values_b;
   size_t num;
-  float base;
   float distance_mul;
 };
 
-// Chroma-from-luma search, values_m will have luma -- and values_s chroma.
-int32_t FindBestMultiplier(const float* values_m, const float* values_s,
-                           size_t num, float base, float distance_mul,
-                           bool fast) {
-  if (num == 0) {
-    return 0;
-  }
-  float x;
-  if (fast) {
-    static constexpr float kInvColorFactor = 1.0f / kDefaultColorFactor;
-    auto ca = Zero(df);
-    auto cb = Zero(df);
-    const auto inv_color_factor = Set(df, kInvColorFactor);
-    const auto base_v = Set(df, base);
-    for (size_t i = 0; i < num; i += Lanes(df)) {
-      // color residual = ax + b
-      const auto a = Mul(inv_color_factor, Load(df, values_m + i));
-      const auto b =
-          Sub(Mul(base_v, Load(df, values_m + i)), Load(df, values_s + i));
-      ca = MulAdd(a, a, ca);
-      cb = MulAdd(a, b, cb);
-    }
-    // + distance_mul * x^2 * num
-    x = -GetLane(SumOfLanes(df, cb)) /
-        (GetLane(SumOfLanes(df, ca)) + num * distance_mul * 0.5f);
-  } else {
-    constexpr float eps = 100;
-    constexpr float kClamp = 20.0f;
-    CFLFunction fn(values_m, values_s, num, base, distance_mul);
-    x = 0;
-    // Up to 20 Newton iterations, with approximate derivatives.
-    // Derivatives are approximate due to the high amount of noise in the exact
-    // derivatives.
-    for (size_t i = 0; i < 20; i++) {
-      float dfpeps;
-      float dfmeps;
-      float d_f = fn.Compute(x, eps, &dfpeps, &dfmeps);
-      float ddf = (dfpeps - dfmeps) / (2 * eps);
-      float kExperimentalInsignificantStabilizer = 0.85;
-      float step = d_f / (ddf + kExperimentalInsignificantStabilizer);
-      x -= std::min(kClamp, std::max(-kClamp, step));
-      if (std::abs(step) < 3e-3) break;
-    }
-  }
+// Shrink the raw multiplier towards zero and clamp/round to the signed-byte
+// range. Shared epilogue for both the fast and robust solvers.
+int32_t QuantizeCflMultiplier(float x) {
   // CFL seems to be tricky for larger transforms for HF components
   // close to zero. This heuristic brings the solutions closer to zero
   // and reduces red-green oscillations. A better approach would
@@ -184,25 +143,46 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
   return jxl::Clamp1(std::round(x), -128.0f, 127.0f);
 }
 
-Status InitDCStorage(JxlMemoryManager* memory_manager, size_t num_blocks,
-                     ImageF* dc_values) {
-  // First row: Y channel
-  // Second row: X channel
-  // Third row: Y channel
-  // Fourth row: B channel
-  JXL_ASSIGN_OR_RETURN(
-      *dc_values,
-      ImageF::Create(memory_manager, RoundUpTo(num_blocks, Lanes(df)), 4));
-
-  JXL_ENSURE(dc_values->xsize() != 0);
-  // Zero-fill the last lanes
-  for (size_t y = 0; y < 4; y++) {
-    for (size_t x = dc_values->xsize() - Lanes(df); x < dc_values->xsize();
-         x++) {
-      dc_values->Row(y)[x] = 0;
-    }
+// Fast least-squares multiplier from the accumulated residual moments
+// sum_a2 = sum(a^2) and sum_ab = sum(a*b). The moments are accumulated by the
+// producer loop (ComputeTile), so the four per-tile coefficient streams never
+// need to be materialised and re-read in the fast path.
+int32_t FinishMultiplierFast(float sum_a2, float sum_ab, size_t num,
+                             float distance_mul) {
+  if (num == 0) {
+    return 0;
   }
-  return true;
+  // + distance_mul * x^2 * num
+  float x = -sum_ab / (sum_a2 + num * distance_mul * 0.5f);
+  return QuantizeCflMultiplier(x);
+}
+
+// Robust multiplier via up to 20 Newton iterations over the precomputed
+// residual coefficients (values_a = luma / color_factor,
+// values_b = base * luma - chroma).
+int32_t FindBestMultiplierRobust(const float* values_a, const float* values_b,
+                                 size_t num, float distance_mul) {
+  if (num == 0) {
+    return 0;
+  }
+  constexpr float eps = 100;
+  constexpr float kClamp = 20.0f;
+  CFLFunction fn(values_a, values_b, num, distance_mul);
+  float x = 0;
+  // Up to 20 Newton iterations, with approximate derivatives.
+  // Derivatives are approximate due to the high amount of noise in the exact
+  // derivatives.
+  for (size_t i = 0; i < 20; i++) {
+    float dfpeps;
+    float dfmeps;
+    float d_f = fn.Compute(x, eps, &dfpeps, &dfmeps);
+    float ddf = (dfpeps - dfmeps) / (2 * eps);
+    float kExperimentalInsignificantStabilizer = 0.85;
+    float step = d_f / (ddf + kExperimentalInsignificantStabilizer);
+    x -= std::min(kClamp, std::max(-kClamp, step));
+    if (std::abs(step) < 3e-3) break;
+  }
+  return QuantizeCflMultiplier(x);
 }
 
 Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
@@ -210,10 +190,9 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
                    const AcStrategyImage* ac_strategy,
                    const ImageI* raw_quant_field, const Quantizer* quantizer,
                    const Rect& rect, bool fast, bool use_dct8, ImageSB* map_x,
-                   ImageSB* map_b, ImageF* dc_values, Span<float> mem) {
+                   ImageSB* map_b, Span<float> mem) {
   static_assert(kEncTileDimInBlocks == kColorTileDimInBlocks,
                 "Invalid color tile dim");
-  size_t xsize_blocks = opsin_rect.xsize() / kBlockDim;
   constexpr float kDistanceMultiplierAC = 1e-9f;
   const size_t dct_scratch_size =
       3 * (MaxVectorSize() / sizeof(float)) * AcStrategy::kMaxBlockDim;
@@ -222,6 +201,7 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   const size_t x0 = rect.x0();
   const size_t x1 = rect.x0() + rect.xsize();
   const size_t y1 = rect.y0() + rect.ysize();
+  const size_t stride = opsin.PixelsPerRow();
 
   int ty = y0 / kColorTileDimInBlocks;
   int tx = x0 / kColorTileDimInBlocks;
@@ -229,29 +209,33 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   int8_t* JXL_RESTRICT row_out_x = map_x->Row(ty);
   int8_t* JXL_RESTRICT row_out_b = map_b->Row(ty);
 
-  float* JXL_RESTRICT dc_values_yx = dc_values->Row(0);
-  float* JXL_RESTRICT dc_values_x = dc_values->Row(1);
-  float* JXL_RESTRICT dc_values_yb = dc_values->Row(2);
-  float* JXL_RESTRICT dc_values_b = dc_values->Row(3);
-
   // All are aligned.
   float* HWY_RESTRICT block_y = mem.begin();
   float* HWY_RESTRICT block_x = block_y + AcStrategy::kMaxCoeffArea;
   float* HWY_RESTRICT block_b = block_x + AcStrategy::kMaxCoeffArea;
   JXL_ENSURE(mem.remove_prefix(3 * AcStrategy::kMaxCoeffArea));
-  float* HWY_RESTRICT coeffs_yx = mem.begin();
-  float* HWY_RESTRICT coeffs_x = coeffs_yx + kColorTileDim * kColorTileDim;
-  float* HWY_RESTRICT coeffs_yb = coeffs_x + kColorTileDim * kColorTileDim;
-  float* HWY_RESTRICT coeffs_b = coeffs_yb + kColorTileDim * kColorTileDim;
+  // Per-tile residual coefficients in solver-native (a, b) form, where the
+  // color residual is a*x + b. Only materialised on the robust path, which
+  // re-reads them across up to 20 Newton iterations; the fast path accumulates
+  // its moments directly and never touches these.
+  float* HWY_RESTRICT coeffs_ax = mem.begin();
+  float* HWY_RESTRICT coeffs_bx = coeffs_ax + kColorTileDim * kColorTileDim;
+  float* HWY_RESTRICT coeffs_ab = coeffs_bx + kColorTileDim * kColorTileDim;
+  float* HWY_RESTRICT coeffs_bb = coeffs_ab + kColorTileDim * kColorTileDim;
   JXL_ENSURE(mem.remove_prefix(4 * kColorTileDim * kColorTileDim));
-  constexpr size_t dc_size =
-      AcStrategy::kMaxCoeffBlocks * AcStrategy::kMaxCoeffBlocks;
-  float* HWY_RESTRICT dc_y = mem.begin();
-  float* HWY_RESTRICT dc_x = dc_y + dc_size;
-  float* HWY_RESTRICT dc_b = dc_x + dc_size;
-  JXL_ENSURE(mem.remove_prefix(3 * dc_size));
   float* HWY_RESTRICT scratch_space = mem.begin();
   JXL_ENSURE(mem.size() == 2 * AcStrategy::kMaxCoeffArea + dct_scratch_size);
+
+  constexpr float kInvColorFactor = 1.0f / kDefaultColorFactor;
+  const auto inv_color_factor = Set(df, kInvColorFactor);
+  const auto base_x = Set(df, 0.0f);
+  const auto base_b = Set(df, jxl::cms::kYToBRatio);
+
+  // Fast-path moment accumulators: sum(a^2) and sum(a*b) per channel.
+  auto sum_a2_x = Zero(df);
+  auto sum_ab_x = Zero(df);
+  auto sum_a2_b = Zero(df);
+  auto sum_ab_b = Zero(df);
 
   size_t num_ac = 0;
 
@@ -262,54 +246,36 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
         opsin_rect.ConstPlaneRow(opsin, 0, y * kBlockDim);
     const float* JXL_RESTRICT row_b =
         opsin_rect.ConstPlaneRow(opsin, 2, y * kBlockDim);
-    size_t stride = opsin.PixelsPerRow();
 
     for (size_t x = x0; x < x1; x++) {
       AcStrategy acs = use_dct8
                            ? AcStrategy::FromRawStrategy(AcStrategyType::DCT)
                            : ac_strategy->ConstRow(y)[x];
       if (!acs.IsFirstBlock()) continue;
-      size_t xs = acs.covered_blocks_x();
-      TransformFromPixels(acs.Strategy(), row_y + x * kBlockDim, stride,
-                          block_y, scratch_space);
-      DCFromLowestFrequencies(acs.Strategy(), block_y, dc_y, xs, scratch_space);
-      TransformFromPixels(acs.Strategy(), row_x + x * kBlockDim, stride,
-                          block_x, scratch_space);
-      DCFromLowestFrequencies(acs.Strategy(), block_x, dc_x, xs, scratch_space);
-      TransformFromPixels(acs.Strategy(), row_b + x * kBlockDim, stride,
-                          block_b, scratch_space);
-      DCFromLowestFrequencies(acs.Strategy(), block_b, dc_b, xs, scratch_space);
-      const float* const JXL_RESTRICT qm_x =
-          dequant.InvMatrix(acs.Strategy(), 0);
-      const float* const JXL_RESTRICT qm_b =
-          dequant.InvMatrix(acs.Strategy(), 2);
-      float q_dc_x = use_dct8 ? 1 : 1.0f / quantizer->GetInvDcStep(0);
-      float q_dc_b = use_dct8 ? 1 : 1.0f / quantizer->GetInvDcStep(2);
-
-      // Copy DCs in dc_values.
-      for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
-        for (size_t ix = 0; ix < xs; ix++) {
-          dc_values_yx[(iy + y) * xsize_blocks + ix + x] =
-              dc_y[iy * xs + ix] * q_dc_x;
-          dc_values_x[(iy + y) * xsize_blocks + ix + x] =
-              dc_x[iy * xs + ix] * q_dc_x;
-          dc_values_yb[(iy + y) * xsize_blocks + ix + x] =
-              dc_y[iy * xs + ix] * q_dc_b;
-          dc_values_b[(iy + y) * xsize_blocks + ix + x] =
-              dc_b[iy * xs + ix] * q_dc_b;
-        }
-      }
+      const auto strategy = acs.Strategy();
+      const size_t cbx = acs.covered_blocks_x();
+      const size_t cby = acs.covered_blocks_y();
+      // The CfL map only consumes the AC coefficients. The DC values that used
+      // to be staged here fed a DC-correlation pass that no longer exists, so
+      // the transforms now drive the AC residual computation directly.
+      TransformFromPixels(strategy, row_y + x * kBlockDim, stride, block_y,
+                          scratch_space);
+      TransformFromPixels(strategy, row_x + x * kBlockDim, stride, block_x,
+                          scratch_space);
+      TransformFromPixels(strategy, row_b + x * kBlockDim, stride, block_b,
+                          scratch_space);
+      const float* const JXL_RESTRICT qm_x = dequant.InvMatrix(strategy, 0);
+      const float* const JXL_RESTRICT qm_b = dequant.InvMatrix(strategy, 2);
 
       // Do not use this block for computing AC CfL.
-      if (acs.covered_blocks_x() + x0 > x1 ||
-          acs.covered_blocks_y() + y0 > y1) {
+      if (cbx + x0 > x1 || cby + y0 > y1) {
         continue;
       }
 
-      // Copy AC coefficients in the local block. The order in which
+      // Lay out the AC coefficients contiguously. The order in which
       // coefficients get stored does not matter.
-      size_t cx = acs.covered_blocks_x();
-      size_t cy = acs.covered_blocks_y();
+      size_t cx = cbx;
+      size_t cy = cby;
       CoefficientLayout(&cy, &cx);
       // Zero out LFs. This introduces terms in the optimization loop that
       // don't affect the result, as they are all 0, but allow for simpler
@@ -336,20 +302,42 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
         const auto b_b = Load(df, block_b + i);
         const auto qqm_x = Mul(qv, Load(df, qm_x + i));
         const auto qqm_b = Mul(qv, Load(df, qm_b + i));
-        Store(Mul(b_y, qqm_x), df, coeffs_yx + num_ac);
-        Store(Mul(b_x, qqm_x), df, coeffs_x + num_ac);
-        Store(Mul(b_y, qqm_b), df, coeffs_yb + num_ac);
-        Store(Mul(b_b, qqm_b), df, coeffs_b + num_ac);
+        // Residual coefficients: color residual = a * x + b.
+        const auto m_x = Mul(b_y, qqm_x);
+        const auto a_x = Mul(inv_color_factor, m_x);
+        const auto bx = Sub(Mul(base_x, m_x), Mul(b_x, qqm_x));
+        const auto m_b = Mul(b_y, qqm_b);
+        const auto a_b = Mul(inv_color_factor, m_b);
+        const auto bb = Sub(Mul(base_b, m_b), Mul(b_b, qqm_b));
+        if (fast) {
+          sum_a2_x = MulAdd(a_x, a_x, sum_a2_x);
+          sum_ab_x = MulAdd(a_x, bx, sum_ab_x);
+          sum_a2_b = MulAdd(a_b, a_b, sum_a2_b);
+          sum_ab_b = MulAdd(a_b, bb, sum_ab_b);
+        } else {
+          Store(a_x, df, coeffs_ax + num_ac);
+          Store(bx, df, coeffs_bx + num_ac);
+          Store(a_b, df, coeffs_ab + num_ac);
+          Store(bb, df, coeffs_bb + num_ac);
+        }
         num_ac += Lanes(df);
       }
     }
   }
   JXL_ENSURE(num_ac % Lanes(df) == 0);
-  row_out_x[tx] = FindBestMultiplier(coeffs_yx, coeffs_x, num_ac, 0.0f,
-                                     kDistanceMultiplierAC, fast);
-  row_out_b[tx] =
-      FindBestMultiplier(coeffs_yb, coeffs_b, num_ac, jxl::cms::kYToBRatio,
-                         kDistanceMultiplierAC, fast);
+  if (fast) {
+    row_out_x[tx] = FinishMultiplierFast(GetLane(SumOfLanes(df, sum_a2_x)),
+                                         GetLane(SumOfLanes(df, sum_ab_x)),
+                                         num_ac, kDistanceMultiplierAC);
+    row_out_b[tx] = FinishMultiplierFast(GetLane(SumOfLanes(df, sum_a2_b)),
+                                         GetLane(SumOfLanes(df, sum_ab_b)),
+                                         num_ac, kDistanceMultiplierAC);
+  } else {
+    row_out_x[tx] = FindBestMultiplierRobust(coeffs_ax, coeffs_bx, num_ac,
+                                             kDistanceMultiplierAC);
+    row_out_b[tx] = FindBestMultiplierRobust(coeffs_ab, coeffs_bb, num_ac,
+                                             kDistanceMultiplierAC);
+  }
   return true;
 }
 
@@ -361,15 +349,7 @@ HWY_AFTER_NAMESPACE();
 #if HWY_ONCE
 namespace jxl {
 
-HWY_EXPORT(InitDCStorage);
 HWY_EXPORT(ComputeTile);
-
-Status CfLHeuristics::Init(const Rect& rect) {
-  size_t xsize_blocks = rect.xsize() / kBlockDim;
-  size_t ysize_blocks = rect.ysize() / kBlockDim;
-  return HWY_DYNAMIC_DISPATCH(InitDCStorage)(
-      memory_manager, xsize_blocks * ysize_blocks, &dc_values);
-}
 
 Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,
                                   const Rect& opsin_rect,
@@ -383,7 +363,7 @@ Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,
                       ItemsPerThread());
   return HWY_DYNAMIC_DISPATCH(ComputeTile)(
       opsin, opsin_rect, dequant, ac_strategy, raw_quant_field, quantizer, r,
-      fast, use_dct8, &cmap->ytox_map, &cmap->ytob_map, &dc_values, scratch);
+      fast, use_dct8, &cmap->ytox_map, &cmap->ytob_map, scratch);
 }
 
 Status ColorCorrelationEncodeDC(const ColorCorrelation& color_correlation,
