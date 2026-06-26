@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <deque>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -81,7 +82,7 @@ struct JxlEncoderFrameIndexBox {
 
   int64_t NF() const { return entries.size(); }
   bool StoreFrameIndexBox() {
-    for (auto e : entries) {
+    for (const auto& e : entries) {
       if (e.to_be_indexed) {
         return true;
       }
@@ -352,7 +353,9 @@ class JxlEncoderChunkedFrameAdapter {
 
     void CopyBuffer() {
       if (buffer_) {
-        copy_ = std::vector<uint8_t>(buffer_, buffer_ + buffer_size_);
+        const size_t logical_size =
+            stride_ * (ysize_ - 1) + xsize_ * bytes_per_pixel_;
+        copy_.assign(buffer_, buffer_ + logical_size);
         buffer_ = nullptr;
       }
     }
@@ -577,9 +580,18 @@ class JxlOutputProcessorBuffer {
   JxlOutputProcessorBuffer& operator=(const JxlOutputProcessorBuffer&) = delete;
   JxlOutputProcessorBuffer& operator=(
       JxlOutputProcessorBuffer&& other) noexcept {
-    data_ = other.data_;
-    size_ = other.size_;
-    wrapper_ = other.wrapper_;
+    if (this != &other) {
+      if (data_ != nullptr) {
+        jxl::Status s = release();
+        (void)s;
+      }
+      data_ = other.data_;
+      size_ = other.size_;
+      bytes_used_ = other.bytes_used_;
+      wrapper_ = other.wrapper_;
+      other.data_ = nullptr;
+      other.size_ = 0;
+    }
     return *this;
   }
 
@@ -617,7 +629,7 @@ struct JxlEncoder {
 
   size_t num_queued_frames;
   size_t num_queued_boxes;
-  std::vector<jxl::JxlEncoderQueuedInput> input_queue;
+  std::deque<jxl::JxlEncoderQueuedInput> input_queue;
   JxlEncoderOutputProcessorWrapper output_processor;
 
   // How many codestream bytes have been written, i.e.,

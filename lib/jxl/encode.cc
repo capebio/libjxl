@@ -438,9 +438,16 @@ jxl::Status JxlEncoder::AppendBox(const jxl::BoxType& type, bool unbounded,
 template <typename BoxContents>
 jxl::Status JxlEncoder::AppendBoxWithContents(const jxl::BoxType& type,
                                               const BoxContents& contents) {
-  size_t size = std::end(contents) - std::begin(contents);
-  return AppendBox(type, /*unbounded=*/false, size,
-                   [&]() { return AppendData(output_processor, contents); });
+  const size_t size = std::end(contents) - std::begin(contents);
+  const bool large = size >= jxl::kLargeBoxContentSizeThreshold;
+  uint8_t hdr[jxl::kLargeBoxHeaderSize];
+  const size_t hdr_size =
+      jxl::WriteBoxHeader(type, size, /*unbounded=*/false, large, hdr);
+  JXL_RETURN_IF_ERROR(AppendData(
+      output_processor, jxl::Span<const uint8_t>(hdr, hdr_size)));
+  JXL_RETURN_IF_ERROR(AppendData(output_processor, contents));
+  JXL_RETURN_IF_ERROR(output_processor.SetFinalizedPosition());
+  return jxl::OkStatus();
 }
 
 uint32_t JxlEncoderVersion(void) {
@@ -853,11 +860,13 @@ jxl::Status JxlEncoder::ProcessOneEnqueuedInput() {
         // Add jxll box directly after the ftyp box to indicate the codestream
         // level.
         const uint8_t level = static_cast<uint8_t>(codestream_level);
-        std::vector<uint8_t> jxll_box;
-        jxl::AppendBoxHeader(jxl::MakeBoxType("jxll"), 1,
-                             /*unbounded=*/false, &jxll_box);
-        jxll_box.push_back(level);
-        JXL_RETURN_IF_ERROR(AppendData(output_processor, jxll_box));
+        uint8_t jxll_buf[jxl::kSmallBoxHeaderSize + 1];
+        const size_t jxll_n = jxl::WriteBoxHeader(
+            jxl::MakeBoxType("jxll"), 1, /*unbounded=*/false,
+            /*force_large_box=*/false, jxll_buf);
+        jxll_buf[jxll_n] = level;
+        JXL_RETURN_IF_ERROR(AppendData(output_processor,
+            jxl::Span<const uint8_t>(jxll_buf, jxll_n + 1)));
       }
 
       // Whether to write the basic info and color profile header of the
@@ -902,7 +911,7 @@ jxl::Status JxlEncoder::ProcessOneEnqueuedInput() {
         std::move(input.frame);
     jxl::FJXLFrameUniquePtr fast_lossless_frame =
         std::move(input.fast_lossless_frame);
-    input_queue.erase(input_queue.begin());
+    input_queue.pop_front();
     num_queued_frames--;
     if (input_frame) {
       for (unsigned idx = 0; idx < input_frame->ec_initialized.size(); idx++) {
@@ -1089,7 +1098,7 @@ jxl::Status JxlEncoder::ProcessOneEnqueuedInput() {
     if (MustUseContainer(output_mode) &&
         (output_mode != 2 || jxlp_counter == n1)) {
       JXL_RETURN_IF_ERROR(output_processor.Seek(frame_start_pos));
-      std::vector<uint8_t> box_header(box_header_size);
+      std::array<uint8_t, jxl::kLargeBoxHeaderSize + 4> box_header{};
       // For mode 2 fallback the box wraps only the frame data (not
       // header_bytes).
       const size_t frame_content_size =
@@ -1118,7 +1127,8 @@ jxl::Status JxlEncoder::ProcessOneEnqueuedInput() {
         WriteJxlpBoxCounter(jxlp_counter++, last_frame,
                             &box_header[box_header_size - 4]);
       }
-      JXL_RETURN_IF_ERROR(AppendData(output_processor, box_header));
+      JXL_RETURN_IF_ERROR(AppendData(output_processor,
+          jxl::Span<const uint8_t>(box_header.data(), box_header_size)));
       JXL_ENSURE(output_processor.CurrentPosition() ==
                  frame_start_pos + box_header_size);
       JXL_RETURN_IF_ERROR(output_processor.Seek(content_start + content_size));
@@ -1136,7 +1146,7 @@ jxl::Status JxlEncoder::ProcessOneEnqueuedInput() {
     // Not a frame, so is a box instead
     jxl::MemoryManagerUniquePtr<jxl::JxlEncoderQueuedBox> box =
         std::move(input.box);
-    input_queue.erase(input_queue.begin());
+    input_queue.pop_front();
     num_queued_boxes--;
 
     if (box->compress_box) {
@@ -2290,7 +2300,7 @@ JxlEncoderStatus JxlEncoderAddJPEGFrame(
           frame_settings->enc, JXL_ENC_ERR_JBRD,
           "JPEG bitstream reconstruction data cannot be encoded");
     }
-    frame_settings->enc->jpeg_metadata = jpeg_metadata;
+    frame_settings->enc->jpeg_metadata = std::move(jpeg_metadata);
   }
 
   jxl::JxlEncoderChunkedFrameAdapter frame_data(
