@@ -409,8 +409,11 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
     for (size_t tx = 0; tx < DivCeil(xsize_blocks, kColorTileDimInBlocks);
          tx++) {
       size_t abs_tx = tx + block_rect.x0() / kColorTileDimInBlocks;
-      auto x_cc_mul = Set(d, color_correlation.YtoXRatio(row_cmap[0][abs_tx]));
-      auto b_cc_mul = Set(d, color_correlation.YtoBRatio(row_cmap[2][abs_tx]));
+      const float x_cc_mul_s = color_correlation.YtoXRatio(row_cmap[0][abs_tx]);
+      const float b_cc_mul_s = color_correlation.YtoBRatio(row_cmap[2][abs_tx]);
+      auto x_cc_mul = Set(d, x_cc_mul_s);
+      auto b_cc_mul = Set(d, b_cc_mul_s);
+      const bool no_cfl = (x_cc_mul_s == 0.0f && b_cc_mul_s == 0.0f);
       // Increment bx by llf_x because those iterations would otherwise
       // immediately continue (!IsFirstBlock). Reduces mispredictions.
       for (; bx < xsize_blocks && bx < (tx + 1) * kColorTileDimInBlocks;) {
@@ -451,6 +454,28 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
         JXL_RETURN_IF_ERROR(get_block->LoadBlock(
             bx, by, acs, size, log2_covered_blocks, qblock, ac_type));
         offset += size;
+
+        // DC-only fast path: detect channels where all AC coefficients are zero.
+        // Fires on ~89% X, ~86% B, and ~2-49% Y blocks in real photos.
+        bool dc_only[3] = {false, false, false};
+        if (JXL_LIKELY(!jpeg_data) && JXL_LIKELY(covered_blocks == 1)) {
+          for (size_t c = 0; c < 3; c++) {
+            if (c != 1 && !no_cfl) continue;
+            bool all_zero = true;
+            if (ac_type == ACType::k16) {
+              const int16_t* JXL_RESTRICT p = qblock[c].ptr16;
+              for (size_t k = 1; k < size; k++) {
+                if (p[k]) { all_zero = false; break; }
+              }
+            } else {
+              const int32_t* JXL_RESTRICT p = qblock[c].ptr32;
+              for (size_t k = 1; k < size; k++) {
+                if (p[k]) { all_zero = false; break; }
+              }
+            }
+            dc_only[c] = all_zero;
+          }
+        }
 
         if (JXL_UNLIKELY(jpeg_data)) {
           if (acs.Strategy() != AcStrategyType::DCT) {
@@ -520,24 +545,34 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
           }
         } else {
           HWY_ALIGN float* const block = group_dec_cache->dec_group_block;
-          // Dequantize and add predictions.
-          dequant_block(
-              inv_global_scale, row_quant[bx], dec_state->x_dm_multiplier,
-              dec_state->b_dm_multiplier, x_cc_mul, b_cc_mul, acs.Strategy(),
-              size, dec_state->shared->quantizer,
-              acs.covered_blocks_y() * acs.covered_blocks_x(), sbx, dc_rows,
-              dc_stride,
-              dec_state->output_encoding_info.opsin_params.quant_biases, qblock,
-              block, group_dec_cache->scratch_space);
+          // Skip dequant entirely when all three channels are DC-only.
+          if (JXL_LIKELY(!(dc_only[0] && dc_only[1] && dc_only[2]))) {
+            dequant_block(
+                inv_global_scale, row_quant[bx], dec_state->x_dm_multiplier,
+                dec_state->b_dm_multiplier, x_cc_mul, b_cc_mul, acs.Strategy(),
+                size, dec_state->shared->quantizer,
+                acs.covered_blocks_y() * acs.covered_blocks_x(), sbx, dc_rows,
+                dc_stride,
+                dec_state->output_encoding_info.opsin_params.quant_biases, qblock,
+                block, group_dec_cache->scratch_space);
+          }
 
           for (size_t c : {1, 0, 2}) {
             if ((sbx[c] << hshift[c] != bx) || (sby[c] << vshift[c] != by)) {
               continue;
             }
-            // IDCT
             float* JXL_RESTRICT idct_pos = idct_row[c] + sbx[c] * kBlockDim;
-            TransformToPixels(acs.Strategy(), block + c * size, idct_pos,
-                              idct_stride[c], group_dec_cache->scratch_space);
+            if (dc_only[c]) {
+              // IDCT([DC,0,...]) = DC everywhere: fill directly, skip IDCT.
+              const float dc_val = dc_rows[c][sbx[c]];
+              for (size_t y = 0; y < kBlockDim; y++) {
+                float* JXL_RESTRICT r = idct_pos + y * idct_stride[c];
+                for (size_t x = 0; x < kBlockDim; x++) r[x] = dc_val;
+              }
+            } else {
+              TransformToPixels(acs.Strategy(), block + c * size, idct_pos,
+                                idct_stride[c], group_dec_cache->scratch_space);
+            }
           }
 
 #ifdef JXL_DEC_TRANSFORM_STATS
