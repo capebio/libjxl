@@ -415,24 +415,32 @@ size_t WriteBoxHeader(const jxl::BoxType& type, size_t size, bool unbounded,
 template <typename T>
 void AppendBoxHeader(const jxl::BoxType& type, size_t size, bool unbounded,
                      T* output) {
-  size_t current_size = output->size();
-  output->resize(current_size + kLargeBoxHeaderSize);
-  size_t header_size =
-      WriteBoxHeader(type, size, unbounded, /*force_large_box=*/false,
-                     output->data() + current_size);
-  output->resize(current_size + header_size);
+  uint8_t hdr[kLargeBoxHeaderSize];
+  size_t hdr_size = WriteBoxHeader(type, size, unbounded,
+                                   /*force_large_box=*/false, hdr);
+  size_t n = output->size();
+  output->resize(n + hdr_size);
+  memcpy(output->data() + n, hdr, hdr_size);
 }
 
-// Returns the JXL container signature box and ftyp box.
+// Exact byte count: 12-byte JXL sig + 8-byte ftyp header + 12-byte ftyp body.
+static constexpr size_t kContainerHeaderSize =
+    kJxlSignatureBox.size() + kSmallBoxHeaderSize + 12;
+
+// Returns the JXL container signature box and ftyp box on the stack.
 // ftyp_version: 0 = standard delivery order, 1 = out-of-order jxlp boxes.
-inline std::vector<uint8_t> MakeContainerHeader(int ftyp_version) {
-  std::vector<uint8_t> out(kJxlSignatureBox.begin(), kJxlSignatureBox.end());
+inline std::array<uint8_t, kContainerHeaderSize> MakeContainerHeader(
+    int ftyp_version) {
+  std::array<uint8_t, kContainerHeaderSize> out{};
+  size_t pos = 0;
+  for (uint8_t b : kJxlSignatureBox) out[pos++] = b;
   // ftyp box: major brand "jxl ", minor version, compatible brand "jxl ".
   const uint8_t ftyp[] = {'j', 'x', 'l', ' ',
                            0,   0,   0,   static_cast<uint8_t>(ftyp_version),
                            'j', 'x', 'l', ' '};
-  AppendBoxHeader(MakeBoxType("ftyp"), sizeof(ftyp), /*unbounded=*/false, &out);
-  out.insert(out.end(), ftyp, ftyp + sizeof(ftyp));
+  pos += WriteBoxHeader(MakeBoxType("ftyp"), sizeof(ftyp), /*unbounded=*/false,
+                        /*force_large_box=*/false, out.data() + pos);
+  for (uint8_t b : ftyp) out[pos++] = b;
   return out;
 }
 

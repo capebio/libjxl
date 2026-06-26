@@ -479,32 +479,31 @@ void QueueFrame(
     frame->option_values.cparams.SetLossless();
   }
 
-  jxl::JxlEncoderQueuedInput queued_input(frame_settings->enc->memory_manager);
   int om = frame->option_values.cparams.output_mode;
   if (om < 0) om = (frame->option_values.cparams.buffering == 3 ? 1 : 0);
-  queued_input.output_mode = om;
-  queued_input.frame = std::move(frame);
-  frame_settings->enc->input_queue.emplace_back(std::move(queued_input));
+  frame_settings->enc->input_queue.emplace_back(frame_settings->enc->memory_manager);
+  auto& qi_frame = frame_settings->enc->input_queue.back();
+  qi_frame.output_mode = om;
+  qi_frame.frame = std::move(frame);
   frame_settings->enc->num_queued_frames++;
 }
 
 void QueueFastLosslessFrame(const JxlEncoderFrameSettings* frame_settings,
                             JxlFastLosslessFrameState* fast_lossless_frame) {
-  jxl::JxlEncoderQueuedInput queued_input(frame_settings->enc->memory_manager);
-  queued_input.fast_lossless_frame.reset(fast_lossless_frame);
   int om = frame_settings->values.cparams.output_mode;
   if (om < 0) om = (frame_settings->values.cparams.buffering == 3 ? 1 : 0);
   if (om == 2) om = 1;  // OOO streaming not implemented for fast_lossless
-  queued_input.output_mode = om;
-  frame_settings->enc->input_queue.emplace_back(std::move(queued_input));
+  frame_settings->enc->input_queue.emplace_back(frame_settings->enc->memory_manager);
+  auto& qi_fl = frame_settings->enc->input_queue.back();
+  qi_fl.fast_lossless_frame.reset(fast_lossless_frame);
+  qi_fl.output_mode = om;
   frame_settings->enc->num_queued_frames++;
 }
 
 void QueueBox(JxlEncoder* enc,
               jxl::MemoryManagerUniquePtr<jxl::JxlEncoderQueuedBox>& box) {
-  jxl::JxlEncoderQueuedInput queued_input(enc->memory_manager);
-  queued_input.box = std::move(box);
-  enc->input_queue.emplace_back(std::move(queued_input));
+  enc->input_queue.emplace_back(enc->memory_manager);
+  enc->input_queue.back().box = std::move(box);
   enc->num_queued_boxes++;
 }
 
