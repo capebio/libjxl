@@ -1424,6 +1424,40 @@ JXL_EXPORT JxlDecoderStatus
 JxlDecoderSetProgressiveDetail(JxlDecoder* dec, JxlProgressiveDetail detail);
 
 /**
+ * Sets a target number of progressive AC paints (including the final image) for
+ * `kPasses` progressive detail. The default value 0 keeps the legacy behaviour
+ * of pausing after every encoded pass. When set to a value in
+ * [2, num_passes), the decoder places that many evenly spaced
+ * ::JXL_DEC_FRAME_PROGRESSION events across the passes instead of one per pass,
+ * letting the caller trade refinement granularity against per-paint flush cost.
+ * Values >= num_passes or < 2 fall back to per-pass pausing.
+ *
+ * This is a libjxl extension (not part of the upstream JPEG XL API).
+ *
+ * @param dec decoder object
+ * @param paints target number of AC paints, or 0 for per-pass (default)
+ * @return ::JXL_DEC_SUCCESS
+ */
+JXL_EXPORT JxlDecoderStatus
+JxlDecoderSetProgressivePaintTarget(JxlDecoder* dec, uint32_t paints);
+
+/**
+ * Allows progressive pausing (::JXL_DEC_FRAME_PROGRESSION) for VarDCT frames
+ * that have extra channels such as alpha. By default libjxl disables progressive
+ * pausing whenever an extra channel is present; this opt-in lifts that for
+ * VarDCT, where intermediate flushes are valid and the final image is unchanged.
+ * Has no effect on modular frames.
+ *
+ * This is a libjxl extension (not part of the upstream JPEG XL API).
+ *
+ * @param dec decoder object
+ * @param allow JXL_TRUE to allow alpha/extra-channel progressive pausing
+ * @return ::JXL_DEC_SUCCESS
+ */
+JXL_EXPORT JxlDecoderStatus
+JxlDecoderSetAllowAlphaProgressive(JxlDecoder* dec, JXL_BOOL allow);
+
+/**
  * Returns the intended downsampling ratio for the progressive frame produced
  * by @ref JxlDecoderFlushImage after the latest ::JXL_DEC_FRAME_PROGRESSION
  * event.

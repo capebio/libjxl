@@ -442,6 +442,14 @@ struct JxlDecoder {
 
   // The level of progressive detail in frame decoding.
   JxlProgressiveDetail prog_detail = kDC;
+  // Target number of progressive AC paints (incl. final) for kPasses detail.
+  // 0 = pause after every pass (legacy). Set via
+  // JxlDecoderSetProgressivePaintTarget.
+  uint32_t prog_paint_target = 0;
+  // Opt-in: allow progressive pausing for VarDCT frames with extra channels
+  // (e.g. alpha). Default false = conservative guard. Set via
+  // JxlDecoderSetAllowAlphaProgressive.
+  bool allow_alpha_progressive = false;
   // The progressive detail of the current frame.
   JxlProgressiveDetail frame_prog_detail;
   // The intended downsampling ratio for the current progression step.
@@ -1396,6 +1404,9 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
 
       if (!dec->preview_frame &&
           (dec->events_wanted & JXL_DEC_FRAME_PROGRESSION)) {
+        dec->frame_dec->SetProgressivePaintTarget(dec->prog_paint_target);
+        dec->frame_dec->SetAllowExtraChannelProgressive(
+            dec->allow_alpha_progressive);
         dec->frame_prog_detail =
             dec->frame_dec->SetPauseAtProgressive(dec->prog_detail);
       } else {
@@ -2929,6 +2940,18 @@ JxlDecoderStatus JxlDecoderSetProgressiveDetail(JxlDecoder* dec,
         kDC, kLastPasses, kPasses, detail);
   }
   dec->prog_detail = detail;
+  return JXL_DEC_SUCCESS;
+}
+
+JxlDecoderStatus JxlDecoderSetProgressivePaintTarget(JxlDecoder* dec,
+                                                     uint32_t paints) {
+  dec->prog_paint_target = paints;
+  return JXL_DEC_SUCCESS;
+}
+
+JxlDecoderStatus JxlDecoderSetAllowAlphaProgressive(JxlDecoder* dec,
+                                                    JXL_BOOL allow) {
+  dec->allow_alpha_progressive = !!allow;
   return JXL_DEC_SUCCESS;
 }
 

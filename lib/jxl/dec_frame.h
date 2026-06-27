@@ -152,9 +152,14 @@ class FrameDecoder {
         // don't support DC. If the are encoded with squeeze, DC works in theory
         // but the implementation may not yet correctly support this for Flush.
         // Therefore, can't correctly pause for a progressive step if there is
-        // an extra channel (including alpha channel)
+        // an extra channel (including alpha channel).
         // TODO(firsching): Check if this is still the case.
-        decoded_->metadata()->extra_channel_info.empty() &&
+        // Verified (this fork): for VarDCT, lifting this lets alpha images pause
+        // progressively with VALID intermediate flushes (incl. partial alpha)
+        // and a byte-exact final. Opt in via JxlDecoderSetAllowAlphaProgressive;
+        // default keeps the conservative guard, so behaviour is unchanged.
+        (decoded_->metadata()->extra_channel_info.empty() ||
+         allow_extra_channel_progressive_) &&
         // DC is not guaranteed to be available in modular mode and may be a
         // black image. If squeeze is used, it may be available depending on the
         // current implementation.
@@ -165,10 +170,11 @@ class FrameDecoder {
     } else {
       progressive_detail_ = JxlProgressiveDetail::kFrames;
     }
+    // Reset the pause schedule each frame: it must not accumulate across frames
+    // (e.g. animations), and a paint-target schedule must rebuild cleanly.
+    passes_to_pause_.clear();
     if (progressive_detail_ >= JxlProgressiveDetail::kPasses) {
-      for (size_t i = 1; i < frame_header_.passes.num_passes; ++i) {
-        passes_to_pause_.push_back(i);
-      }
+      BuildPassPauseSchedule();
     } else if (progressive_detail_ >= JxlProgressiveDetail::kLastPasses) {
       for (size_t i = 0; i < frame_header_.passes.num_downsample; ++i) {
         passes_to_pause_.push_back(frame_header_.passes.last_pass[i] + 1);
@@ -177,6 +183,22 @@ class FrameDecoder {
       std::sort(passes_to_pause_.begin(), passes_to_pause_.end());
     }
     return progressive_detail_;
+  }
+
+  // Sets a target number of progressive AC paints (including the final image)
+  // for kPasses detail. 0 (default) keeps the legacy "pause after every pass"
+  // behaviour. When in [2, num_passes), pauses are placed at evenly spaced pass
+  // boundaries so the consumer receives ~`paints` refinements instead of one per
+  // encoded pass. Must be called before SetPauseAtProgressive.
+  void SetProgressivePaintTarget(size_t paints) {
+    progressive_paint_target_ = paints;
+  }
+
+  // When true, allows VarDCT progressive pausing even when extra channels (e.g.
+  // alpha) are present. Default false keeps the conservative libjxl behaviour.
+  // Must be called before SetPauseAtProgressive.
+  void SetAllowExtraChannelProgressive(bool allow) {
+    allow_extra_channel_progressive_ = allow;
   }
 
   size_t NextNumPassesToPause() const {
@@ -258,6 +280,32 @@ class FrameDecoder {
                         bool dc_only);
   void MarkSections(const SectionInfo* sections, size_t num,
                     const SectionStatus* section_status);
+
+  // Fills passes_to_pause_ for kPasses detail. With progressive_paint_target_
+  // in [2, num_passes), places target-1 evenly spaced intermediate pauses (the
+  // final image is the implicit last paint). Otherwise pauses after every pass
+  // (legacy behaviour). The caller must have cleared passes_to_pause_.
+  void BuildPassPauseSchedule() {
+    const size_t np = frame_header_.passes.num_passes;
+    const size_t target = progressive_paint_target_;
+    if (target >= 2 && target < np) {
+      int prev = 0;
+      for (size_t k = 1; k < target; ++k) {
+        // ceil(k * np / target): strictly increasing, in [1, np - 1].
+        size_t pass = (k * np + target - 1) / target;
+        if (pass < 1) pass = 1;
+        if (pass >= np) break;
+        if (static_cast<int>(pass) > prev) {
+          prev = static_cast<int>(pass);
+          passes_to_pause_.push_back(prev);
+        }
+      }
+    } else {
+      for (size_t i = 1; i < np; ++i) {
+        passes_to_pause_.push_back(static_cast<int>(i));
+      }
+    }
+  }
 
   // Allocates storage for parallel decoding using up to `num_threads` threads
   // of up to `num_tasks` tasks. The value of `thread` passed to
@@ -351,6 +399,22 @@ class FrameDecoder {
   // Number of completed passes where section decoding should pause.
   // Used for progressive details at least kLastPasses.
   std::vector<int> passes_to_pause_;
+  // Target number of progressive AC paints (incl. final) for kPasses detail;
+  // 0 = legacy pause-after-every-pass. Set via SetProgressivePaintTarget before
+  // SetPauseAtProgressive.
+  size_t progressive_paint_target_ = 0;
+  // Opt-in: allow progressive pausing for VarDCT frames that have extra channels
+  // (e.g. alpha). Default false = conservative libjxl guard. Set via
+  // SetAllowExtraChannelProgressive before SetPauseAtProgressive.
+  bool allow_extra_channel_progressive_ = false;
+
+  // Reusable scratch for ProcessSections, to avoid per-call heap churn on the
+  // streaming/progressive decode path. Byte-exact with the previous per-call
+  // vectors: identical values, identical iteration order; only the storage is
+  // reused (the AC scratch is flattened to [group * num_passes + pass]).
+  std::vector<size_t> ps_dc_group_sec_;
+  std::vector<size_t> ps_ac_group_sec_;
+  std::vector<size_t> ps_desired_num_ac_passes_;
 };
 
 }  // namespace jxl

@@ -577,13 +577,24 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
   std::fill(section_status, section_status + num, SectionStatus::kSkipped);
   size_t dc_global_sec = num;
   size_t ac_global_sec = num;
-  std::vector<size_t> dc_group_sec(frame_dim_.num_dc_groups, num);
-  std::vector<std::vector<size_t>> ac_group_sec(
-      frame_dim_.num_groups,
-      std::vector<size_t>(frame_header_.passes.num_passes, num));
+  const size_t num_groups = frame_dim_.num_groups;
+  const size_t num_passes = frame_header_.passes.num_passes;
+  // Reusable decoder-owned scratch (see ps_* field declarations) instead of
+  // freshly allocating these vectors on every call. This removes the per-call
+  // heap churn on the streaming/progressive path (notably the former
+  // vector<vector<size_t>>, one allocation per AC group). The AC scratch is
+  // flattened to row-major [group * num_passes + pass]. assign() refills with
+  // the current `num` sentinel (and 0) so the values and iteration order are
+  // byte-for-byte identical to the previous per-call vectors; only the backing
+  // storage is reused.
+  std::vector<size_t>& dc_group_sec = ps_dc_group_sec_;
+  std::vector<size_t>& ac_group_sec = ps_ac_group_sec_;
+  std::vector<size_t>& desired_num_ac_passes = ps_desired_num_ac_passes_;
+  dc_group_sec.assign(frame_dim_.num_dc_groups, num);
+  ac_group_sec.assign(num_groups * num_passes, num);
   // This keeps track of the number of ac passes we want to process during this
   // call of ProcessSections.
-  std::vector<size_t> desired_num_ac_passes(frame_dim_.num_groups);
+  desired_num_ac_passes.assign(num_groups, 0);
   bool single_section =
       frame_dim_.num_groups == 1 && frame_header_.passes.num_passes == 1;
   if (single_section) {
@@ -591,8 +602,9 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
     JXL_ENSURE(sections[0].id == 0);
     if (processed_section_[0] == JXL_FALSE) {
       processed_section_[0] = JXL_TRUE;
-      ac_group_sec[0].resize(1);
-      dc_global_sec = ac_global_sec = dc_group_sec[0] = ac_group_sec[0][0] = 0;
+      // single_section => num_groups == 1 && num_passes == 1, so the flattened
+      // AC scratch has exactly one slot at index 0.
+      dc_global_sec = ac_global_sec = dc_group_sec[0] = ac_group_sec[0] = 0;
       desired_num_ac_passes[0] = 1;
     } else {
       section_status[0] = SectionStatus::kDuplicate;
@@ -618,17 +630,16 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
         if (acp >= frame_header_.passes.num_passes) {
           return JXL_FAILURE("Invalid section ID");
         }
-        ac_group_sec[acg][acp] = i;
+        ac_group_sec[acg * num_passes + acp] = i;
       }
       processed_section_[sections[i].id] = JXL_TRUE;
     }
     // Count number of new passes per group.
-    for (size_t g = 0; g < ac_group_sec.size(); g++) {
+    for (size_t g = 0; g < num_groups; g++) {
       size_t j = 0;
-      for (; j + decoded_passes_per_ac_group_[g] <
-             frame_header_.passes.num_passes;
-           j++) {
-        if (ac_group_sec[g][j + decoded_passes_per_ac_group_[g]] == num) {
+      for (; j + decoded_passes_per_ac_group_[g] < num_passes; j++) {
+        if (ac_group_sec[g * num_passes + j + decoded_passes_per_ac_group_[g]] ==
+            num) {
           break;
         }
       }
@@ -688,7 +699,7 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
   if (progressive_detail_ >= JxlProgressiveDetail::kLastPasses) {
     // Mark that we only want the next progression pass.
     size_t target_complete_passes = NextNumPassesToPause();
-    for (size_t i = 0; i < ac_group_sec.size(); i++) {
+    for (size_t i = 0; i < num_groups; i++) {
       desired_num_ac_passes[i] =
           std::min(desired_num_ac_passes[i],
                    target_complete_passes - decoded_passes_per_ac_group_[i]);
@@ -697,7 +708,7 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
 
   if (decoded_ac_global_) {
     // Mark all the AC groups that we received as not complete yet.
-    for (size_t i = 0; i < ac_group_sec.size(); i++) {
+    for (size_t i = 0; i < num_groups; i++) {
       if (desired_num_ac_passes[i] != 0) {
         dec_state_->render_pipeline->ClearDone(i);
       }
@@ -709,7 +720,7 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
       return true;
     };
     const auto process_group = [this, &ac_group_sec, &desired_num_ac_passes,
-                                &num, &sections, &section_status](
+                                num_passes, &num, &sections, &section_status](
                                    size_t g, size_t thread) -> Status {
       if (desired_num_ac_passes[g] == 0) {
         // no new AC pass, nothing to do
@@ -718,20 +729,20 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
       size_t first_pass = decoded_passes_per_ac_group_[g];
       PassesReaders readers = {};
       for (size_t i = 0; i < desired_num_ac_passes[g]; i++) {
-        JXL_ENSURE(ac_group_sec[g][first_pass + i] != num);
-        readers[i] = sections[ac_group_sec[g][first_pass + i]].br;
+        JXL_ENSURE(ac_group_sec[g * num_passes + first_pass + i] != num);
+        readers[i] = sections[ac_group_sec[g * num_passes + first_pass + i]].br;
       }
       JXL_RETURN_IF_ERROR(ProcessACGroup(
           g, readers, desired_num_ac_passes[g], GetStorageLocation(thread, g),
           /*force_draw=*/false, /*dc_only=*/false));
       for (size_t i = 0; i < desired_num_ac_passes[g]; i++) {
-        section_status[ac_group_sec[g][first_pass + i]] = SectionStatus::kDone;
+        section_status[ac_group_sec[g * num_passes + first_pass + i]] =
+            SectionStatus::kDone;
       }
       return true;
     };
-    JXL_RETURN_IF_ERROR(RunOnPool(pool_, 0, ac_group_sec.size(),
-                                  prepare_storage, process_group,
-                                  "DecodeGroup"));
+    JXL_RETURN_IF_ERROR(RunOnPool(pool_, 0, num_groups, prepare_storage,
+                                  process_group, "DecodeGroup"));
   }
 
   MarkSections(sections, num, section_status);
