@@ -96,20 +96,15 @@ float Symmetric5Border(const ImageF& in, const int64_t ix, const int64_t iy,
   return sum0 + sum1;
 }
 
-// Produces result for one vector's worth of pixels
-template <class WrapY>
+// Produces result for one vector's worth of pixels. The replicated coefficient
+// vectors are loop-invariant across a row, so they are loaded once by the
+// caller (Symmetric5Row) and passed in rather than reloaded per vector.
+template <class WrapY, class V>
 static void Symmetric5Interior(const ImageF& in, const int64_t ix,
-                               const int64_t rix, const int64_t iy,
-                               const WeightsSymmetric5& weights,
-                               float* JXL_RESTRICT row_out) {
+                               const int64_t rix, const int64_t iy, const V w0,
+                               const V w1, const V w2, const V w4, const V w5,
+                               const V w8, float* JXL_RESTRICT row_out) {
   const HWY_FULL(float) d;
-
-  const auto w0 = LoadDup128(d, weights.c);
-  const auto w1 = LoadDup128(d, weights.r);
-  const auto w2 = LoadDup128(d, weights.R);
-  const auto w4 = LoadDup128(d, weights.d);
-  const auto w5 = LoadDup128(d, weights.L);
-  const auto w8 = LoadDup128(d, weights.D);
 
   const size_t ysize = in.ysize();
   const WrapY wrap_y;
@@ -140,8 +135,15 @@ static void Symmetric5Row(const ImageF& in, const Rect& rect, const int64_t iy,
   for (; ix < std::min(aligned_x, xend); ++ix, ++rix) {
     row_out[rix] = Symmetric5Border<WrapY>(in, ix, iy, weights);
   }
+  // Hoist the loop-invariant coefficient vectors out of the interior loop.
+  const auto w0 = LoadDup128(d, weights.c);
+  const auto w1 = LoadDup128(d, weights.r);
+  const auto w2 = LoadDup128(d, weights.R);
+  const auto w4 = LoadDup128(d, weights.d);
+  const auto w5 = LoadDup128(d, weights.L);
+  const auto w8 = LoadDup128(d, weights.D);
   for (; ix + N + kRadius <= xend; ix += N, rix += N) {
-    Symmetric5Interior<WrapY>(in, ix, rix, iy, weights, row_out);
+    Symmetric5Interior<WrapY>(in, ix, rix, iy, w0, w1, w2, w4, w5, w8, row_out);
   }
   for (; ix < xend; ++ix, ++rix) {
     row_out[rix] = Symmetric5Border<WrapY>(in, ix, iy, weights);

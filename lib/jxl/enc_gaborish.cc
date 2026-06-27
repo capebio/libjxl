@@ -47,27 +47,36 @@ Status GaborishInverse(Image3F* in_out, const Rect& rect, const float mul[3],
                                    {HWY_REP4(normalize_mul * kGaborish[4])},
                                    {HWY_REP4(normalize_mul * kGaborish[3])}};
   }
-  // Reduce memory footprint by only allocating a single plane and swapping it
-  // into the output Image3F. Better still would be tiling.
-  // Note that we cannot *allocate* a plane, as doing so might cause Image3F to
-  // have planes of different stride. Instead, we copy one plane in a temporary
-  // image and reuse the existing planes of the in/out image.
+  // Reduce memory footprint by only allocating a single scratch plane and
+  // rotating it into the output Image3F. We cannot *allocate* a full plane in
+  // the Image3F (doing so might give planes different strides), so we filter
+  // into a separate temporary image and reuse the existing planes in place.
+  //
+  // Only the convolution rectangle xrect is touched, so the scratch image is
+  // sized to xrect rather than the whole plane: for a partial/streaming rect
+  // this drops the scratch allocation and the back-copy from a full plane to a
+  // tile, while a full-frame rect retains effectively the same cost. The three
+  // Symmetric5 evaluations, their source coordinates, weights and output pixels
+  // are byte-for-byte identical to the full-plane-scratch version, including
+  // pixels outside xrect after the plane rotation.
+  const Rect xrect = rect.Extend(3, Rect(*in_out));
   ImageF temp;
-  JXL_ASSIGN_OR_RETURN(temp,
-                       ImageF::Create(memory_manager, in_out->Plane(2).xsize(),
-                                      in_out->Plane(2).ysize()));
-  JXL_RETURN_IF_ERROR(CopyImageTo(in_out->Plane(2), &temp));
-  Rect xrect = rect.Extend(3, Rect(*in_out));
+  JXL_ASSIGN_OR_RETURN(
+      temp, ImageF::Create(memory_manager, xrect.xsize(), xrect.ysize()));
+  const Rect temp_rect(temp);
+  // Filter channel 0 into the scratch tile first, preserving it before plane 0
+  // is overwritten by channel 1's result.
   JXL_RETURN_IF_ERROR(Symmetric5(in_out->Plane(0), xrect, weights[0], pool,
-                                 &in_out->Plane(2), xrect));
+                                 &temp, temp_rect));
   JXL_RETURN_IF_ERROR(Symmetric5(in_out->Plane(1), xrect, weights[1], pool,
                                  &in_out->Plane(0), xrect));
-  JXL_RETURN_IF_ERROR(
-      Symmetric5(temp, xrect, weights[2], pool, &in_out->Plane(1), xrect));
-  // Now planes are 1, 2, 0.
-  in_out->Plane(0).Swap(in_out->Plane(1));
-  // 2 1 0
+  JXL_RETURN_IF_ERROR(Symmetric5(in_out->Plane(2), xrect, weights[2], pool,
+                                 &in_out->Plane(1), xrect));
+  // Copy filtered channel 0 from the tile back into plane 2.
+  JXL_RETURN_IF_ERROR(CopyImageTo(temp_rect, temp, xrect, &in_out->Plane(2)));
+  // Planes now hold channels 1, 2, 0; rotate them back to 0, 1, 2.
   in_out->Plane(0).Swap(in_out->Plane(2));
+  in_out->Plane(1).Swap(in_out->Plane(2));
   return true;
 }
 
