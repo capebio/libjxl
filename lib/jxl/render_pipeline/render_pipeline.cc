@@ -46,56 +46,42 @@ StatusOr<std::unique_ptr<RenderPipeline>> RenderPipeline::Builder::Finalize(
     res = jxl::make_unique<LowMemoryRenderPipeline>(memory_manager_);
   }
 
-  res->padding_.resize(stages_.size());
-  for (size_t i = stages_.size(); i-- > 0;) {
-    const auto& stage = stages_[i];
+  // Cumulative padding and channel shifts both obey the same reverse
+  // recurrence over stages, so derive them in a single backward pass. For a
+  // kInOut stage, padding[i] = ceil(padding[i+1] / 2^shift) + border and
+  // shift[i] = shift[i+1] + stage_shift; otherwise both are copied from the
+  // next stage. The final stage contributes neither (its rows stay zero).
+  const size_t num_stages = stages_.size();
+  res->padding_.resize(num_stages);
+  res->channel_shifts_.resize(num_stages);
+  for (size_t i = 0; i < num_stages; i++) {
     res->padding_[i].resize(num_c_);
-    if (i + 1 == stages_.size()) {
-      continue;
-    }
+    res->channel_shifts_[i].resize(num_c_);
+  }
+  for (size_t i = num_stages - 1; i-- > 0;) {
+    const auto& stage = stages_[i];
+    const auto& settings = stage->settings_;
     for (size_t c = 0; c < num_c_; c++) {
       if (stage->GetChannelMode(c) == RenderPipelineChannelMode::kInOut) {
-        res->padding_[i][c].first = DivCeil(res->padding_[i + 1][c].first,
-                                            1 << stage->settings_.shift_x) +
-                                    stage->settings_.border_x;
-        res->padding_[i][c].second = DivCeil(res->padding_[i + 1][c].second,
-                                             1 << stage->settings_.shift_y) +
-                                     stage->settings_.border_y;
+        res->padding_[i][c].first =
+            DivCeil(res->padding_[i + 1][c].first, 1 << settings.shift_x) +
+            settings.border_x;
+        res->padding_[i][c].second =
+            DivCeil(res->padding_[i + 1][c].second, 1 << settings.shift_y) +
+            settings.border_y;
+        res->channel_shifts_[i][c].first =
+            res->channel_shifts_[i + 1][c].first + settings.shift_x;
+        res->channel_shifts_[i][c].second =
+            res->channel_shifts_[i + 1][c].second + settings.shift_y;
       } else {
         res->padding_[i][c] = res->padding_[i + 1][c];
+        res->channel_shifts_[i][c] = res->channel_shifts_[i + 1][c];
       }
     }
   }
 
   res->frame_dimensions_ = frame_dimensions;
   res->group_completed_passes_.resize(frame_dimensions.num_groups);
-  res->channel_shifts_.resize(stages_.size());
-  res->channel_shifts_[0].resize(num_c_);
-  for (size_t i = 1; i < stages_.size(); i++) {
-    auto& stage = stages_[i - 1];
-    for (size_t c = 0; c < num_c_; c++) {
-      if (stage->GetChannelMode(c) == RenderPipelineChannelMode::kInOut) {
-        res->channel_shifts_[0][c].first += stage->settings_.shift_x;
-        res->channel_shifts_[0][c].second += stage->settings_.shift_y;
-      }
-    }
-  }
-  for (size_t i = 1; i < stages_.size(); i++) {
-    auto& stage = stages_[i - 1];
-    res->channel_shifts_[i].resize(num_c_);
-    for (size_t c = 0; c < num_c_; c++) {
-      if (stage->GetChannelMode(c) == RenderPipelineChannelMode::kInOut) {
-        res->channel_shifts_[i][c].first =
-            res->channel_shifts_[i - 1][c].first - stage->settings_.shift_x;
-        res->channel_shifts_[i][c].second =
-            res->channel_shifts_[i - 1][c].second - stage->settings_.shift_y;
-      } else {
-        res->channel_shifts_[i][c].first = res->channel_shifts_[i - 1][c].first;
-        res->channel_shifts_[i][c].second =
-            res->channel_shifts_[i - 1][c].second;
-      }
-    }
-  }
   res->stages_ = std::move(stages_);
   JXL_RETURN_IF_ERROR(res->Init());
   return res;
@@ -136,7 +122,12 @@ Status RenderPipeline::PrepareForThreads(size_t num, bool use_group_ids) {
 
 Status RenderPipelineInput::Done() {
   JXL_ENSURE(pipeline_);
-  JXL_RETURN_IF_ERROR(pipeline_->InputReady(group_id_, thread_id_, buffers_));
+  // Done() is one-shot: InputReady increments the group's completed-pass
+  // counter, so detach the pipeline first to prevent a second call (or a
+  // retry after error) from double-counting the group.
+  RenderPipeline* pipeline = pipeline_;
+  pipeline_ = nullptr;
+  JXL_RETURN_IF_ERROR(pipeline->InputReady(group_id_, thread_id_, buffers_));
   return true;
 }
 
