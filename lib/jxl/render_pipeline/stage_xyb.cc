@@ -37,7 +37,8 @@ class XYBStage : public RenderPipelineStage {
       : RenderPipelineStage(RenderPipelineStage::Settings()),
         opsin_params_(output_encoding_info.opsin_params),
         output_is_xyb_(output_encoding_info.color_encoding.GetColorSpace() ==
-                       ColorSpace::kXYB) {}
+                       ColorSpace::kXYB),
+        xyb_flags_(DetectXybKernel(output_encoding_info.opsin_params)) {}
 
   Status ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
                     size_t xextra_left, size_t xextra_right, size_t xsize,
@@ -77,19 +78,9 @@ class XYBStage : public RenderPipelineStage {
       }
     } else {
       // TODO(eustas): why unaligned load/store?
-      for (size_t x = 0; x < xsize; x += Lanes(d)) {
-        const auto in_opsin_x = LoadU(d, row0 + x);
-        const auto in_opsin_y = LoadU(d, row1 + x);
-        const auto in_opsin_b = LoadU(d, row2 + x);
-        auto r = Undefined(d);
-        auto g = Undefined(d);
-        auto b = Undefined(d);
-        XybToRgb(d, in_opsin_x, in_opsin_y, in_opsin_b, opsin_params_, &r, &g,
-                 &b);
-        StoreU(r, d, row0 + x);
-        StoreU(g, d, row1 + x);
-        StoreU(b, d, row2 + x);
-      }
+      // In-place; rows are both source and destination (unaligned).
+      JXL_XYB_DISPATCH_ROW(xyb_flags_, /*kUnaligned=*/true, d, row0, row1, row2,
+                           row0, row1, row2, xsize, opsin_params_);
     }
     msan::PoisonMemory(row0 + xsize, sizeof(float) * x_span_tail);
     msan::PoisonMemory(row1 + xsize, sizeof(float) * x_span_tail);
@@ -107,6 +98,7 @@ class XYBStage : public RenderPipelineStage {
  private:
   const OpsinParams opsin_params_;
   const bool output_is_xyb_;
+  const XybKernelFlags xyb_flags_;
 };
 
 std::unique_ptr<RenderPipelineStage> GetXYBStage(

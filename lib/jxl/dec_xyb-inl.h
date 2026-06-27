@@ -14,6 +14,8 @@
 
 #include <hwy/highway.h>
 
+#include <cstring>
+
 #include "lib/jxl/common.h"
 #include "lib/jxl/dec_xyb.h"
 
@@ -29,12 +31,119 @@ using hwy::HWY_NAMESPACE::Mul;
 using hwy::HWY_NAMESPACE::MulAdd;
 using hwy::HWY_NAMESPACE::Sub;
 
+// Runtime-detected properties of an OpsinParams that unlock byte-exact
+// XybToRgb specializations (computed once per conversion, not per vector).
+//   equal_bias: opsin_biases[0..2] AND opsin_biases_cbrt[0..2] are bit-equal
+//               (the default opsin transform) -> one bias Set instead of three.
+//   gray:       the 3x3 inverse matrix has three bit-identical OUTPUT rows
+//               (grayscale output encoding) -> one matrix product, replicated.
+struct XybKernelFlags {
+  bool equal_bias;
+  bool gray;
+};
+
+HWY_INLINE HWY_MAYBE_UNUSED XybKernelFlags
+DetectXybKernel(const OpsinParams& p) {
+  const auto feq = [](float a, float b) {
+    return memcmp(&a, &b, sizeof(float)) == 0;
+  };
+  const float* b = p.opsin_biases;
+  const float* c = p.opsin_biases_cbrt;
+  const bool equal_bias =
+      feq(b[0], b[1]) && feq(b[1], b[2]) && feq(c[0], c[1]) && feq(c[1], c[2]);
+  const float* m = p.inverse_opsin_matrix;  // 9 entries, each broadcast x4.
+  const bool gray = feq(m[0 * 4], m[3 * 4]) && feq(m[3 * 4], m[6 * 4]) &&
+                    feq(m[1 * 4], m[4 * 4]) && feq(m[4 * 4], m[7 * 4]) &&
+                    feq(m[2 * 4], m[5 * 4]) && feq(m[5 * 4], m[8 * 4]);
+  return {equal_bias, gray};
+}
+
 // Inverts the pixel-wise RGB->XYB conversion in OpsinDynamicsImage() (including
 // the gamma mixing and simple gamma). Avoids clamping to [0, 1] - out of (sRGB)
 // gamut values may be in-gamut after transforming to a wider space.
 // "inverse_matrix" points to 9 broadcasted vectors, which are the 3x3 entries
 // of the (row-major) opsin absorbance matrix inverse. Pre-multiplying its
 // entries by c is equivalent to multiplying linear_* by c afterwards.
+//
+// kEqualBias / kGray select byte-exact specializations (see XybKernelFlags).
+// XybToRgbImpl<false,false> is the original generic kernel verbatim.
+template <bool kEqualBias, bool kGray, class D, class V>
+HWY_INLINE void XybToRgbImpl(D d, const V opsin_x, const V opsin_y,
+                             const V opsin_b, const OpsinParams& opsin_params,
+                             V* const HWY_RESTRICT linear_r,
+                             V* const HWY_RESTRICT linear_g,
+                             V* const HWY_RESTRICT linear_b) {
+  V mixed_r, mixed_g, mixed_b;
+  if constexpr (kEqualBias) {
+    // Single bias materialisation (bit-equal across channels).
+    const auto neg_bias = Set(d, opsin_params.opsin_biases[0]);
+    const auto cbrt_bias = Set(d, opsin_params.opsin_biases_cbrt[0]);
+    auto gamma_r = Sub(Add(opsin_y, opsin_x), cbrt_bias);
+    auto gamma_g = Sub(Sub(opsin_y, opsin_x), cbrt_bias);
+    auto gamma_b = Sub(opsin_b, cbrt_bias);
+    mixed_r = MulAdd(Mul(gamma_r, gamma_r), gamma_r, neg_bias);
+    mixed_g = MulAdd(Mul(gamma_g, gamma_g), gamma_g, neg_bias);
+    mixed_b = MulAdd(Mul(gamma_b, gamma_b), gamma_b, neg_bias);
+  } else {
+#if HWY_TARGET == HWY_SCALAR
+    const auto neg_bias_r = Set(d, opsin_params.opsin_biases[0]);
+    const auto neg_bias_g = Set(d, opsin_params.opsin_biases[1]);
+    const auto neg_bias_b = Set(d, opsin_params.opsin_biases[2]);
+#else
+    const auto neg_bias_rgb = LoadDup128(d, opsin_params.opsin_biases);
+    const auto neg_bias_r = Broadcast<0>(neg_bias_rgb);
+    const auto neg_bias_g = Broadcast<1>(neg_bias_rgb);
+    const auto neg_bias_b = Broadcast<2>(neg_bias_rgb);
+#endif
+    // Color space: XYB -> RGB
+    auto gamma_r = Add(opsin_y, opsin_x);
+    auto gamma_g = Sub(opsin_y, opsin_x);
+    auto gamma_b = opsin_b;
+    gamma_r = Sub(gamma_r, Set(d, opsin_params.opsin_biases_cbrt[0]));
+    gamma_g = Sub(gamma_g, Set(d, opsin_params.opsin_biases_cbrt[1]));
+    gamma_b = Sub(gamma_b, Set(d, opsin_params.opsin_biases_cbrt[2]));
+    // Undo gamma compression: linear = gamma^3 for efficiency.
+    const auto gamma_r2 = Mul(gamma_r, gamma_r);
+    const auto gamma_g2 = Mul(gamma_g, gamma_g);
+    const auto gamma_b2 = Mul(gamma_b, gamma_b);
+    mixed_r = MulAdd(gamma_r2, gamma_r, neg_bias_r);
+    mixed_g = MulAdd(gamma_g2, gamma_g, neg_bias_g);
+    mixed_b = MulAdd(gamma_b2, gamma_b, neg_bias_b);
+  }
+
+  const float* HWY_RESTRICT inverse_matrix = opsin_params.inverse_opsin_matrix;
+
+  if constexpr (kGray) {
+    // Three identical output rows -> one matrix product, replicated.
+    auto lin = Mul(LoadDup128(d, &inverse_matrix[0 * 4]), mixed_r);
+    lin = MulAdd(LoadDup128(d, &inverse_matrix[1 * 4]), mixed_g, lin);
+    lin = MulAdd(LoadDup128(d, &inverse_matrix[2 * 4]), mixed_b, lin);
+    *linear_r = lin;
+    *linear_g = lin;
+    *linear_b = lin;
+  } else {
+    // Unmix (multiply by 3x3 inverse_matrix)
+    // TODO(eustas): ref would be more readable than pointer
+    *linear_r = Mul(LoadDup128(d, &inverse_matrix[0 * 4]), mixed_r);
+    *linear_g = Mul(LoadDup128(d, &inverse_matrix[3 * 4]), mixed_r);
+    *linear_b = Mul(LoadDup128(d, &inverse_matrix[6 * 4]), mixed_r);
+    *linear_r =
+        MulAdd(LoadDup128(d, &inverse_matrix[1 * 4]), mixed_g, *linear_r);
+    *linear_g =
+        MulAdd(LoadDup128(d, &inverse_matrix[4 * 4]), mixed_g, *linear_g);
+    *linear_b =
+        MulAdd(LoadDup128(d, &inverse_matrix[7 * 4]), mixed_g, *linear_b);
+    *linear_r =
+        MulAdd(LoadDup128(d, &inverse_matrix[2 * 4]), mixed_b, *linear_r);
+    *linear_g =
+        MulAdd(LoadDup128(d, &inverse_matrix[5 * 4]), mixed_b, *linear_g);
+    *linear_b =
+        MulAdd(LoadDup128(d, &inverse_matrix[8 * 4]), mixed_b, *linear_b);
+  }
+}
+
+// Original generic signature, unchanged byte-exact behaviour: used by callers
+// that do not dispatch on XybKernelFlags (e.g. dec_modular).
 template <class D, class V>
 HWY_INLINE HWY_MAYBE_UNUSED void XybToRgb(D d, const V opsin_x, const V opsin_y,
                                           const V opsin_b,
@@ -42,48 +151,68 @@ HWY_INLINE HWY_MAYBE_UNUSED void XybToRgb(D d, const V opsin_x, const V opsin_y,
                                           V* const HWY_RESTRICT linear_r,
                                           V* const HWY_RESTRICT linear_g,
                                           V* const HWY_RESTRICT linear_b) {
-#if HWY_TARGET == HWY_SCALAR
-  const auto neg_bias_r = Set(d, opsin_params.opsin_biases[0]);
-  const auto neg_bias_g = Set(d, opsin_params.opsin_biases[1]);
-  const auto neg_bias_b = Set(d, opsin_params.opsin_biases[2]);
-#else
-  const auto neg_bias_rgb = LoadDup128(d, opsin_params.opsin_biases);
-  const auto neg_bias_r = Broadcast<0>(neg_bias_rgb);
-  const auto neg_bias_g = Broadcast<1>(neg_bias_rgb);
-  const auto neg_bias_b = Broadcast<2>(neg_bias_rgb);
-#endif
-
-  // Color space: XYB -> RGB
-  auto gamma_r = Add(opsin_y, opsin_x);
-  auto gamma_g = Sub(opsin_y, opsin_x);
-  auto gamma_b = opsin_b;
-
-  gamma_r = Sub(gamma_r, Set(d, opsin_params.opsin_biases_cbrt[0]));
-  gamma_g = Sub(gamma_g, Set(d, opsin_params.opsin_biases_cbrt[1]));
-  gamma_b = Sub(gamma_b, Set(d, opsin_params.opsin_biases_cbrt[2]));
-
-  // Undo gamma compression: linear = gamma^3 for efficiency.
-  const auto gamma_r2 = Mul(gamma_r, gamma_r);
-  const auto gamma_g2 = Mul(gamma_g, gamma_g);
-  const auto gamma_b2 = Mul(gamma_b, gamma_b);
-  const auto mixed_r = MulAdd(gamma_r2, gamma_r, neg_bias_r);
-  const auto mixed_g = MulAdd(gamma_g2, gamma_g, neg_bias_g);
-  const auto mixed_b = MulAdd(gamma_b2, gamma_b, neg_bias_b);
-
-  const float* HWY_RESTRICT inverse_matrix = opsin_params.inverse_opsin_matrix;
-
-  // Unmix (multiply by 3x3 inverse_matrix)
-  // TODO(eustas): ref would be more readable than pointer
-  *linear_r = Mul(LoadDup128(d, &inverse_matrix[0 * 4]), mixed_r);
-  *linear_g = Mul(LoadDup128(d, &inverse_matrix[3 * 4]), mixed_r);
-  *linear_b = Mul(LoadDup128(d, &inverse_matrix[6 * 4]), mixed_r);
-  *linear_r = MulAdd(LoadDup128(d, &inverse_matrix[1 * 4]), mixed_g, *linear_r);
-  *linear_g = MulAdd(LoadDup128(d, &inverse_matrix[4 * 4]), mixed_g, *linear_g);
-  *linear_b = MulAdd(LoadDup128(d, &inverse_matrix[7 * 4]), mixed_g, *linear_b);
-  *linear_r = MulAdd(LoadDup128(d, &inverse_matrix[2 * 4]), mixed_b, *linear_r);
-  *linear_g = MulAdd(LoadDup128(d, &inverse_matrix[5 * 4]), mixed_b, *linear_g);
-  *linear_b = MulAdd(LoadDup128(d, &inverse_matrix[8 * 4]), mixed_b, *linear_b);
+  XybToRgbImpl<false, false>(d, opsin_x, opsin_y, opsin_b, opsin_params,
+                             linear_r, linear_g, linear_b);
 }
+
+// Compile-time aligned/unaligned load-store selectors.
+template <bool kUnaligned, class D>
+HWY_INLINE auto XybLoad(D d, const float* p) {
+  if constexpr (kUnaligned) {
+    return LoadU(d, p);
+  } else {
+    return Load(d, p);
+  }
+}
+template <bool kUnaligned, class D, class V>
+HWY_INLINE void XybStore(V v, D d, float* p) {
+  if constexpr (kUnaligned) {
+    StoreU(v, d, p);
+  } else {
+    Store(v, d, p);
+  }
+}
+
+// Shared XYB->linear row loop, specialized on the detected kernel flags. Inputs
+// and outputs may alias in-place (loads precede stores within each iteration).
+template <bool kEqualBias, bool kGray, bool kUnaligned, class D>
+HWY_INLINE void XybToRgbRow(D d, const float* in0, const float* in1,
+                            const float* in2, float* out0, float* out1,
+                            float* out2, size_t xsize,
+                            const OpsinParams& opsin_params) {
+  for (size_t x = 0; x < xsize; x += Lanes(d)) {
+    const auto vx = XybLoad<kUnaligned>(d, in0 + x);
+    const auto vy = XybLoad<kUnaligned>(d, in1 + x);
+    const auto vb = XybLoad<kUnaligned>(d, in2 + x);
+    auto r = Undefined(d);
+    auto g = Undefined(d);
+    auto b = Undefined(d);
+    XybToRgbImpl<kEqualBias, kGray>(d, vx, vy, vb, opsin_params, &r, &g, &b);
+    XybStore<kUnaligned>(r, d, out0 + x);
+    XybStore<kUnaligned>(g, d, out1 + x);
+    XybStore<kUnaligned>(b, d, out2 + x);
+  }
+}
+
+// Dispatch a XybToRgbRow call on runtime flags to the right specialization.
+#define JXL_XYB_DISPATCH_ROW(flags, kUnaligned, d, in0, in1, in2, out0, out1, \
+                             out2, xsize, pp)                                 \
+  do {                                                                       \
+    if ((flags).equal_bias && (flags).gray) {                                \
+      XybToRgbRow<true, true, kUnaligned>((d), (in0), (in1), (in2), (out0),  \
+                                          (out1), (out2), (xsize), (pp));     \
+    } else if ((flags).equal_bias) {                                         \
+      XybToRgbRow<true, false, kUnaligned>((d), (in0), (in1), (in2), (out0), \
+                                           (out1), (out2), (xsize), (pp));    \
+    } else if ((flags).gray) {                                               \
+      XybToRgbRow<false, true, kUnaligned>((d), (in0), (in1), (in2), (out0), \
+                                           (out1), (out2), (xsize), (pp));    \
+    } else {                                                                 \
+      XybToRgbRow<false, false, kUnaligned>((d), (in0), (in1), (in2),        \
+                                            (out0), (out1), (out2), (xsize),  \
+                                            (pp));                            \
+    }                                                                        \
+  } while (0)
 
 #if !JXL_HIGH_PRECISION
 inline HWY_MAYBE_UNUSED bool HasFastXYBTosRGB8() {

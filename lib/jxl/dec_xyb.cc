@@ -49,6 +49,9 @@ Status OpsinToLinear(const Image3F& opsin, const Rect& rect, ThreadPool* pool,
   JXL_ENSURE(SameSize(rect, *linear));
   JXL_CHECK_IMAGE_INITIALIZED(opsin, rect);
 
+  // Detect byte-exact kernel specializations once for the whole conversion.
+  const XybKernelFlags kf = DetectXybKernel(opsin_params);
+
   const auto process_row = [&](const uint32_t task,
                                size_t /*thread*/) -> Status {
     const size_t y = static_cast<size_t>(task);
@@ -63,20 +66,10 @@ Status OpsinToLinear(const Image3F& opsin, const Rect& rect, ThreadPool* pool,
 
     const HWY_FULL(float) d;
 
-    for (size_t x = 0; x < rect.xsize(); x += Lanes(d)) {
-      const auto in_opsin_x = Load(d, row_opsin_0 + x);
-      const auto in_opsin_y = Load(d, row_opsin_1 + x);
-      const auto in_opsin_b = Load(d, row_opsin_2 + x);
-      auto linear_r = Undefined(d);
-      auto linear_g = Undefined(d);
-      auto linear_b = Undefined(d);
-      XybToRgb(d, in_opsin_x, in_opsin_y, in_opsin_b, opsin_params, &linear_r,
-               &linear_g, &linear_b);
-
-      Store(linear_r, d, row_linear_0 + x);
-      Store(linear_g, d, row_linear_1 + x);
-      Store(linear_b, d, row_linear_2 + x);
-    }
+    // Aligned (non-in-place) source/destination rows.
+    JXL_XYB_DISPATCH_ROW(kf, /*kUnaligned=*/false, d, row_opsin_0, row_opsin_1,
+                         row_opsin_2, row_linear_0, row_linear_1, row_linear_2,
+                         rect.xsize(), opsin_params);
     return true;
   };
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, static_cast<int>(rect.ysize()),
