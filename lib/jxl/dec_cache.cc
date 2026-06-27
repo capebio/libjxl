@@ -56,9 +56,10 @@ Status GroupDecCache::InitOnce(JxlMemoryManager* memory_manager,
       // right/bottom border just use a subset. The valid size is passed via
       // Rect.
 
-      JXL_ASSIGN_OR_RETURN(num_nzeroes[i],
-                           Image3I::Create(memory_manager, kGroupDimInBlocks,
-                                           kGroupDimInBlocks));
+      JXL_ASSIGN_OR_RETURN(
+          num_nzeroes[i],
+          Image3<uint8_t>::Create(memory_manager, kGroupDimInBlocks,
+                                  kGroupDimInBlocks));
     }
   }
   size_t max_block_area = 0;
@@ -72,36 +73,39 @@ Status GroupDecCache::InitOnce(JxlMemoryManager* memory_manager,
   }
 
   if (max_block_area > max_block_area_) {
+    // One arena of 7 float blocks: 3x for dequantized coefficients + 4x scratch
+    // for transforms. The 4x scratch region also backs the quantized buffers
+    // (3x int32 = 12 bytes/elem or 3x int16 = 6 bytes/elem, both <= the 16
+    // bytes/elem of the 4x float scratch), which are consumed before scratch is
+    // used. Allocate into a temporary first and only commit max_block_area_
+    // after success, so a failed grow leaves the cache's capacity claim honest.
+    AlignedMemory new_memory;
+    JXL_ASSIGN_OR_RETURN(
+        new_memory,
+        AlignedMemory::Create(memory_manager,
+                              max_block_area * 7 * sizeof(float)));
+    float_memory_ = std::move(new_memory);
     max_block_area_ = max_block_area;
-    // We need 3x float blocks for dequantized coefficients and 1x for scratch
-    // space for transforms.
-    JXL_ASSIGN_OR_RETURN(
-        float_memory_,
-        AlignedMemory::Create(memory_manager,
-                              max_block_area_ * 7 * sizeof(float)));
-    // We need 3x int32 or int16 blocks for quantized coefficients.
-    JXL_ASSIGN_OR_RETURN(
-        int32_memory_,
-        AlignedMemory::Create(memory_manager,
-                              max_block_area_ * 3 * sizeof(int32_t)));
-    JXL_ASSIGN_OR_RETURN(
-        int16_memory_,
-        AlignedMemory::Create(memory_manager,
-                              max_block_area_ * 3 * sizeof(int16_t)));
   }
 
   dec_group_block = float_memory_.address<float>();
   scratch_space = dec_group_block + max_block_area_ * 3;
-  dec_group_qblock = int32_memory_.address<int32_t>();
-  dec_group_qblock16 = int16_memory_.address<int16_t>();
+  // Intentionally alias the scratch region (lifetimes are disjoint, see header).
+  // Byte offset 3*max_block_area*sizeof(float) == 3*max_block_area*sizeof(int32)
+  // == 6*max_block_area*sizeof(int16), so all three start at scratch_space.
+  dec_group_qblock = float_memory_.address<int32_t>() + max_block_area_ * 3;
+  dec_group_qblock16 = float_memory_.address<int16_t>() + max_block_area_ * 6;
   return true;
 }
 
 // Initialize the decoder state after all of DC is decoded.
 Status PassesDecoderState::InitForAC(size_t num_passes, ThreadPool* pool) {
   shared_storage.coeff_order_size = 0;
+  // Snapshot the atomic once instead of re-loading it on every strategy
+  // iteration (cold path; purely a cleanup, the value is stable here).
+  const uint32_t used_acs_snapshot = used_acs.load(std::memory_order_acquire);
   for (uint8_t o = 0; o < AcStrategy::kNumValidStrategies; ++o) {
-    if (((1 << o) & used_acs) == 0) continue;
+    if (((1u << o) & used_acs_snapshot) == 0) continue;
     uint8_t ord = kStrategyOrder[o];
     shared_storage.coeff_order_size =
         std::max(kCoeffOrderOffset[3 * (ord + 1)] * kDCTBlockSize,

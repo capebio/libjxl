@@ -22,9 +22,15 @@
 
 namespace jxl {
 
+// Predicts the nonzero count from the top and left neighbours. Templated on the
+// stored element type so both the encoder (int32_t planes) and the decoder
+// (uint8_t planes; values are always in [0, 63]) share one implementation. The
+// arithmetic is identical for both T because the stored values are small enough
+// that no promotion changes the result.
+template <typename T>
 static JXL_INLINE int32_t PredictFromTopAndLeft(
-    const int32_t* const JXL_RESTRICT row_top,
-    const int32_t* const JXL_RESTRICT row, size_t x, int32_t default_val) {
+    const T* const JXL_RESTRICT row_top, const T* const JXL_RESTRICT row,
+    size_t x, int32_t default_val) {
   if (x == 0) {
     return row_top == nullptr ? default_val : row_top[x];
   }
