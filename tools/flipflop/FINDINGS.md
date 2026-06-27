@@ -36,3 +36,27 @@ The change is correct and byte-exact but **perf-neutral on every real encode
 path**. It marginally lowers transient per-group scratch allocation in streaming
 (border ring only). Keep as a harmless cleanup or drop; do not expect a speedup.
 The earlier "18.8% partial-rect win" was a synthetic-geometry artifact.
+
+## Streaming-path profile (encode_stream_bench, buffering=2, 4096² e5)
+
+Profiled the real streaming encode via the public API (`tools/encode_stream_bench.cc`,
+JXL_STAGE_TIMERS). 4096² = 4 DC groups. Steady-state per DC group (2nd encode):
+
+| stage | share of group |
+|-------|----------------|
+| ComputeVarDCTEncodingData (XYB + adaptive-quant + ACS + chroma-from-luma + DCT) | **~91%** |
+| EncodeGroups (histogram build + rANS) | ~5% |
+| TokenizeAllCoefficients | ~2% |
+| setup + alloc + gaborish + AR heuristics (remainder) | ~6% (overlaps) |
+
+**No streaming-specific fat.** The per-group cost is the same VarDCT heuristic
+block as one-shot encoding; ACS search dominates (consistent with prior
+profiling: ACS = 76% of e5). Per-group buffer re-allocation is negligible in
+steady state — the apparent 2× slowdown on the very first groups of a fresh
+process is allocator/code cold-start (gone by the 2nd encode), not a per-encode
+streaming inefficiency, so libjxl-level buffer reuse buys nothing (the CRT
+already recycles same-size blocks).
+
+Conclusion: the streaming path has no cheap, isolated win. The lever is the
+shared ACS/DCT/adaptive-quant hot path already targeted by other branches
+(ACS-prune, DCT-fusion, enc_group, CfL).
