@@ -311,8 +311,11 @@ void DequantBlock(float inv_global_scale, int quant, float x_dm_multiplier,
   }
 }
 
-// DecodeGroupImpl renders one group to pixels. Always called with kDraw;
-// kDontDraw groups are handled by DecodeGroupNoDraw (below, in HWY_ONCE).
+// DecodeGroupImpl renders one group to pixels. kReadCoefficients is false
+// for progressive redraws that render the persistent coefficient store: that
+// path must not construct or touch the entropy reader. kDontDraw groups are
+// handled by DecodeGroupNoDraw (below, in HWY_ONCE).
+template <bool kReadCoefficients>
 Status DecodeGroupImpl(const FrameHeader& frame_header,
                        GetBlock* JXL_RESTRICT get_block,
                        GroupDecCache* JXL_RESTRICT group_dec_cache,
@@ -370,7 +373,9 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
   }
 
   for (size_t by = 0; by < ysize_blocks; ++by) {
-    get_block->StartRow(by);
+    if constexpr (kReadCoefficients) {
+      get_block->StartRow(by);
+    }
     size_t sby[3] = {by >> vshift[0], by >> vshift[1], by >> vshift[2]};
 
     const int32_t* JXL_RESTRICT row_quant =
@@ -451,8 +456,10 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
             }
           }
         }
-        JXL_RETURN_IF_ERROR(get_block->LoadBlock(
-            bx, by, acs, size, log2_covered_blocks, qblock, ac_type));
+        if constexpr (kReadCoefficients) {
+          JXL_RETURN_IF_ERROR(get_block->LoadBlock(
+              bx, by, acs, size, log2_covered_blocks, qblock, ac_type));
+        }
         offset += size;
 
         // DC-only fast path: detect channels where all AC coefficients are zero.
@@ -891,7 +898,36 @@ struct GetBlockFromEncoder : public GetBlock {
       : quantized_ac(&ac), shift_for_pass(shift_for_pass) {}
 };
 
-HWY_EXPORT(DecodeGroupImpl);
+// Keep the bitstream and stored-coefficient paths as separate Highway
+// dispatch targets. The latter has no GetBlock argument so it cannot
+// accidentally enter the entropy path during a progressive redraw.
+Status DecodeGroupFromBitstream(
+    const FrameHeader& frame_header, GetBlock* JXL_RESTRICT get_block,
+    GroupDecCache* JXL_RESTRICT group_dec_cache,
+    PassesDecoderState* JXL_RESTRICT dec_state, size_t thread,
+    size_t group_idx, RenderPipelineInput& render_pipeline_input,
+    jpeg::JPEGData* jpeg_data,
+    const JpegGroupParams* JXL_RESTRICT jpeg_params) {
+  return DecodeGroupImpl<true>(
+      frame_header, get_block, group_dec_cache, dec_state, thread, group_idx,
+      render_pipeline_input, jpeg_data, jpeg_params);
+}
+
+Status DecodeGroupFromStoredCoefficients(
+    const FrameHeader& frame_header,
+    GroupDecCache* JXL_RESTRICT group_dec_cache,
+    PassesDecoderState* JXL_RESTRICT dec_state, size_t thread,
+    size_t group_idx, RenderPipelineInput& render_pipeline_input,
+    jpeg::JPEGData* jpeg_data,
+    const JpegGroupParams* JXL_RESTRICT jpeg_params) {
+  JXL_ENSURE(!dec_state->coefficients->IsEmpty());
+  return DecodeGroupImpl<false>(
+      frame_header, nullptr, group_dec_cache, dec_state, thread, group_idx,
+      render_pipeline_input, jpeg_data, jpeg_params);
+}
+
+HWY_EXPORT(DecodeGroupFromBitstream);
+HWY_EXPORT(DecodeGroupFromStoredCoefficients);
 
 }  // namespace
 
@@ -1065,6 +1101,25 @@ Status DecodeGroup(const FrameHeader& frame_header,
     histo_selector_bits = CeilLog2Nonzero(dec_state->shared->num_histograms);
   }
 
+  // A progressive redraw has no new entropy-coded passes. Coefficients were
+  // retained by earlier no-draw or partial-draw calls, so bypass the entire
+  // reader/histogram setup and render directly from that store.
+  const bool render_from_stored_coefficients =
+      draw == kDraw && num_passes == 0 && !dec_state->coefficients->IsEmpty();
+  if (render_from_stored_coefficients) {
+    const JpegGroupParams* jpeg_params_ptr = nullptr;
+    JpegGroupParams jpeg_params;
+    if (jpeg_data) {
+      JXL_ASSIGN_OR_RETURN(
+          jpeg_params,
+          PrepareJpegGroupParams(frame_header, *dec_state, *jpeg_data));
+      jpeg_params_ptr = &jpeg_params;
+    }
+    return HWY_DYNAMIC_DISPATCH(DecodeGroupFromStoredCoefficients)(
+        frame_header, group_dec_cache, dec_state, thread, group_idx,
+        render_pipeline_input, jpeg_data, jpeg_params_ptr);
+  }
+
   // Stack-allocate: GetBlockFromBitstream has no ownership requirements and
   // outlives only this call frame.
   GetBlockFromBitstream get_block;
@@ -1085,7 +1140,7 @@ Status DecodeGroup(const FrameHeader& frame_header,
                                                   *jpeg_data));
       jpeg_params_ptr = &jpeg_params;
     }
-    JXL_RETURN_IF_ERROR(HWY_DYNAMIC_DISPATCH(DecodeGroupImpl)(
+    JXL_RETURN_IF_ERROR(HWY_DYNAMIC_DISPATCH(DecodeGroupFromBitstream)(
         frame_header, &get_block, group_dec_cache, dec_state, thread, group_idx,
         render_pipeline_input, jpeg_data, jpeg_params_ptr));
   }
@@ -1124,7 +1179,7 @@ Status DecodeGroupForRoundtrip(const FrameHeader& frame_header,
         PrepareJpegGroupParams(frame_header, *dec_state, *jpeg_data));
     jpeg_params_ptr = &jpeg_params;
   }
-  return HWY_DYNAMIC_DISPATCH(DecodeGroupImpl)(
+  return HWY_DYNAMIC_DISPATCH(DecodeGroupFromBitstream)(
       frame_header, &get_block, group_dec_cache, dec_state, thread, group_idx,
       render_pipeline_input, jpeg_data, jpeg_params_ptr);
 }
