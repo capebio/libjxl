@@ -143,9 +143,19 @@ bool PlanesEqual(const Image3F& a, const Image3F& b) {
   return true;
 }
 
-Rect MakeRect(bool full, size_t S) {
-  if (full) return Rect(0, 0, S, S);
-  // Block-aligned interior rect, mirroring the streaming/group case.
+// Rect modes:
+//   "full"    -> whole plane (one-shot encode path)
+//   "partial" -> interior quarter-plane rect (synthetic; rect << plane)
+//   "stream"  -> realistic streaming geometry: plane is one DC group + an
+//                8px (kBlockDim) border ring, rect is the group itself, so the
+//                rect is ~99% of the plane and only the border ring differs.
+Rect MakeRect(const std::string& mode, size_t S) {
+  if (mode == "full") return Rect(0, 0, S, S);
+  if (mode == "stream") {
+    // 8px border on each side (clamped block-aligned).
+    return Rect(8, 8, S - 16, S - 16);
+  }
+  // "partial": block-aligned interior quarter-plane rect.
   const size_t q = (S / 4) & ~size_t{7};
   const size_t h = (S / 2) & ~size_t{7};
   return Rect(q, q, h, h);
@@ -155,8 +165,8 @@ int RunVerify(size_t S) {
   Image3F base;
   if (!MakeBase(S, &base)) return 2;
   const float mul[3] = {1.0f, 1.0f, 1.0f};
-  for (bool full : {true, false}) {
-    Rect rect = MakeRect(full, S);
+  for (const char* mode : {"full", "partial", "stream"}) {
+    Rect rect = MakeRect(mode, S);
     Image3F a = Create3(S);
     Image3F b = Create3(S);
     CopyBase(base, &a);
@@ -164,22 +174,20 @@ int RunVerify(size_t S) {
     if (!GaborishInverseOld(&a, rect, mul, nullptr)) return 2;
     if (!GaborishInverse(&b, rect, mul, nullptr)) return 2;
     if (!PlanesEqual(a, b)) {
-      std::fprintf(stderr, "PARITY FAIL rect=%s S=%zu\n",
-                   full ? "full" : "partial", S);
+      std::fprintf(stderr, "PARITY FAIL rect=%s S=%zu\n", mode, S);
       return 1;
     }
-    std::fprintf(stderr, "parity ok rect=%s S=%zu\n", full ? "full" : "partial",
-                 S);
+    std::fprintf(stderr, "parity ok rect=%s S=%zu\n", mode, S);
   }
   std::printf("VERIFY OK\n");
   return 0;
 }
 
-int RunTiming(bool use_new, bool full, size_t S, int reps) {
+int RunTiming(bool use_new, const std::string& mode, size_t S, int reps) {
   Image3F base;
   if (!MakeBase(S, &base)) return 2;
   const float mul[3] = {1.0f, 1.0f, 1.0f};
-  Rect rect = MakeRect(full, S);
+  Rect rect = MakeRect(mode, S);
   Image3F work = Create3(S);
   double sum = 0.0;
   for (int r = 0; r < reps; ++r) {
@@ -214,8 +222,8 @@ int main(int argc, char** argv) {
     return 64;
   }
   bool use_new = (mode == "new");
-  bool full = (std::string(argv[2]) == "full");
+  std::string rect_mode = argv[2];  // full | partial | stream
   size_t S = std::strtoull(argv[3], nullptr, 10);
   int reps = std::atoi(argv[4]);
-  return RunTiming(use_new, full, S, reps);
+  return RunTiming(use_new, rect_mode, S, reps);
 }
