@@ -644,6 +644,34 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
   return true;
 }
 
+// Keep the bitstream and stored-coefficient paths as separate Highway
+// dispatch targets. The latter has no GetBlock argument so it cannot
+// accidentally enter the entropy path during a progressive redraw.
+Status DecodeGroupFromBitstream(
+    const FrameHeader& frame_header, GetBlock* JXL_RESTRICT get_block,
+    GroupDecCache* JXL_RESTRICT group_dec_cache,
+    PassesDecoderState* JXL_RESTRICT dec_state, size_t thread,
+    size_t group_idx, RenderPipelineInput& render_pipeline_input,
+    jpeg::JPEGData* jpeg_data,
+    const JpegGroupParams* JXL_RESTRICT jpeg_params) {
+  return DecodeGroupImpl<true>(
+      frame_header, get_block, group_dec_cache, dec_state, thread, group_idx,
+      render_pipeline_input, jpeg_data, jpeg_params);
+}
+
+Status DecodeGroupFromStoredCoefficients(
+    const FrameHeader& frame_header,
+    GroupDecCache* JXL_RESTRICT group_dec_cache,
+    PassesDecoderState* JXL_RESTRICT dec_state, size_t thread,
+    size_t group_idx, RenderPipelineInput& render_pipeline_input,
+    jpeg::JPEGData* jpeg_data,
+    const JpegGroupParams* JXL_RESTRICT jpeg_params) {
+  JXL_ENSURE(!dec_state->coefficients->IsEmpty());
+  return DecodeGroupImpl<false>(
+      frame_header, nullptr, group_dec_cache, dec_state, thread, group_idx,
+      render_pipeline_input, jpeg_data, jpeg_params);
+}
+
 // NOLINTNEXTLINE(google-readability-namespace-comments)
 }  // namespace HWY_NAMESPACE
 }  // namespace jxl
@@ -897,34 +925,6 @@ struct GetBlockFromEncoder : public GetBlock {
                       size_t group_idx, const uint32_t* shift_for_pass)
       : quantized_ac(&ac), shift_for_pass(shift_for_pass) {}
 };
-
-// Keep the bitstream and stored-coefficient paths as separate Highway
-// dispatch targets. The latter has no GetBlock argument so it cannot
-// accidentally enter the entropy path during a progressive redraw.
-Status DecodeGroupFromBitstream(
-    const FrameHeader& frame_header, GetBlock* JXL_RESTRICT get_block,
-    GroupDecCache* JXL_RESTRICT group_dec_cache,
-    PassesDecoderState* JXL_RESTRICT dec_state, size_t thread,
-    size_t group_idx, RenderPipelineInput& render_pipeline_input,
-    jpeg::JPEGData* jpeg_data,
-    const JpegGroupParams* JXL_RESTRICT jpeg_params) {
-  return DecodeGroupImpl<true>(
-      frame_header, get_block, group_dec_cache, dec_state, thread, group_idx,
-      render_pipeline_input, jpeg_data, jpeg_params);
-}
-
-Status DecodeGroupFromStoredCoefficients(
-    const FrameHeader& frame_header,
-    GroupDecCache* JXL_RESTRICT group_dec_cache,
-    PassesDecoderState* JXL_RESTRICT dec_state, size_t thread,
-    size_t group_idx, RenderPipelineInput& render_pipeline_input,
-    jpeg::JPEGData* jpeg_data,
-    const JpegGroupParams* JXL_RESTRICT jpeg_params) {
-  JXL_ENSURE(!dec_state->coefficients->IsEmpty());
-  return DecodeGroupImpl<false>(
-      frame_header, nullptr, group_dec_cache, dec_state, thread, group_idx,
-      render_pipeline_input, jpeg_data, jpeg_params);
-}
 
 HWY_EXPORT(DecodeGroupFromBitstream);
 HWY_EXPORT(DecodeGroupFromStoredCoefficients);
