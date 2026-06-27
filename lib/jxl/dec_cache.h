@@ -81,6 +81,56 @@ struct ImageOutput {
   size_t stride;
 };
 
+// Temp images required for decoding a single group. Reduces memory allocations
+// for large images because we only initialize min(#threads, #groups) instances.
+struct HWY_ALIGN_MAX GroupDecCache {
+  Status InitOnce(JxlMemoryManager* memory_manager, size_t num_passes,
+                  size_t used_acs);
+
+  Status InitDCBufferOnce(JxlMemoryManager* memory_manager) {
+    if (dc_buffer.xsize() == 0) {
+      JXL_ASSIGN_OR_RETURN(
+          dc_buffer,
+          ImageF::Create(memory_manager,
+                         kGroupDimInBlocks + kRenderPipelineXOffset * 2,
+                         kGroupDimInBlocks + 4));
+    }
+    return true;
+  }
+
+  // Scratch space used by DecGroupImpl().
+  float* dec_group_block;
+  int32_t* dec_group_qblock;
+  int16_t* dec_group_qblock16;
+
+  // For TransformToPixels.
+  float* scratch_space;
+  // scratch_space is never used at the same time as dec_group_qblock, and only
+  // one of dec_group_qblock / dec_group_qblock16 is ever used. We exploit this:
+  // all three (scratch_space, dec_group_qblock, dec_group_qblock16) are aliased
+  // onto the trailing 4 transform-scratch float blocks of the single arena
+  // below. qblock is fully consumed by dequant_block before scratch_space is
+  // touched (see DequantLane loop in dec_group.cc), so the lifetimes do not
+  // overlap. See InitOnce() for the layout proof.
+
+  // AC decoding. Stored value is the AC nonzero count averaged over the covered
+  // blocks, i.e. (nzeros + covered - 1) >> log2_covered, always in [0, 63], so a
+  // single byte per plane suffices (was Image3I = 4 bytes).
+  Image3<uint8_t> num_nzeroes[kMaxNumPasses];
+
+  // Buffer for DC upsampling.
+  ImageF dc_buffer;
+
+ private:
+  // One grow-only arena: 3 float blocks for dequantized coefficients + 4 float
+  // blocks of transform scratch. The quantized-coefficient buffers (3x int32 or
+  // 3x int16, both shorter-lived and mutually exclusive with scratch) alias the
+  // scratch region. 7 float blocks vs the old 7f + 3*int32 + 3*int16 = ~39%
+  // less per-worker scratch at the largest transform shape.
+  AlignedMemory float_memory_;
+  size_t max_block_area_ = 0;
+};
+
 // Per-frame decoder state. All the images here should be accessed through a
 // group rect (either with block units or pixel units).
 struct PassesDecoderState {
@@ -139,6 +189,13 @@ struct PassesDecoderState {
   // Storage for the current frame if it can be referenced by future frames.
   ImageBundle frame_storage_for_referencing;
 
+  // Per-thread group decoding scratch. Owned here (rather than in FrameDecoder)
+  // so the grow-only buffers survive across frames: a fresh FrameDecoder is
+  // constructed per frame, so keeping these here avoids re-allocating the
+  // num_nzeroes planes, the dequant/scratch arena and the DC buffer on every
+  // animation frame / decoder reuse. Pure scratch, no cross-frame state.
+  std::vector<GroupDecCache> group_dec_caches;
+
   struct PipelineOptions {
     bool use_slow_render_pipeline;
     bool coalescing;
@@ -174,58 +231,21 @@ struct PassesDecoderState {
     upsampler8x = GetUpsamplingStage(memory_manager,
                                      shared->metadata->transform_data, 0, 3);
     if (frame_header.loop_filter.epf_iters > 0) {
-      JXL_ASSIGN_OR_RETURN(
-          sigma,
-          ImageF::Create(memory_manager,
-                         shared->frame_dim.xsize_blocks + 2 * kSigmaPadding,
-                         shared->frame_dim.ysize_blocks + 2 * kSigmaPadding));
+      const size_t sigma_x = shared->frame_dim.xsize_blocks + 2 * kSigmaPadding;
+      const size_t sigma_y = shared->frame_dim.ysize_blocks + 2 * kSigmaPadding;
+      // Reuse the existing sigma plane across frames when the dimensions are
+      // unchanged (e.g. animation): the EPF stages fully overwrite every sigma
+      // value they consume, so a fresh allocation is unnecessary.
+      if (sigma.xsize() != sigma_x || sigma.ysize() != sigma_y) {
+        JXL_ASSIGN_OR_RETURN(
+            sigma, ImageF::Create(memory_manager, sigma_x, sigma_y));
+      }
     }
     return true;
   }
 
   // Initialize the decoder state after all of DC is decoded.
   Status InitForAC(size_t num_passes, ThreadPool* pool);
-};
-
-// Temp images required for decoding a single group. Reduces memory allocations
-// for large images because we only initialize min(#threads, #groups) instances.
-struct HWY_ALIGN_MAX GroupDecCache {
-  Status InitOnce(JxlMemoryManager* memory_manager, size_t num_passes,
-                  size_t used_acs);
-
-  Status InitDCBufferOnce(JxlMemoryManager* memory_manager) {
-    if (dc_buffer.xsize() == 0) {
-      JXL_ASSIGN_OR_RETURN(
-          dc_buffer,
-          ImageF::Create(memory_manager,
-                         kGroupDimInBlocks + kRenderPipelineXOffset * 2,
-                         kGroupDimInBlocks + 4));
-    }
-    return true;
-  }
-
-  // Scratch space used by DecGroupImpl().
-  float* dec_group_block;
-  int32_t* dec_group_qblock;
-  int16_t* dec_group_qblock16;
-
-  // For TransformToPixels.
-  float* scratch_space;
-  // Note that scratch_space is never used at the same time as dec_group_qblock.
-  // Moreover, only one of dec_group_qblock16 is ever used.
-  // TODO(veluca): figure out if we can save allocations.
-
-  // AC decoding
-  Image3I num_nzeroes[kMaxNumPasses];
-
-  // Buffer for DC upsampling.
-  ImageF dc_buffer;
-
- private:
-  AlignedMemory float_memory_;
-  AlignedMemory int32_memory_;
-  AlignedMemory int16_memory_;
-  size_t max_block_area_ = 0;
 };
 
 }  // namespace jxl

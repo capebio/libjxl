@@ -499,11 +499,11 @@ Status FrameDecoder::ProcessACGroup(size_t ac_group_id, PassesReaders& br,
   bool should_run_pipeline = true;
 
   if (frame_header_.encoding == FrameEncoding::kVarDCT) {
-    JXL_RETURN_IF_ERROR(group_dec_caches_[thread].InitOnce(
+    JXL_RETURN_IF_ERROR(dec_state_->group_dec_caches[thread].InitOnce(
         memory_manager, frame_header_.passes.num_passes, dec_state_->used_acs));
     JXL_RETURN_IF_ERROR(DecodeGroup(
         frame_header_, br.data(), num_passes, ac_group_id, dec_state_,
-        &group_dec_caches_[thread], thread, render_pipeline_input,
+        &dec_state_->group_dec_caches[thread], thread, render_pipeline_input,
         decoded_->jpeg_data.get(), decoded_passes_per_ac_group_[ac_group_id],
         force_draw, dc_only, &should_run_pipeline));
   }

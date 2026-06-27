@@ -314,8 +314,9 @@ class FrameDecoder {
   // than the value of `num_tasks` passed here.
   Status PrepareStorage(size_t num_threads, size_t num_tasks) {
     size_t storage_size = std::min(num_threads, num_tasks);
-    if (storage_size > group_dec_caches_.size()) {
-      group_dec_caches_.resize(storage_size);
+    // Grow-only, owned by dec_state_ so it persists across frames.
+    if (storage_size > dec_state_->group_dec_caches.size()) {
+      dec_state_->group_dec_caches.resize(storage_size);
     }
     use_task_id_ = num_threads > num_tasks;
     bool use_noise = (frame_header_.flags & FrameHeader::kNoise) != 0;
@@ -385,8 +386,6 @@ class FrameDecoder {
   size_t num_sections_done_ = 0;
   bool is_finalized_ = true;
   bool allocated_ = false;
-
-  std::vector<GroupDecCache> group_dec_caches_;
 
   // Whether or not the task id should be used for storage indexing, instead of
   // the thread id.

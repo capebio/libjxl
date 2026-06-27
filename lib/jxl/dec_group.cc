@@ -684,8 +684,8 @@ namespace {
 // LLF components in the output block will not be modified.
 template <ACType ac_type, bool uses_lz77>
 Status DecodeACVarBlock(size_t ctx_offset, size_t log2_covered_blocks,
-                        int32_t* JXL_RESTRICT row_nzeros,
-                        const int32_t* JXL_RESTRICT row_nzeros_top,
+                        uint8_t* JXL_RESTRICT row_nzeros,
+                        const uint8_t* JXL_RESTRICT row_nzeros_top,
                         size_t nzeros_stride, size_t c, size_t bx, size_t by,
                         size_t lbx, AcStrategy acs,
                         const coeff_order_t* JXL_RESTRICT coeff_order,
@@ -716,10 +716,15 @@ Status DecodeACVarBlock(size_t ctx_offset, size_t log2_covered_blocks,
                        " 8x8 blocks",
                        nzeros, covered_blocks);
   }
+  // (nzeros + covered_blocks - 1) >> log2_covered_blocks averages the AC nonzero
+  // count over the covered blocks; nzeros <= size - covered_blocks bounds it to
+  // [0, 63], so it always fits in the uint8_t plane.
+  const uint8_t avg_nzeros =
+      static_cast<uint8_t>((nzeros + covered_blocks - 1) >> log2_covered_blocks);
+  JXL_DASSERT(((nzeros + covered_blocks - 1) >> log2_covered_blocks) <= 63);
   for (size_t y = 0; y < acs.covered_blocks_y(); y++) {
     for (size_t x = 0; x < acs.covered_blocks_x(); x++) {
-      row_nzeros[bx + x + y * nzeros_stride] =
-          (nzeros + covered_blocks - 1) >> log2_covered_blocks;
+      row_nzeros[bx + x + y * nzeros_stride] = avg_nzeros;
     }
   }
 
@@ -864,8 +869,8 @@ struct GetBlockFromBitstream : public GetBlock {
   size_t num_passes;
   size_t ctx_offset[kMaxNumPasses];
   size_t nzeros_stride;
-  int32_t* JXL_RESTRICT row_nzeros[kMaxNumPasses][3];
-  const int32_t* JXL_RESTRICT row_nzeros_top[kMaxNumPasses][3];
+  uint8_t* JXL_RESTRICT row_nzeros[kMaxNumPasses][3];
+  const uint8_t* JXL_RESTRICT row_nzeros_top[kMaxNumPasses][3];
   GroupDecCache* JXL_RESTRICT group_dec_cache;
   const BlockCtxMap* block_ctx_map;
   const ImageI* qf;
