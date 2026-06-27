@@ -9,11 +9,14 @@
 #include <jxl/memory_manager.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <utility>
 #include <vector>
+
+#include "lib/jxl/base/compiler_specific.h"
 
 #include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/status.h"
@@ -33,6 +36,9 @@ class RenderPipelineInput {
     *this = std::move(other);
   }
   RenderPipelineInput& operator=(RenderPipelineInput&& other) noexcept {
+    if (this == &other) return *this;
+    // Release any lease this object currently holds before taking over other's.
+    ReleaseAbandonedLease();
     pipeline_ = other.pipeline_;
     group_id_ = other.group_id_;
     thread_id_ = other.thread_id_;
@@ -43,6 +49,10 @@ class RenderPipelineInput {
   }
 
   RenderPipelineInput() = default;
+  // Releasing the lease on destruction makes abandoning an input (e.g. on an
+  // error path, before Done()) safe: the thread's descriptor slot is freed for
+  // reacquisition rather than left permanently leased.
+  ~RenderPipelineInput() { ReleaseAbandonedLease(); }
   Status Done();
 
   const std::pair<ImageF*, Rect>& GetBuffer(size_t c) const {
@@ -52,6 +62,10 @@ class RenderPipelineInput {
   }
 
  private:
+  // Releases the lease iff this object still holds one (pipeline_ != nullptr,
+  // i.e. neither Done() nor a move has consumed it). Idempotent.
+  void ReleaseAbandonedLease();
+
   RenderPipeline* pipeline_ = nullptr;
   size_t group_id_;
   size_t thread_id_;
@@ -142,6 +156,12 @@ class RenderPipeline {
   // heap allocation per GetInputBuffers call. Indexed by thread_id; at most one
   // live RenderPipelineInput may lease a given slot at a time.
   std::vector<std::vector<std::pair<ImageF*, Rect>>> input_buffers_;
+
+#if JXL_IS_DEBUG_BUILD
+  // Number of live descriptor leases (debug only). Guards against resizing
+  // input_buffers_ while a non-owning lease pointer is outstanding.
+  std::atomic<size_t> live_leases_{0};
+#endif
 
   friend class RenderPipelineInput;
 

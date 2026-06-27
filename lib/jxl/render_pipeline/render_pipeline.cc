@@ -99,7 +99,19 @@ RenderPipelineInput RenderPipeline::GetInputBuffers(size_t group_id,
   std::vector<std::pair<ImageF*, Rect>>* slot = &input_buffers_[thread_id];
   PrepareBuffers(group_id, thread_id, slot);
   ret.buffers_ = slot;
+#if JXL_IS_DEBUG_BUILD
+  live_leases_.fetch_add(1, std::memory_order_relaxed);
+#endif
   return ret;
+}
+
+void RenderPipelineInput::ReleaseAbandonedLease() {
+  if (pipeline_ == nullptr) return;
+#if JXL_IS_DEBUG_BUILD
+  pipeline_->live_leases_.fetch_sub(1, std::memory_order_relaxed);
+#endif
+  pipeline_ = nullptr;
+  buffers_ = nullptr;
 }
 
 Status RenderPipeline::InputReady(
@@ -120,7 +132,12 @@ Status RenderPipeline::PrepareForThreads(size_t num, bool use_group_ids) {
   for (const auto& stage : stages_) {
     JXL_RETURN_IF_ERROR(stage->PrepareForThreads(num));
   }
-  // Grow-only: one reusable descriptor slot per thread.
+  // Grow-only: one reusable descriptor slot per thread. Resizing while a lease
+  // is live would reallocate the slot vector and invalidate the non-owning
+  // pointer held by a live RenderPipelineInput.
+#if JXL_IS_DEBUG_BUILD
+  JXL_DASSERT(live_leases_.load(std::memory_order_relaxed) == 0);
+#endif
   if (input_buffers_.size() < num) input_buffers_.resize(num);
   JXL_RETURN_IF_ERROR(PrepareForThreadsInternal(num, use_group_ids));
   return true;
@@ -132,9 +149,16 @@ Status RenderPipelineInput::Done() {
   // counter, so detach the pipeline first to prevent a second call (or a
   // retry after error) from double-counting the group.
   RenderPipeline* pipeline = pipeline_;
+  std::vector<std::pair<ImageF*, Rect>>* buffers = buffers_;
+  // Lease is consumed on entry; release it unconditionally (even if InputReady
+  // fails) so the thread's slot is freed regardless of the result.
   pipeline_ = nullptr;
-  JXL_DASSERT(buffers_ != nullptr);
-  JXL_RETURN_IF_ERROR(pipeline->InputReady(group_id_, thread_id_, *buffers_));
+#if JXL_IS_DEBUG_BUILD
+  pipeline->live_leases_.fetch_sub(1, std::memory_order_relaxed);
+#endif
+  buffers_ = nullptr;
+  JXL_DASSERT(buffers != nullptr);
+  JXL_RETURN_IF_ERROR(pipeline->InputReady(group_id_, thread_id_, *buffers));
   return true;
 }
 

@@ -284,6 +284,38 @@ TEST(RenderPipelineTest, PrepareForThreadsReuseNoRealloc) {
   EXPECT_EQ(pipeline->PassesWithAllInput(), 1u);
 }
 
+// An input acquired then moved/abandoned without Done() must release its
+// descriptor slot, so the same thread_id can be reacquired and a later
+// PrepareForThreads (which debug-asserts no live leases) still succeeds.
+TEST(RenderPipelineTest, AbandonedLeaseReacquire) {
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+  FrameDimensions frame_dimensions;
+  JXL_TEST_ASSIGN_OR_DIE(
+      auto pipeline,
+      BuildUpsampleCheckPipeline(memory_manager, &frame_dimensions));
+  ASSERT_TRUE(pipeline->PrepareForThreads(1, /*use_group_ids=*/false));
+
+  // Acquire on thread 0, move it, then let the moved-to object go out of scope
+  // without Done() -> the lease must be released by the destructor.
+  {
+    auto input = pipeline->GetInputBuffers(0, 0);
+    auto moved = std::move(input);
+    (void)moved.GetBuffer(0);
+  }
+
+  // Reacquire the same thread_id (including group 0) and complete normally.
+  for (size_t i = 0; i < frame_dimensions.num_groups; i++) {
+    auto input_buffers = pipeline->GetInputBuffers(i, 0);
+    const auto& buffer = input_buffers.GetBuffer(0);
+    FillPlane(0.0f, buffer.first, buffer.second);
+    ASSERT_TRUE(input_buffers.Done());
+  }
+  EXPECT_EQ(pipeline->PassesWithAllInput(), 1u);
+
+  // No lease is live now; the debug live-lease assertion must hold.
+  ASSERT_TRUE(pipeline->PrepareForThreads(1, /*use_group_ids=*/false));
+}
+
 struct RenderPipelineTestInputSettings {
   // Input image.
   std::string input_path;

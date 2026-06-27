@@ -173,6 +173,36 @@ Status Run() {
     printf("[ok] DescriptorReuseNoRealloc\n");
   }
 
+  // --- Test 5 / FLIPFLOP: multi-thread descriptor reuse. ---
+  // Warm-up descriptor allocations are bounded by the number of active thread
+  // slots, NOT by the number of groups; steady-state is zero.
+  {
+    const size_t kThreads = 4;
+    CountingMemoryManager c;
+    FrameDimensions fd;
+    JXL_ASSIGN_OR_RETURN(auto p, BuildPipeline(&c.mm, &fd));
+    JXL_RETURN_IF_ERROR(p->PrepareForThreads(kThreads, false));
+
+    auto sweep = [&]() -> size_t {
+      size_t before = g_global_allocs.load(std::memory_order_relaxed);
+      for (size_t g = 0; g < fd.num_groups; g++) {
+        auto in = p->GetInputBuffers(g, g % kThreads);
+        (void)in.GetBuffer(0);
+      }
+      return g_global_allocs.load(std::memory_order_relaxed) - before;
+    };
+
+    size_t warm = sweep();
+    size_t steady = sweep();
+    printf(
+        "[flipflop] GetInputBuffers x%zu over %zu threads: warm sweep "
+        "allocs=%zu  steady sweep allocs=%zu\n",
+        fd.num_groups, kThreads, warm, steady);
+    JXL_ENSURE(warm <= kThreads);  // bounded by active slots, not groups
+    JXL_ENSURE(steady == 0);
+    printf("[ok] MultiThreadDescriptorReuse\n");
+  }
+
   printf("ALL PASS\n");
   return true;
 }
