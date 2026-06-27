@@ -30,8 +30,8 @@ class LowMemoryRenderPipeline final : public RenderPipeline {
       : RenderPipeline(memory_manager) {}
 
  private:
-  std::vector<std::pair<ImageF*, Rect>> PrepareBuffers(
-      size_t group_id, size_t thread_id) override;
+  void PrepareBuffers(size_t group_id, size_t thread_id,
+                      std::vector<std::pair<ImageF*, Rect>>* buffers) override;
 
   Status PrepareForThreadsInternal(size_t num, bool use_group_ids) override;
 

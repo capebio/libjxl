@@ -191,6 +191,48 @@ TEST(RenderPipelineTest, CallAllGroupsFast) {
   EXPECT_EQ(pipeline->PassesWithAllInput(), 1u);
 }
 
+// An input acquired then moved/abandoned without Done() must release its
+// per-thread descriptor slot, so the same thread_id can be reacquired and a
+// later PrepareForThreads (which debug-asserts no live leases) still succeeds.
+// Covers the lease lifecycle introduced by the descriptor-reuse optimization.
+TEST(RenderPipelineTest, AbandonedLeaseReacquire) {
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+  RenderPipeline::Builder builder(memory_manager, /*num_c=*/1);
+  ASSERT_TRUE(builder.AddStage(jxl::make_unique<UpsampleXSlowStage>()));
+  ASSERT_TRUE(builder.AddStage(jxl::make_unique<UpsampleYSlowStage>()));
+  ASSERT_TRUE(builder.AddStage(jxl::make_unique<Check0FinalStage>()));
+  // Low-memory (real) path: do not call UseSimpleImplementation().
+  FrameDimensions frame_dimensions;
+  frame_dimensions.Set(/*xsize_px=*/1024, /*ysize_px=*/1024,
+                       /*group_size_shift=*/0,
+                       /*max_hshift=*/0, /*max_vshift=*/0,
+                       /*modular_mode=*/false, /*upsampling=*/1);
+  JXL_TEST_ASSIGN_OR_DIE(auto pipeline,
+                         std::move(builder).Finalize(frame_dimensions));
+  ASSERT_TRUE(pipeline->PrepareForThreads(1, /*use_group_ids=*/false));
+
+  // Acquire on thread 0, move it, then let the moved-to object go out of scope
+  // without Done() -> the lease must be released by the destructor.
+  {
+    auto input = pipeline->GetInputBuffers(0, 0);
+    auto moved = std::move(input);
+    (void)moved.GetBuffer(0);
+  }
+
+  // Reacquire the same thread_id (including group 0) and complete normally.
+  for (size_t i = 0; i < frame_dimensions.num_groups; i++) {
+    auto input_buffers = pipeline->GetInputBuffers(i, 0);
+    const auto& buffer = input_buffers.GetBuffer(0);
+    FillPlane(0.0f, buffer.first, buffer.second);
+    ASSERT_TRUE(input_buffers.Done());
+  }
+  EXPECT_EQ(pipeline->PassesWithAllInput(), 1u);
+
+  // No lease is live now; the debug live-lease assertion in PrepareForThreads
+  // must hold.
+  ASSERT_TRUE(pipeline->PrepareForThreads(1, /*use_group_ids=*/false));
+}
+
 struct RenderPipelineTestInputSettings {
   // Input image.
   std::string input_path;

@@ -203,3 +203,11 @@ if(JPEGXL_ENABLE_BENCHMARK)
   # Google benchmark for the jxl library
   include(jxl_benchmark.cmake)
 endif()
+
+# Standalone render-pipeline descriptor-reuse flipflop harness (no
+# codec/PNG/gtest deps). Enable with -DRP_STANDALONE_BENCH=ON.
+if(RP_STANDALONE_BENCH)
+  add_executable(rp_bench
+    ${CMAKE_CURRENT_SOURCE_DIR}/jxl/render_pipeline/rp_bench.cc)
+  target_link_libraries(rp_bench jxl-internal hwy)
+endif()

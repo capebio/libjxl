@@ -451,9 +451,11 @@ Status LowMemoryRenderPipeline::PrepareForThreadsInternal(size_t num,
   return true;
 }
 
-std::vector<std::pair<ImageF*, Rect>> LowMemoryRenderPipeline::PrepareBuffers(
-    size_t group_id, size_t thread_id) {
-  std::vector<std::pair<ImageF*, Rect>> ret(channel_shifts_[0].size());
+void LowMemoryRenderPipeline::PrepareBuffers(
+    size_t group_id, size_t thread_id,
+    std::vector<std::pair<ImageF*, Rect>>* buffers) {
+  auto& ret = *buffers;
+  ret.resize(channel_shifts_[0].size());
   const size_t gx = group_id % frame_dimensions_.xsize_groups;
   const size_t gy = group_id / frame_dimensions_.xsize_groups;
   for (size_t c = 0; c < channel_shifts_[0].size(); c++) {
@@ -467,7 +469,6 @@ std::vector<std::pair<ImageF*, Rect>> LowMemoryRenderPipeline::PrepareBuffers(
                                  1 << channel_shifts_[0][c].second) -
                              gy * GroupInputYSize(c) + group_data_y_border_);
   }
-  return ret;
 }
 
 namespace {
