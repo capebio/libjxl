@@ -82,8 +82,10 @@ void GroupBorderAssigner::GroupDone(size_t group_id, size_t padx, size_t pady,
     // Note that the acq-rel semantics of this fetch are actually needed to
     // ensure that the pixel data of the group is already written to memory.
     size_t shift = 4 * (x & 7u);
-    size_t status =
-        counters_[y * counters_stride_ + x / 8].fetch_or(bit << shift);
+    // acq-rel matches the documented requirement above; seq_cst (the default)
+    // is stricter than needed and costs on weak-memory targets (ARM/wasm).
+    size_t status = counters_[y * counters_stride_ + x / 8].fetch_or(
+        bit << shift, std::memory_order_acq_rel);
     status >>= shift;
     JXL_DASSERT((bit & status) == 0);
     return (bit | status) & 0xF;
