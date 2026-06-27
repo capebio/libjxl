@@ -12,8 +12,10 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <ostream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -165,20 +167,53 @@ TEST(RenderPipelineTest, BuildFast) {
   (void)pipeline;
 }
 
-TEST(RenderPipelineTest, CallAllGroupsFast) {
-  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+// Counting memory manager: forwards to malloc/free and tracks the number of
+// live allocations. Used to prove that repeated PrepareForThreads calls reuse
+// buffers instead of reallocating.
+struct CountingMemoryManager {
+  JxlMemoryManager mm;
+  size_t alloc_count = 0;
+  size_t free_count = 0;
+
+  CountingMemoryManager() {
+    mm.opaque = this;
+    mm.alloc = &Alloc;
+    mm.free = &Free;
+  }
+
+  static void* Alloc(void* opaque, size_t size) {
+    auto* self = static_cast<CountingMemoryManager*>(opaque);
+    self->alloc_count++;
+    return malloc(size);
+  }
+  static void Free(void* opaque, void* address) {
+    auto* self = static_cast<CountingMemoryManager*>(opaque);
+    if (address != nullptr) self->free_count++;
+    free(address);
+  }
+};
+
+// Builds the standard X/Y-upsample + check pipeline used by these tests.
+StatusOr<std::unique_ptr<RenderPipeline>> BuildUpsampleCheckPipeline(
+    JxlMemoryManager* memory_manager, FrameDimensions* frame_dimensions) {
   RenderPipeline::Builder builder(memory_manager, /*num_c=*/1);
-  ASSERT_TRUE(builder.AddStage(jxl::make_unique<UpsampleXSlowStage>()));
-  ASSERT_TRUE(builder.AddStage(jxl::make_unique<UpsampleYSlowStage>()));
-  ASSERT_TRUE(builder.AddStage(jxl::make_unique<Check0FinalStage>()));
-  builder.UseSimpleImplementation();
+  JXL_RETURN_IF_ERROR(builder.AddStage(jxl::make_unique<UpsampleXSlowStage>()));
+  JXL_RETURN_IF_ERROR(builder.AddStage(jxl::make_unique<UpsampleYSlowStage>()));
+  JXL_RETURN_IF_ERROR(builder.AddStage(jxl::make_unique<Check0FinalStage>()));
+  frame_dimensions->Set(/*xsize_px=*/1024, /*ysize_px=*/1024,
+                        /*group_size_shift=*/0,
+                        /*max_hshift=*/0, /*max_vshift=*/0,
+                        /*modular_mode=*/false, /*upsampling=*/1);
+  return std::move(builder).Finalize(*frame_dimensions);
+}
+
+// Drives every group once through the (default, low-memory) pipeline.
+TEST(RenderPipelineTest, CallAllGroupsLowMemory) {
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
   FrameDimensions frame_dimensions;
-  frame_dimensions.Set(/*xsize_px=*/1024, /*ysize_px=*/1024,
-                       /*group_size_shift=*/0,
-                       /*max_hshift=*/0, /*max_vshift=*/0,
-                       /*modular_mode=*/false, /*upsampling=*/1);
-  JXL_TEST_ASSIGN_OR_DIE(auto pipeline,
-                         std::move(builder).Finalize(frame_dimensions));
+  JXL_TEST_ASSIGN_OR_DIE(
+      auto pipeline,
+      BuildUpsampleCheckPipeline(memory_manager, &frame_dimensions));
   ASSERT_TRUE(pipeline->PrepareForThreads(1, /*use_group_ids=*/false));
 
   for (size_t i = 0; i < frame_dimensions.num_groups; i++) {
@@ -189,6 +224,96 @@ TEST(RenderPipelineTest, CallAllGroupsFast) {
   }
 
   EXPECT_EQ(pipeline->PassesWithAllInput(), 1u);
+}
+
+// Two progressive passes over the low-memory pipeline with ClearDone() between
+// them, submitting groups in shuffled order. Exercises border invalidation and
+// the deferred-rectangle paths (UpsampleX/Y both require neighbour halos).
+TEST(RenderPipelineTest, CallAllGroupsLowMemoryInvalidate) {
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+  FrameDimensions frame_dimensions;
+  JXL_TEST_ASSIGN_OR_DIE(
+      auto pipeline,
+      BuildUpsampleCheckPipeline(memory_manager, &frame_dimensions));
+  ASSERT_TRUE(pipeline->PrepareForThreads(1, /*use_group_ids=*/false));
+
+  std::vector<size_t> groups(frame_dimensions.num_groups);
+  for (size_t i = 0; i < groups.size(); i++) groups[i] = i;
+  std::mt19937 rng(123);
+
+  for (size_t pass = 0; pass < 2; pass++) {
+    std::shuffle(groups.begin(), groups.end(), rng);
+    for (size_t g : groups) {
+      if (pass != 0) pipeline->ClearDone(g);
+      auto input_buffers = pipeline->GetInputBuffers(g, 0);
+      const auto& buffer = input_buffers.GetBuffer(0);
+      FillPlane(0.0f, buffer.first, buffer.second);
+      ASSERT_TRUE(input_buffers.Done());
+    }
+    EXPECT_EQ(pipeline->PassesWithAllInput(), pass + 1);
+  }
+}
+
+// Regression test for the grow-only scratch reuse: oscillating the thread count
+// (8 -> 1 -> 8) must not reallocate the same-size stage buffers. Asserts both
+// correctness and that no allocations occur after the first preparation.
+TEST(RenderPipelineTest, PrepareForThreadsReuseNoRealloc) {
+  CountingMemoryManager counter;
+  FrameDimensions frame_dimensions;
+  JXL_TEST_ASSIGN_OR_DIE(
+      auto pipeline,
+      BuildUpsampleCheckPipeline(&counter.mm, &frame_dimensions));
+
+  ASSERT_TRUE(pipeline->PrepareForThreads(8, /*use_group_ids=*/false));
+  const size_t after_first = counter.alloc_count;
+  EXPECT_GT(after_first, 0u);
+
+  // Smaller count must not shrink/free; larger-again must reuse same-size
+  // buffers. No allocation should happen on either subsequent call.
+  ASSERT_TRUE(pipeline->PrepareForThreads(1, /*use_group_ids=*/false));
+  EXPECT_EQ(counter.alloc_count, after_first);
+  ASSERT_TRUE(pipeline->PrepareForThreads(8, /*use_group_ids=*/false));
+  EXPECT_EQ(counter.alloc_count, after_first);
+
+  for (size_t i = 0; i < frame_dimensions.num_groups; i++) {
+    auto input_buffers = pipeline->GetInputBuffers(i, 0);
+    const auto& buffer = input_buffers.GetBuffer(0);
+    FillPlane(0.0f, buffer.first, buffer.second);
+    ASSERT_TRUE(input_buffers.Done());
+  }
+  EXPECT_EQ(pipeline->PassesWithAllInput(), 1u);
+}
+
+// An input acquired then moved/abandoned without Done() must release its
+// descriptor slot, so the same thread_id can be reacquired and a later
+// PrepareForThreads (which debug-asserts no live leases) still succeeds.
+TEST(RenderPipelineTest, AbandonedLeaseReacquire) {
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+  FrameDimensions frame_dimensions;
+  JXL_TEST_ASSIGN_OR_DIE(
+      auto pipeline,
+      BuildUpsampleCheckPipeline(memory_manager, &frame_dimensions));
+  ASSERT_TRUE(pipeline->PrepareForThreads(1, /*use_group_ids=*/false));
+
+  // Acquire on thread 0, move it, then let the moved-to object go out of scope
+  // without Done() -> the lease must be released by the destructor.
+  {
+    auto input = pipeline->GetInputBuffers(0, 0);
+    auto moved = std::move(input);
+    (void)moved.GetBuffer(0);
+  }
+
+  // Reacquire the same thread_id (including group 0) and complete normally.
+  for (size_t i = 0; i < frame_dimensions.num_groups; i++) {
+    auto input_buffers = pipeline->GetInputBuffers(i, 0);
+    const auto& buffer = input_buffers.GetBuffer(0);
+    FillPlane(0.0f, buffer.first, buffer.second);
+    ASSERT_TRUE(input_buffers.Done());
+  }
+  EXPECT_EQ(pipeline->PassesWithAllInput(), 1u);
+
+  // No lease is live now; the debug live-lease assertion must hold.
+  ASSERT_TRUE(pipeline->PrepareForThreads(1, /*use_group_ids=*/false));
 }
 
 struct RenderPipelineTestInputSettings {

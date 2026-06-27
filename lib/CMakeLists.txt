@@ -203,3 +203,10 @@ if(JPEGXL_ENABLE_BENCHMARK)
   # Google benchmark for the jxl library
   include(jxl_benchmark.cmake)
 endif()
+
+# Standalone render-pipeline scratch-reuse harness (no codec/PNG/gtest deps).
+if(RP_STANDALONE_BENCH)
+  add_executable(rp_bench
+    ${CMAKE_CURRENT_SOURCE_DIR}/jxl/render_pipeline/rp_bench.cc)
+  target_link_libraries(rp_bench jxl-internal hwy)
+endif()

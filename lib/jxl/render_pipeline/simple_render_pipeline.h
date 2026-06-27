@@ -23,8 +23,8 @@ namespace jxl {
 // amounts of memory and be slow. It is intended to be used mostly for testing
 // purposes.
 class SimpleRenderPipeline : public RenderPipeline {
-  std::vector<std::pair<ImageF*, Rect>> PrepareBuffers(
-      size_t group_id, size_t thread_id) override;
+  void PrepareBuffers(size_t group_id, size_t thread_id,
+                      std::vector<std::pair<ImageF*, Rect>>* buffers) override;
 
   Status ProcessBuffers(size_t group_id, size_t thread_id) override;
 

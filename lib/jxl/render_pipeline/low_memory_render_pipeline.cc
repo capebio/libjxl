@@ -397,8 +397,13 @@ Status LowMemoryRenderPipeline::PrepareForThreadsInternal(size_t num,
                          kRenderPipelineXOffset));
     }
   }
-  // TODO(veluca): avoid reallocating buffers if not needed.
-  stage_data_.resize(num);
+  // Grow-only: never shrink thread storage on a smaller `num`, and reuse any
+  // existing same-size ImageF rather than reallocating. The required stage
+  // buffer geometry is invariant for a given frame/stage layout, so repeated
+  // PrepareForThreads calls (progressive decode / FlushImage) reuse buffers.
+  // Exact-size reuse only: stage buffers are ring buffers whose wrap mask
+  // depends on ysize, so a differently-sized buffer must be recreated.
+  if (stage_data_.size() < num) stage_data_.resize(num);
   size_t upsampling = 1u << base_color_shift_;
   size_t group_dim = frame_dimensions_.group_dim * upsampling;
   size_t padding =
@@ -417,10 +422,13 @@ Status LowMemoryRenderPipeline::PrepareForThreadsInternal(size_t num,
               2 * next_y_border + (1 << stages_[i]->settings_.shift_y);
           stage_buffer_ysize = 1 << CeilLog2Nonzero(stage_buffer_ysize);
           next_y_border = stages_[i]->settings_.border_y;
-          JXL_ASSIGN_OR_RETURN(
-              stage_data_[t][c][i],
-              ImageF::Create(memory_manager_, stage_buffer_xsize,
-                             stage_buffer_ysize));
+          ImageF& buf = stage_data_[t][c][i];
+          if (buf.xsize() != stage_buffer_xsize ||
+              buf.ysize() != stage_buffer_ysize) {
+            JXL_ASSIGN_OR_RETURN(
+                buf, ImageF::Create(memory_manager_, stage_buffer_xsize,
+                                    stage_buffer_ysize));
+          }
         }
       }
     }
@@ -441,19 +449,25 @@ Status LowMemoryRenderPipeline::PrepareForThreadsInternal(size_t num,
     size_t out_of_frame_xsize =
         padding +
         std::max(left_padding, std::max(middle_padding, right_padding));
-    out_of_frame_data_.resize(num);
+    // Grow-only with same-size reuse, matching stage_data_ above.
+    if (out_of_frame_data_.size() < num) out_of_frame_data_.resize(num);
     for (size_t t = 0; t < num; t++) {
-      JXL_ASSIGN_OR_RETURN(
-          out_of_frame_data_[t],
-          ImageF::Create(memory_manager_, out_of_frame_xsize, shifts.size()));
+      ImageF& buf = out_of_frame_data_[t];
+      if (buf.xsize() != out_of_frame_xsize || buf.ysize() != shifts.size()) {
+        JXL_ASSIGN_OR_RETURN(
+            buf,
+            ImageF::Create(memory_manager_, out_of_frame_xsize, shifts.size()));
+      }
     }
   }
   return true;
 }
 
-std::vector<std::pair<ImageF*, Rect>> LowMemoryRenderPipeline::PrepareBuffers(
-    size_t group_id, size_t thread_id) {
-  std::vector<std::pair<ImageF*, Rect>> ret(channel_shifts_[0].size());
+void LowMemoryRenderPipeline::PrepareBuffers(
+    size_t group_id, size_t thread_id,
+    std::vector<std::pair<ImageF*, Rect>>* buffers) {
+  auto& ret = *buffers;
+  ret.resize(channel_shifts_[0].size());
   const size_t gx = group_id % frame_dimensions_.xsize_groups;
   const size_t gy = group_id / frame_dimensions_.xsize_groups;
   for (size_t c = 0; c < channel_shifts_[0].size(); c++) {
@@ -467,7 +481,6 @@ std::vector<std::pair<ImageF*, Rect>> LowMemoryRenderPipeline::PrepareBuffers(
                                  1 << channel_shifts_[0][c].second) -
                              gy * GroupInputYSize(c) + group_data_y_border_);
   }
-  return ret;
 }
 
 namespace {
