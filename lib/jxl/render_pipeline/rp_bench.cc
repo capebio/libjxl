@@ -11,7 +11,9 @@
 #include <jxl/memory_manager.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <new>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -27,6 +29,10 @@
 #include "lib/jxl/image_ops.h"
 #include "lib/jxl/render_pipeline/render_pipeline.h"
 #include "lib/jxl/render_pipeline/test_render_pipeline_stages.h"
+
+// Global allocation counter so we can observe std::vector (descriptor) heap
+// traffic, which does NOT go through JxlMemoryManager.
+static std::atomic<size_t> g_global_allocs{0};
 
 namespace jxl {
 namespace {
@@ -137,11 +143,58 @@ Status Run() {
     printf("[ok] PrepareForThreadsReuseNoRealloc\n");
   }
 
+  // --- Test 4 / FLIPFLOP: descriptor reuse across GetInputBuffers. ---
+  // Each GetInputBuffers used to allocate a fresh descriptor vector. With the
+  // per-thread reusable slot, only the first sweep warms capacity; subsequent
+  // sweeps allocate nothing for descriptors. Measure GetInputBuffers in
+  // isolation (no Done() -> no render-side allocations to confound the count).
+  {
+    CountingMemoryManager c;
+    FrameDimensions fd;
+    JXL_ASSIGN_OR_RETURN(auto p, BuildPipeline(&c.mm, &fd));
+    JXL_RETURN_IF_ERROR(p->PrepareForThreads(1, false));
+
+    auto sweep = [&]() -> size_t {
+      size_t before = g_global_allocs.load(std::memory_order_relaxed);
+      for (size_t g = 0; g < fd.num_groups; g++) {
+        auto in = p->GetInputBuffers(g, 0);
+        (void)in.GetBuffer(0);  // lease released when `in` leaves scope
+      }
+      return g_global_allocs.load(std::memory_order_relaxed) - before;
+    };
+
+    size_t warm = sweep();    // warm-up sweep (slot capacity grows)
+    size_t steady = sweep();  // steady-state sweep
+    printf(
+        "[flipflop] GetInputBuffers x%zu (descriptors only): warm sweep "
+        "allocs=%zu  steady sweep allocs=%zu\n",
+        fd.num_groups, warm, steady);
+    JXL_ENSURE(steady == 0);  // steady-state: zero descriptor allocations
+    printf("[ok] DescriptorReuseNoRealloc\n");
+  }
+
   printf("ALL PASS\n");
   return true;
 }
 
 }  // namespace
 }  // namespace jxl
+
+void* operator new(std::size_t n) {
+  g_global_allocs.fetch_add(1, std::memory_order_relaxed);
+  void* p = std::malloc(n ? n : 1);
+  if (!p) throw std::bad_alloc();
+  return p;
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void* operator new[](std::size_t n) {
+  g_global_allocs.fetch_add(1, std::memory_order_relaxed);
+  void* p = std::malloc(n ? n : 1);
+  if (!p) throw std::bad_alloc();
+  return p;
+}
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
 int main() { return jxl::Run() ? 0 : 1; }

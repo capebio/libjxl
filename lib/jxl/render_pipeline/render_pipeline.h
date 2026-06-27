@@ -36,8 +36,9 @@ class RenderPipelineInput {
     pipeline_ = other.pipeline_;
     group_id_ = other.group_id_;
     thread_id_ = other.thread_id_;
-    buffers_ = std::move(other.buffers_);
+    buffers_ = other.buffers_;
     other.pipeline_ = nullptr;
+    other.buffers_ = nullptr;
     return *this;
   }
 
@@ -45,15 +46,19 @@ class RenderPipelineInput {
   Status Done();
 
   const std::pair<ImageF*, Rect>& GetBuffer(size_t c) const {
-    JXL_DASSERT(c < buffers_.size());
-    return buffers_[c];
+    JXL_DASSERT(buffers_ != nullptr);
+    JXL_DASSERT(c < buffers_->size());
+    return (*buffers_)[c];
   }
 
  private:
   RenderPipeline* pipeline_ = nullptr;
   size_t group_id_;
   size_t thread_id_;
-  std::vector<std::pair<ImageF*, Rect>> buffers_;
+  // Non-owning view of the pipeline's per-thread descriptor slot. The slot is
+  // owned by RenderPipeline::input_buffers_ and is leased for the lifetime of
+  // this object (one live input per thread_id; released by Done()).
+  std::vector<std::pair<ImageF*, Rect>>* buffers_ = nullptr;
   friend class RenderPipeline;
 };
 
@@ -133,14 +138,23 @@ class RenderPipeline {
 
   std::vector<uint8_t> group_completed_passes_;
 
+  // Reusable per-thread descriptor slots, sized in PrepareForThreads. Avoids a
+  // heap allocation per GetInputBuffers call. Indexed by thread_id; at most one
+  // live RenderPipelineInput may lease a given slot at a time.
+  std::vector<std::vector<std::pair<ImageF*, Rect>>> input_buffers_;
+
   friend class RenderPipelineInput;
 
  private:
   Status InputReady(size_t group_id, size_t thread_id,
                     const std::vector<std::pair<ImageF*, Rect>>& buffers);
 
-  virtual std::vector<std::pair<ImageF*, Rect>> PrepareBuffers(
-      size_t group_id, size_t thread_id) = 0;
+  // Fills `*buffers` with the (ImageF*, Rect) descriptor for each channel of
+  // `group_id`. `*buffers` is a reusable slot, so implementations must size it
+  // to the channel count and overwrite every entry.
+  virtual void PrepareBuffers(
+      size_t group_id, size_t thread_id,
+      std::vector<std::pair<ImageF*, Rect>>* buffers) = 0;
 
   virtual Status ProcessBuffers(size_t group_id, size_t thread_id) = 0;
 

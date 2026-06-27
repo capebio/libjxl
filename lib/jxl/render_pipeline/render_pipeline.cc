@@ -91,10 +91,14 @@ RenderPipelineInput RenderPipeline::GetInputBuffers(size_t group_id,
                                                     size_t thread_id) {
   RenderPipelineInput ret;
   JXL_DASSERT(group_id < group_completed_passes_.size());
+  JXL_DASSERT(thread_id < input_buffers_.size());
   ret.group_id_ = group_id;
   ret.thread_id_ = thread_id;
   ret.pipeline_ = this;
-  ret.buffers_ = PrepareBuffers(group_id, thread_id);
+  // Reuse this thread's descriptor slot instead of allocating a fresh vector.
+  std::vector<std::pair<ImageF*, Rect>>* slot = &input_buffers_[thread_id];
+  PrepareBuffers(group_id, thread_id, slot);
+  ret.buffers_ = slot;
   return ret;
 }
 
@@ -116,6 +120,8 @@ Status RenderPipeline::PrepareForThreads(size_t num, bool use_group_ids) {
   for (const auto& stage : stages_) {
     JXL_RETURN_IF_ERROR(stage->PrepareForThreads(num));
   }
+  // Grow-only: one reusable descriptor slot per thread.
+  if (input_buffers_.size() < num) input_buffers_.resize(num);
   JXL_RETURN_IF_ERROR(PrepareForThreadsInternal(num, use_group_ids));
   return true;
 }
@@ -127,7 +133,8 @@ Status RenderPipelineInput::Done() {
   // retry after error) from double-counting the group.
   RenderPipeline* pipeline = pipeline_;
   pipeline_ = nullptr;
-  JXL_RETURN_IF_ERROR(pipeline->InputReady(group_id_, thread_id_, buffers_));
+  JXL_DASSERT(buffers_ != nullptr);
+  JXL_RETURN_IF_ERROR(pipeline->InputReady(group_id_, thread_id_, *buffers_));
   return true;
 }
 

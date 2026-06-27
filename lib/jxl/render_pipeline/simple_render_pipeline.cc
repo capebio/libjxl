@@ -67,13 +67,14 @@ Rect SimpleRenderPipeline::MakeChannelRect(size_t group_id, size_t channel) {
                   1 << channel_shifts_[0][channel].second));
 }
 
-std::vector<std::pair<ImageF*, Rect>> SimpleRenderPipeline::PrepareBuffers(
-    size_t group_id, size_t thread_id) {
-  std::vector<std::pair<ImageF*, Rect>> ret;
+void SimpleRenderPipeline::PrepareBuffers(
+    size_t group_id, size_t thread_id,
+    std::vector<std::pair<ImageF*, Rect>>* buffers) {
+  auto& ret = *buffers;
+  ret.clear();
   for (size_t c = 0; c < channel_data_.size(); c++) {
     ret.emplace_back(&channel_data_[c], MakeChannelRect(group_id, c));
   }
-  return ret;
 }
 
 Status SimpleRenderPipeline::ProcessBuffers(size_t group_id, size_t thread_id) {
