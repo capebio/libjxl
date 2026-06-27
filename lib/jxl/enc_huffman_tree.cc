@@ -130,87 +130,70 @@ void CreateHuffmanTree(const uint32_t* data, const size_t length,
   }
 }
 
-void Reverse(uint8_t* v, size_t start, size_t end) {
-  --end;
-  while (start < end) {
-    uint8_t tmp = v[start];
-    v[start] = v[end];
-    v[end] = tmp;
-    ++start;
-    --end;
-  }
+static JXL_INLINE void EmitPackedToken(uint8_t symbol, uint8_t extra,
+                                        size_t* tree_size, uint8_t* packed_tree,
+                                        uint32_t* histogram) {
+  packed_tree[(*tree_size)++] = symbol | static_cast<uint8_t>(extra << 5);
+  ++histogram[symbol];
 }
 
 void WriteHuffmanTreeRepetitions(const uint8_t previous_value,
                                  const uint8_t value, size_t repetitions,
-                                 size_t* tree_size, uint8_t* tree,
-                                 uint8_t* extra_bits_data) {
+                                 size_t* tree_size, uint8_t* packed_tree,
+                                 uint32_t* histogram) {
   JXL_DASSERT(repetitions > 0);
   if (previous_value != value) {
-    tree[*tree_size] = value;
-    extra_bits_data[*tree_size] = 0;
-    ++(*tree_size);
+    EmitPackedToken(value, 0, tree_size, packed_tree, histogram);
     --repetitions;
   }
   if (repetitions == 7) {
-    tree[*tree_size] = value;
-    extra_bits_data[*tree_size] = 0;
-    ++(*tree_size);
+    EmitPackedToken(value, 0, tree_size, packed_tree, histogram);
     --repetitions;
   }
   if (repetitions < 3) {
     for (size_t i = 0; i < repetitions; ++i) {
-      tree[*tree_size] = value;
-      extra_bits_data[*tree_size] = 0;
-      ++(*tree_size);
+      EmitPackedToken(value, 0, tree_size, packed_tree, histogram);
     }
   } else {
     repetitions -= 3;
-    size_t start = *tree_size;
+    uint8_t digits[8];
+    size_t ndigits = 0;
     while (true) {
-      tree[*tree_size] = 16;
-      extra_bits_data[*tree_size] = repetitions & 0x3;
-      ++(*tree_size);
+      digits[ndigits++] = static_cast<uint8_t>(repetitions & 0x3);
       repetitions >>= 2;
-      if (repetitions == 0) {
-        break;
-      }
+      if (repetitions == 0) break;
       --repetitions;
     }
-    Reverse(tree, start, *tree_size);
-    Reverse(extra_bits_data, start, *tree_size);
+    while (ndigits != 0) {
+      EmitPackedToken(16, digits[--ndigits], tree_size, packed_tree, histogram);
+    }
   }
 }
 
 void WriteHuffmanTreeRepetitionsZeros(size_t repetitions, size_t* tree_size,
-                                      uint8_t* tree, uint8_t* extra_bits_data) {
+                                      uint8_t* packed_tree,
+                                      uint32_t* histogram) {
   if (repetitions == 11) {
-    tree[*tree_size] = 0;
-    extra_bits_data[*tree_size] = 0;
-    ++(*tree_size);
+    EmitPackedToken(0, 0, tree_size, packed_tree, histogram);
     --repetitions;
   }
   if (repetitions < 3) {
     for (size_t i = 0; i < repetitions; ++i) {
-      tree[*tree_size] = 0;
-      extra_bits_data[*tree_size] = 0;
-      ++(*tree_size);
+      EmitPackedToken(0, 0, tree_size, packed_tree, histogram);
     }
   } else {
     repetitions -= 3;
-    size_t start = *tree_size;
+    uint8_t digits[8];
+    size_t ndigits = 0;
     while (true) {
-      tree[*tree_size] = 17;
-      extra_bits_data[*tree_size] = repetitions & 0x7;
-      ++(*tree_size);
+      digits[ndigits++] = static_cast<uint8_t>(repetitions & 0x7);
       repetitions >>= 3;
-      if (repetitions == 0) {
-        break;
-      }
+      if (repetitions == 0) break;
       --repetitions;
     }
-    Reverse(tree, start, *tree_size);
-    Reverse(extra_bits_data, start, *tree_size);
+    while (ndigits != 0) {
+      EmitPackedToken(17, digits[--ndigits], tree_size, packed_tree, histogram);
+    }
   }
 }
 
@@ -242,7 +225,7 @@ static void DecideOverRleUse(const uint8_t* depth, const size_t length,
 }
 
 void WriteHuffmanTree(const uint8_t* depth, size_t length, size_t* tree_size,
-                      uint8_t* tree, uint8_t* extra_bits_data) {
+                      uint8_t* packed_tree, uint32_t* histogram) {
   uint8_t previous_value = 8;
 
   // Throw away trailing zeros.
@@ -276,10 +259,10 @@ void WriteHuffmanTree(const uint8_t* depth, size_t length, size_t* tree_size,
       }
     }
     if (value == 0) {
-      WriteHuffmanTreeRepetitionsZeros(reps, tree_size, tree, extra_bits_data);
+      WriteHuffmanTreeRepetitionsZeros(reps, tree_size, packed_tree, histogram);
     } else {
-      WriteHuffmanTreeRepetitions(previous_value, value, reps, tree_size, tree,
-                                  extra_bits_data);
+      WriteHuffmanTreeRepetitions(previous_value, value, reps, tree_size,
+                                  packed_tree, histogram);
       previous_value = value;
     }
     i += reps;

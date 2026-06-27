@@ -66,26 +66,16 @@ void StoreHuffmanTreeOfHuffmanTreeToBitMask(const int num_codes,
 }
 
 Status StoreHuffmanTreeToBitMask(const size_t huffman_tree_size,
-                                 const uint8_t* huffman_tree,
-                                 const uint8_t* huffman_tree_extra_bits,
+                                 const uint8_t* packed_tree,
                                  const uint8_t* code_length_bitdepth,
                                  const uint16_t* code_length_bitdepth_symbols,
                                  BitWriter* writer) {
   for (size_t i = 0; i < huffman_tree_size; ++i) {
-    size_t ix = huffman_tree[i];
+    const size_t ix = packed_tree[i] & 0x1F;
     writer->Write(code_length_bitdepth[ix], code_length_bitdepth_symbols[ix]);
     JXL_ENSURE(ix <= 17);
-    // Extra bits
-    switch (ix) {
-      case 16:
-        writer->Write(2, huffman_tree_extra_bits[i]);
-        break;
-      case 17:
-        writer->Write(3, huffman_tree_extra_bits[i]);
-        break;
-      default:
-        // no-op
-        break;
+    if (ix >= 16) {
+      writer->Write(ix == 16 ? 2 : 3, packed_tree[i] >> 5);
     }
   }
   return true;
@@ -127,42 +117,52 @@ void StoreSimpleHuffmanTree(const uint8_t* depths, size_t symbols[4],
 // num = alphabet size
 // depths = symbol depths
 Status StoreHuffmanTree(const uint8_t* depths, size_t num, BitWriter* writer) {
-  // Write the Huffman tree into the compact representation.
-  auto arena = jxl::make_uninitialized_vector<uint8_t>(2 * num);
-  uint8_t* huffman_tree = arena.data();
-  uint8_t* huffman_tree_extra_bits = arena.data() + num;
+  // Write the Huffman tree into the packed representation and accumulate the
+  // secondary histogram in one pass. Each byte: low 5 bits = code-length
+  // symbol (0..17), high 3 bits = RLE extra payload.
+  auto packed = jxl::make_uninitialized_vector<uint8_t>(num);
   size_t huffman_tree_size = 0;
-  WriteHuffmanTree(depths, num, &huffman_tree_size, huffman_tree,
-                   huffman_tree_extra_bits);
-
-  // Calculate the statistics of the Huffman tree in the compact representation.
   uint32_t huffman_tree_histogram[kCodeLengthCodes] = {0};
-  for (size_t i = 0; i < huffman_tree_size; ++i) {
-    ++huffman_tree_histogram[huffman_tree[i]];
-  }
+  WriteHuffmanTree(depths, num, &huffman_tree_size, packed.data(),
+                   huffman_tree_histogram);
 
+  // The compact stream uses only the 18 code-length symbols. Avoid the
+  // generic, allocating tree builder when that secondary alphabet has one or
+  // two live symbols: those trees are fixed by the format and canonical-code
+  // order.
   int num_codes = 0;
   int code = 0;
+  int second_code = 0;
   for (int i = 0; i < kCodeLengthCodes; ++i) {
-    if (huffman_tree_histogram[i]) {
-      if (num_codes == 0) {
-        code = i;
-        num_codes = 1;
-      } else if (num_codes == 1) {
-        num_codes = 2;
-        break;
-      }
+    if (!huffman_tree_histogram[i]) continue;
+    if (num_codes == 0) {
+      code = i;
+    } else if (num_codes == 1) {
+      second_code = i;
     }
+    ++num_codes;
   }
 
-  // Calculate another Huffman tree to use for compressing both the
-  // earlier Huffman tree with.
+  // Calculate another Huffman tree to use for compressing the earlier
+  // Huffman tree.
   uint8_t code_length_bitdepth[kCodeLengthCodes] = {0};
   uint16_t code_length_bitdepth_symbols[kCodeLengthCodes] = {0};
-  CreateHuffmanTree(&huffman_tree_histogram[0], kCodeLengthCodes, 5,
-                    &code_length_bitdepth[0]);
-  ConvertBitDepthsToSymbols(code_length_bitdepth, kCodeLengthCodes,
-                            &code_length_bitdepth_symbols[0]);
+  if (num_codes == 1) {
+    // The one-symbol tree normally has depth 1 and code 0. Its code bits are
+    // omitted below after its depth has been written to the tree header.
+    code_length_bitdepth[code] = 1;
+  } else if (num_codes == 2) {
+    // `code` and `second_code` were collected in ascending-symbol order,
+    // which is precisely canonical-code order for equal one-bit depths.
+    code_length_bitdepth[code] = 1;
+    code_length_bitdepth[second_code] = 1;
+    code_length_bitdepth_symbols[second_code] = 1;
+  } else {
+    CreateHuffmanTree(&huffman_tree_histogram[0], kCodeLengthCodes, 5,
+                      &code_length_bitdepth[0]);
+    ConvertBitDepthsToSymbols(code_length_bitdepth, kCodeLengthCodes,
+                              &code_length_bitdepth_symbols[0]);
+  }
 
   // Now, we have all the data, let's start storing it
   StoreHuffmanTreeOfHuffmanTreeToBitMask(num_codes, code_length_bitdepth,
@@ -174,7 +174,7 @@ Status StoreHuffmanTree(const uint8_t* depths, size_t num, BitWriter* writer) {
 
   // Store the real huffman tree now.
   JXL_RETURN_IF_ERROR(StoreHuffmanTreeToBitMask(
-      huffman_tree_size, huffman_tree, huffman_tree_extra_bits,
+      huffman_tree_size, packed.data(),
       &code_length_bitdepth[0], code_length_bitdepth_symbols, writer));
   return true;
 }
@@ -187,14 +187,9 @@ Status BuildAndStoreHuffmanTree(const uint32_t* histogram, const size_t length,
   size_t count = 0;
   size_t s4[4] = {0};
   for (size_t i = 0; i < length; i++) {
-    if (histogram[i]) {
-      if (count < 4) {
-        s4[count] = i;
-      } else if (count > 4) {
-        break;
-      }
-      count++;
-    }
+    if (!histogram[i]) continue;
+    if (count < 4) s4[count] = i;
+    if (++count == 5) break;
   }
 
   size_t max_bits_counter = length - 1;
@@ -208,6 +203,39 @@ Status BuildAndStoreHuffmanTree(const uint32_t* histogram, const size_t length,
     // Output symbol bits and depths are initialized with 0, nothing to do.
     writer->Write(4, 1);
     writer->Write(max_bits, s4[0]);
+    return true;
+  }
+
+  if (count == 2) {
+    // Both depth 1; canonical order follows ascending symbol index.
+    depth[s4[0]] = 1; depth[s4[1]] = 1;
+    bits[s4[0]] = 0;  bits[s4[1]] = 1;
+    StoreSimpleHuffmanTree(depth, s4, 2, max_bits, writer);
+    return true;
+  }
+
+  if (count == 3) {
+    // depth-1 symbol: highest count; ties broken by lowest symbol index.
+    // s4[0..2] are in ascending symbol-index order.
+    size_t shallow = s4[0];
+    for (size_t k = 1; k < 3; ++k) {
+      if (histogram[s4[k]] > histogram[shallow] ||
+          (histogram[s4[k]] == histogram[shallow] && s4[k] < shallow)) {
+        shallow = s4[k];
+      }
+    }
+    depth[shallow] = 1;
+    bits[shallow] = 0;
+    size_t ab[2];
+    size_t ab_n = 0;
+    for (size_t k = 0; k < 3; ++k) {
+      if (s4[k] != shallow) ab[ab_n++] = s4[k];
+    }
+    // ab[0] < ab[1] since s4 is in ascending symbol-index order.
+    depth[ab[0]] = depth[ab[1]] = 2;
+    bits[ab[0]] = 1;
+    bits[ab[1]] = 3;
+    StoreSimpleHuffmanTree(depth, s4, 3, max_bits, writer);
     return true;
   }
 

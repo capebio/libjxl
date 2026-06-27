@@ -40,8 +40,11 @@ void CreateHuffmanTree(const uint32_t* data, size_t length, int tree_limit,
 // Write a Huffman tree from bit depths into the bitstream representation
 // of a Huffman tree. The generated Huffman tree is to be compressed once
 // more using a Huffman tree
+// Each byte of packed_tree encodes one RLE token: low 5 bits = code-length
+// symbol (0..17), high 3 bits = RLE extra payload (for symbols 16 and 17).
+// histogram[0..17] is incremented for each emitted symbol.
 void WriteHuffmanTree(const uint8_t* depth, size_t length, size_t* tree_size,
-                      uint8_t* tree, uint8_t* extra_bits_data);
+                      uint8_t* packed_tree, uint32_t* histogram);
 
 // Get the actual bit values for a tree of bit depths.
 void ConvertBitDepthsToSymbols(const uint8_t* depth, size_t len,
