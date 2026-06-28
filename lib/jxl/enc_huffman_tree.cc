@@ -56,9 +56,12 @@ void CreateHuffmanTree(const uint32_t* data, const size_t length,
   // of this loop. Probably all of our block sizes will be smaller than
   // that, so this loop is mostly of academic interest. If we actually
   // would need this, we would be better off with the Katajainen algorithm.
+  // Retain node storage across count-limit retries. Retrying rewrites every
+  // active node, so clear() is sufficient and avoids allocate/free churn.
+  std::vector<HuffmanTree> tree;
+  tree.reserve(2 * length + 1);
   for (uint32_t count_limit = 1;; count_limit *= 2) {
-    std::vector<HuffmanTree> tree;
-    tree.reserve(2 * length + 1);
+    tree.clear();
 
     for (size_t i = length; i != 0;) {
       --i;
