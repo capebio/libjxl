@@ -132,7 +132,6 @@ class ModularFrameDecoder {
  private:
   Status ModularImageToDecodedRect(const FrameHeader& frame_header, Image& gi,
                                    PassesDecoderState* dec_state,
-                                   jxl::ThreadPool* pool,
                                    RenderPipelineInput& render_pipeline_input,
                                    Rect modular_rect) const;
   JxlMemoryManager* memory_manager_;

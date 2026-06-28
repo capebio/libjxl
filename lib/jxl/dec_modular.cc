@@ -123,6 +123,22 @@ void SingleFromSingleAccurate(const size_t xsize,
   }
 }
 
+// Same as three SingleFromSingleAccurate calls on identical input, but loads
+// each sample once and writes the byte-identical result to all three outputs.
+void RgbFromSingleAccurate(const size_t xsize,
+                           const pixel_type* const JXL_RESTRICT row_in,
+                           const double factor,
+                           float* const JXL_RESTRICT out_r,
+                           float* const JXL_RESTRICT out_g,
+                           float* const JXL_RESTRICT out_b) {
+  for (size_t x = 0; x < xsize; x++) {
+    const float value = static_cast<float>(row_in[x] * factor);
+    out_r[x] = value;
+    out_g[x] = value;
+    out_b[x] = value;
+  }
+}
+
 // convert custom [bits]-bit float (with [exp_bits] exponent bits) stored as int
 // back to binary32 float
 Status int_to_float(const pixel_type* const JXL_RESTRICT row_in,
@@ -401,7 +417,7 @@ Status ModularFrameDecoder::DecodeGroup(
       JXL_RETURN_IF_ERROR(t.Inverse(gi, global_header.wp_header));
     }
     JXL_RETURN_IF_ERROR(ModularImageToDecodedRect(
-        frame_header, gi, dec_state, nullptr, *render_pipeline_input,
+        frame_header, gi, dec_state, *render_pipeline_input,
         Rect(0, 0, gi.w, gi.h)));
     return true;
   }
@@ -506,17 +522,19 @@ Status ModularFrameDecoder::DecodeAcMetadata(const FrameHeader& frame_header,
   size_t xlim = std::min(ac_strategy.xsize(), r.x0() + r.xsize());
   size_t ylim = std::min(ac_strategy.ysize(), r.y0() + r.ysize());
   uint32_t local_used_acs = 0;
+  // These two rows are independent of iy; resolve them once.
+  const int32_t* const row_in_1 = image.channel[2].plane.Row(0);
+  const int32_t* const row_in_2 = image.channel[2].plane.Row(1);
   for (size_t iy = 0; iy < r.ysize(); iy++) {
     size_t y = r.y0() + iy;
     int32_t* row_qf = r.Row(&dec_state->shared_storage.raw_quant_field, iy);
     uint8_t* row_epf = r.Row(&dec_state->shared_storage.epf_sharpness, iy);
-    int32_t* row_in_1 = image.channel[2].plane.Row(0);
-    int32_t* row_in_2 = image.channel[2].plane.Row(1);
-    int32_t* row_in_3 = image.channel[3].plane.Row(iy);
+    const int32_t* row_in_3 = image.channel[3].plane.Row(iy);
     for (size_t ix = 0; ix < r.xsize(); ix++) {
       size_t x = r.x0() + ix;
-      int sharpness = row_in_3[ix];
-      if (sharpness < 0 || sharpness >= LoopFilter::kEpfSharpEntries) {
+      const int32_t sharpness = row_in_3[ix];
+      if (static_cast<uint32_t>(sharpness) >=
+          static_cast<uint32_t>(LoopFilter::kEpfSharpEntries)) {
         return JXL_FAILURE("Corrupted sharpness field");
       }
       row_epf[ix] = sharpness;
@@ -526,11 +544,12 @@ Status ModularFrameDecoder::DecodeAcMetadata(const FrameHeader& frame_header,
 
       if (num >= count) return JXL_FAILURE("Corrupted stream");
 
-      if (!AcStrategy::IsRawStrategyValid(row_in_1[num])) {
+      const int32_t strategy = row_in_1[num];
+      if (!AcStrategy::IsRawStrategyValid(strategy)) {
         return JXL_FAILURE("Invalid AC strategy");
       }
-      local_used_acs |= 1u << row_in_1[num];
-      AcStrategy acs = AcStrategy::FromRawStrategy(row_in_1[num]);
+      local_used_acs |= 1u << strategy;
+      AcStrategy acs = AcStrategy::FromRawStrategy(strategy);
       if ((acs.covered_blocks_x() > 1 || acs.covered_blocks_y() > 1) &&
           !is444) {
         return JXL_FAILURE(
@@ -548,7 +567,7 @@ Status ModularFrameDecoder::DecodeAcMetadata(const FrameHeader& frame_header,
         return JXL_FAILURE("Invalid AC strategy, y overflow");
       }
       JXL_RETURN_IF_ERROR(
-          ac_strategy.SetNoBoundsCheck(x, y, AcStrategyType(row_in_1[num])));
+          ac_strategy.SetNoBoundsCheck(x, y, AcStrategyType(strategy)));
       row_qf[ix] = 1 + std::max<int32_t>(0, std::min(Quantizer::kQuantMax - 1,
                                                      row_in_2[num]));
       num++;
@@ -563,15 +582,9 @@ Status ModularFrameDecoder::DecodeAcMetadata(const FrameHeader& frame_header,
 
 Status ModularFrameDecoder::ModularImageToDecodedRect(
     const FrameHeader& frame_header, Image& gi, PassesDecoderState* dec_state,
-    jxl::ThreadPool* pool, RenderPipelineInput& render_pipeline_input,
-    Rect modular_rect) const {
+    RenderPipelineInput& render_pipeline_input, Rect modular_rect) const {
   const auto* metadata = frame_header.nonserialized_metadata;
   JXL_ENSURE(gi.transform.empty());
-
-  auto get_row = [&](size_t c, size_t y) {
-    const auto& buffer = render_pipeline_input.GetBuffer(c);
-    return buffer.second.Row(buffer.first, y);
-  };
 
   size_t c = 0;
   if (do_color) {
@@ -580,6 +593,11 @@ Status ModularFrameDecoder::ModularImageToDecodedRect(
         frame_header.color_transform == ColorTransform::kNone;
     const bool fp = metadata->m.bit_depth.floating_point_sample &&
                     frame_header.color_transform != ColorTransform::kXYB;
+    // Groups are already parallelized by the caller (pool is always null here),
+    // so resolve the Highway dispatch once per call rather than once per row.
+    const auto multiply_sum = HWY_DYNAMIC_DISPATCH(MultiplySum);
+    const auto rgb_from_single = HWY_DYNAMIC_DISPATCH(RgbFromSingle);
+    const auto single_from_single = HWY_DYNAMIC_DISPATCH(SingleFromSingle);
     for (; c < 3; c++) {
       double factor = full_image.bitdepth < 32
                           ? 1.0 / ((1u << full_image.bitdepth) - 1)
@@ -599,14 +617,15 @@ Status ModularFrameDecoder::ModularImageToDecodedRect(
         return JXL_FAILURE("Empty image");
       }
       JXL_ENSURE(ch_in.hshift <= 3 && ch_in.vshift <= 3);
-      Rect r = render_pipeline_input.GetBuffer(c).second;
+      const auto& out_buf = render_pipeline_input.GetBuffer(c);
+      const Rect& r = out_buf.second;
       Rect mr(modular_rect.x0() >> ch_in.hshift,
               modular_rect.y0() >> ch_in.vshift,
               DivCeil(modular_rect.xsize(), 1 << ch_in.hshift),
               DivCeil(modular_rect.ysize(), 1 << ch_in.vshift));
       mr = mr.Crop(ch_in.plane);
-      size_t xsize_shifted = r.xsize();
-      size_t ysize_shifted = r.ysize();
+      const size_t xsize_shifted = r.xsize();
+      const size_t ysize_shifted = r.ysize();
       if (r.ysize() != mr.ysize() || r.xsize() != mr.xsize()) {
         return JXL_FAILURE("Dimension mismatch: trying to fit a %" PRIuS
                            "x%" PRIuS
@@ -616,75 +635,80 @@ Status ModularFrameDecoder::ModularImageToDecodedRect(
       }
       if (frame_header.color_transform == ColorTransform::kXYB && c == 2) {
         JXL_ENSURE(!fp);
-        const auto process_row = [&](const uint32_t task,
-                                     size_t /* thread */) -> Status {
-          const size_t y = task;
+        const auto& plane_y = gi.channel[0].plane;
+        for (size_t y = 0; y < ysize_shifted; ++y) {
           const pixel_type* const JXL_RESTRICT row_in = mr.Row(&ch_in.plane, y);
-          const pixel_type* const JXL_RESTRICT row_in_Y =
-              mr.Row(&gi.channel[0].plane, y);
-          float* const JXL_RESTRICT row_out = get_row(c, y);
-          HWY_DYNAMIC_DISPATCH(MultiplySum)
-          (xsize_shifted, row_in, row_in_Y, factor, row_out);
-          return true;
-        };
-        JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, ysize_shifted,
-                                      ThreadPool::NoInit, process_row,
-                                      "ModularIntToFloat"));
+          const pixel_type* const JXL_RESTRICT row_in_Y = mr.Row(&plane_y, y);
+          float* const JXL_RESTRICT row_out = r.Row(out_buf.first, y);
+          multiply_sum(xsize_shifted, row_in, row_in_Y, factor, row_out);
+        }
       } else if (fp) {
-        int bits = metadata->m.bit_depth.bits_per_sample;
-        int exp_bits = metadata->m.bit_depth.exponent_bits_per_sample;
-        const auto process_row = [&](const uint32_t task,
-                                     size_t /* thread */) -> Status {
-          const size_t y = task;
-          const pixel_type* const JXL_RESTRICT row_in = mr.Row(&ch_in.plane, y);
-          if (rgb_from_gray) {
-            for (size_t cc = 0; cc < 3; cc++) {
-              float* const JXL_RESTRICT row_out = get_row(cc, y);
-              JXL_RETURN_IF_ERROR(
-                  int_to_float(row_in, row_out, xsize_shifted, bits, exp_bits));
-            }
-          } else {
-            float* const JXL_RESTRICT row_out = get_row(c, y);
+        const int bits = metadata->m.bit_depth.bits_per_sample;
+        const int exp_bits = metadata->m.bit_depth.exponent_bits_per_sample;
+        if (rgb_from_gray) {
+          const auto& b0 = render_pipeline_input.GetBuffer(0);
+          const auto& b1 = render_pipeline_input.GetBuffer(1);
+          const auto& b2 = render_pipeline_input.GetBuffer(2);
+          for (size_t y = 0; y < ysize_shifted; ++y) {
+            const pixel_type* const JXL_RESTRICT row_in =
+                mr.Row(&ch_in.plane, y);
+            float* const JXL_RESTRICT out_r = b0.second.Row(b0.first, y);
+            float* const JXL_RESTRICT out_g = b1.second.Row(b1.first, y);
+            float* const JXL_RESTRICT out_b = b2.second.Row(b2.first, y);
+            JXL_RETURN_IF_ERROR(
+                int_to_float(row_in, out_r, xsize_shifted, bits, exp_bits));
+            // The other two grayscale outputs are bit-identical to out_r.
+            memcpy(out_g, out_r, xsize_shifted * sizeof(float));
+            memcpy(out_b, out_r, xsize_shifted * sizeof(float));
+          }
+        } else {
+          for (size_t y = 0; y < ysize_shifted; ++y) {
+            const pixel_type* const JXL_RESTRICT row_in =
+                mr.Row(&ch_in.plane, y);
+            float* const JXL_RESTRICT row_out = r.Row(out_buf.first, y);
             JXL_RETURN_IF_ERROR(
                 int_to_float(row_in, row_out, xsize_shifted, bits, exp_bits));
           }
-          return true;
-        };
-        JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, ysize_shifted,
-                                      ThreadPool::NoInit, process_row,
-                                      "ModularIntToFloat_losslessfloat"));
-      } else {
-        const auto process_row = [&](const uint32_t task,
-                                     size_t /* thread */) -> Status {
-          const size_t y = task;
-          const pixel_type* const JXL_RESTRICT row_in = mr.Row(&ch_in.plane, y);
-          if (rgb_from_gray) {
-            if (full_image.bitdepth < 23) {
-              HWY_DYNAMIC_DISPATCH(RgbFromSingle)
-              (xsize_shifted, row_in, factor, get_row(0, y), get_row(1, y),
-               get_row(2, y));
-            } else {
-              SingleFromSingleAccurate(xsize_shifted, row_in, factor,
-                                       get_row(0, y));
-              SingleFromSingleAccurate(xsize_shifted, row_in, factor,
-                                       get_row(1, y));
-              SingleFromSingleAccurate(xsize_shifted, row_in, factor,
-                                       get_row(2, y));
-            }
-          } else {
-            float* const JXL_RESTRICT row_out = get_row(c, y);
-            if (full_image.bitdepth < 23) {
-              HWY_DYNAMIC_DISPATCH(SingleFromSingle)
-              (xsize_shifted, row_in, factor, row_out);
-            } else {
-              SingleFromSingleAccurate(xsize_shifted, row_in, factor, row_out);
-            }
+        }
+      } else if (rgb_from_gray) {
+        const auto& b0 = render_pipeline_input.GetBuffer(0);
+        const auto& b1 = render_pipeline_input.GetBuffer(1);
+        const auto& b2 = render_pipeline_input.GetBuffer(2);
+        if (full_image.bitdepth < 23) {
+          for (size_t y = 0; y < ysize_shifted; ++y) {
+            const pixel_type* const JXL_RESTRICT row_in =
+                mr.Row(&ch_in.plane, y);
+            rgb_from_single(xsize_shifted, row_in, factor,
+                            b0.second.Row(b0.first, y),
+                            b1.second.Row(b1.first, y),
+                            b2.second.Row(b2.first, y));
           }
-          return true;
-        };
-        JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, ysize_shifted,
-                                      ThreadPool::NoInit, process_row,
-                                      "ModularIntToFloat"));
+        } else {
+          for (size_t y = 0; y < ysize_shifted; ++y) {
+            const pixel_type* const JXL_RESTRICT row_in =
+                mr.Row(&ch_in.plane, y);
+            RgbFromSingleAccurate(xsize_shifted, row_in, factor,
+                                  b0.second.Row(b0.first, y),
+                                  b1.second.Row(b1.first, y),
+                                  b2.second.Row(b2.first, y));
+          }
+        }
+      } else {
+        if (full_image.bitdepth < 23) {
+          for (size_t y = 0; y < ysize_shifted; ++y) {
+            const pixel_type* const JXL_RESTRICT row_in =
+                mr.Row(&ch_in.plane, y);
+            float* const JXL_RESTRICT row_out = r.Row(out_buf.first, y);
+            single_from_single(xsize_shifted, row_in, factor, row_out);
+          }
+        } else {
+          for (size_t y = 0; y < ysize_shifted; ++y) {
+            const pixel_type* const JXL_RESTRICT row_in =
+                mr.Row(&ch_in.plane, y);
+            float* const JXL_RESTRICT row_out = r.Row(out_buf.first, y);
+            SingleFromSingleAccurate(xsize_shifted, row_in, factor, row_out);
+          }
+        }
       }
       if (rgb_from_gray) {
         break;
@@ -779,7 +803,7 @@ Status ModularFrameDecoder::FinalizeDecoding(const FrameHeader& frame_header,
     RenderPipelineInput input =
         dec_state->render_pipeline->GetInputBuffers(group, thread_id);
     JXL_RETURN_IF_ERROR(ModularImageToDecodedRect(
-        frame_header, gi, dec_state, nullptr, input,
+        frame_header, gi, dec_state, input,
         dec_state->shared->frame_dim.GroupRect(group)));
     JXL_RETURN_IF_ERROR(input.Done());
     return true;
@@ -825,16 +849,19 @@ Status ModularFrameDecoder::DecodeQuantTable(
                required_size_x * required_size_y * 3);
   }
   int* qtable = encoding->qraw.qtable->data();
+  const size_t plane_size = required_size_x * required_size_y;
   for (size_t c = 0; c < 3; c++) {
+    int* JXL_RESTRICT dst = qtable + c * plane_size;
     for (size_t y = 0; y < required_size_y; y++) {
-      int32_t* JXL_RESTRICT row = image.channel[c].Row(y);
+      const int32_t* JXL_RESTRICT src = image.channel[c].Row(y);
       for (size_t x = 0; x < required_size_x; x++) {
-        qtable[c * required_size_x * required_size_y + y * required_size_x +
-               x] = row[x];
-        if (row[x] <= 0) {
+        const int32_t value = src[x];
+        if (value <= 0) {
           return JXL_FAILURE("Invalid raw quantization table");
         }
+        dst[x] = value;
       }
+      dst += required_size_x;
     }
   }
   return true;
