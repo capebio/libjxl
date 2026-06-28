@@ -8,6 +8,7 @@
 #include <jxl/memory_manager.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -30,7 +31,7 @@ namespace {
 enum class NextAction { CHECK_AND_GO_LEFT, GO_RIGHT, POP };
 
 struct WorkItem {
-  size_t node_index;
+  uint32_t node_index;  // tree indices fit in 32 bits (kMaxTreeSize)
   pixel_type orig_l;
   pixel_type orig_u;
   NextAction action;
@@ -41,14 +42,16 @@ Status ValidateTree(const Tree& tree) {
   // TODO(eustas): or invalid?
 
   int num_properties = 0;
-  for (auto node : tree) {
+  for (const auto& node : tree) {
     if (node.property >= num_properties) {
       num_properties = node.property + 1;
     }
   }
 
-  std::vector<std::pair<pixel_type, pixel_type>> property_ranges(
-      num_properties);
+  // Property values are bounded to [0, 255] at decode time, so a fixed array
+  // avoids the heap allocation. Only [0, num_properties) is ever touched.
+  constexpr size_t kPropertyLimit = 256;
+  std::array<std::pair<pixel_type, pixel_type>, kPropertyLimit> property_ranges;
   for (int i = 0; i < num_properties; i++) {
     property_ranges[i].first = std::numeric_limits<pixel_type>::min();
     property_ranges[i].second = std::numeric_limits<pixel_type>::max();
@@ -57,6 +60,7 @@ Status ValidateTree(const Tree& tree) {
   constexpr size_t kHeightLimit = 2048;
 
   std::vector<WorkItem> stack;
+  stack.reserve(std::min(tree.size(), kHeightLimit));
   stack.push_back({/*node_index=*/0, /*orig_l=*/0, /*orig_u=*/0,
                    NextAction::CHECK_AND_GO_LEFT});
 
