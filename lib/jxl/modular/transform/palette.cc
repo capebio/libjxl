@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <utility>
 #include <vector>
 
@@ -40,12 +41,19 @@ Status InvPalette(Image &input, uint32_t begin_c, uint32_t nb_colors,
   size_t w = input.channel[c0].w;
   size_t h = input.channel[c0].h;
   if (nb < 1) return JXL_FAILURE("Corrupted transforms");
+  // Build the nb-1 (identical, fresh) output channels and insert them in a
+  // single shift instead of shifting the channel vector once per channel.
+  std::vector<Channel> extra_channels;
+  extra_channels.reserve(static_cast<size_t>(nb - 1));
   for (int i = 1; i < nb; i++) {
     JXL_ASSIGN_OR_RETURN(Channel c, Channel::Create(memory_manager, w, h,
                                                     input.channel[c0].hshift,
                                                     input.channel[c0].vshift));
-    input.channel.insert(input.channel.begin() + c0 + 1, std::move(c));
+    extra_channels.emplace_back(std::move(c));
   }
+  input.channel.insert(input.channel.begin() + c0 + 1,
+                       std::make_move_iterator(extra_channels.begin()),
+                       std::make_move_iterator(extra_channels.end()));
   const Channel &palette = input.channel[0];
   const pixel_type *JXL_RESTRICT p_palette = input.channel[0].Row(0);
   ptrdiff_t onerow = input.channel[0].plane.PixelsPerRow();
@@ -123,8 +131,9 @@ Status InvPalette(Image &input, uint32_t begin_c, uint32_t nb_colors,
             } else {
               val = palette_entry;
             }
-            p[x] = val;
-            wp_state.UpdateErrors(p[x], x, y, channel.w);
+            const pixel_type value = static_cast<pixel_type>(val);
+            p[x] = value;
+            wp_state.UpdateErrors(value, x, y, channel.w);
           }
         }
         return true;

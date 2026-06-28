@@ -53,6 +53,11 @@ static inline pixel_type Scale(uint64_t value, uint64_t bit_depth) {
 static JXL_MAYBE_UNUSED pixel_type
 GetPaletteValue(const pixel_type *const palette, int index, const size_t c,
                 const int palette_size, const int onerow, const int bit_depth) {
+  // Explicit palette entries (0 <= index < palette_size) are by far the common
+  // case; handle them first. The unsigned compare also rejects index < 0.
+  if (static_cast<uint32_t>(index) < static_cast<uint32_t>(palette_size)) {
+    return palette[c * onerow + static_cast<size_t>(index)];
+  }
   if (index < 0) {
     static constexpr std::array<std::array<pixel_type, 3>, 72> kDeltaPalette = {
         {
