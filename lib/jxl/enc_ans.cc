@@ -656,35 +656,39 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreANSEncodingData(
   if (use_prefix_code) {
     size_t cost = 0;
     if (size <= 1) return 0;
-    std::vector<uint32_t> histo(size);
+    huff_histo_.resize(size);
     for (size_t i = 0; i < size; i++) {
       JXL_ENSURE(histogram.counts[i] >= 0);
-      histo[i] = histogram.counts[i];
+      huff_histo_[i] = histogram.counts[i];
     }
-    std::vector<uint8_t> depths(size);
-    std::vector<uint16_t> bits(size);
+    if (huff_depths_.size() < size) huff_depths_.resize(size);
+    if (huff_bits_.size() < size) huff_bits_.resize(size);
+    std::fill(huff_depths_.data(), huff_depths_.data() + size, uint8_t{0});
+    std::fill(huff_bits_.data(), huff_bits_.data() + size, uint16_t{0});
     if (writer == nullptr) {
       BitWriter tmp_writer{memory_manager};
       JXL_RETURN_IF_ERROR(tmp_writer.WithMaxBits(
           8 * size + 8,  // safe upper bound
           LayerType::Header, /*aux_out=*/nullptr, [&] {
-            return BuildAndStoreHuffmanTree(histo.data(), size, depths.data(),
-                                            bits.data(), &tmp_writer);
+            return BuildAndStoreHuffmanTree(huff_histo_.data(), size,
+                                            huff_depths_.data(),
+                                            huff_bits_.data(), &tmp_writer);
           }));
       cost = tmp_writer.BitsWritten();
     } else {
       size_t start = writer->BitsWritten();
       JXL_RETURN_IF_ERROR(BuildAndStoreHuffmanTree(
-          histo.data(), size, depths.data(), bits.data(), writer));
+          huff_histo_.data(), size, huff_depths_.data(), huff_bits_.data(),
+          writer));
       cost = writer->BitsWritten() - start;
     }
     for (size_t i = 0; i < size; i++) {
-      info[i].bits = depths[i] == 0 ? 0 : bits[i];
-      info[i].depth = depths[i];
+      info[i].bits = huff_depths_[i] == 0 ? 0 : huff_bits_[i];
+      info[i].depth = huff_depths_[i];
     }
     // Estimate data cost.
     for (size_t i = 0; i < size; i++) {
-      cost += histo[i] * info[i].depth;
+      cost += huff_histo_[i] * info[i].depth;
     }
     return cost;
   }
