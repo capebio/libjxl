@@ -107,8 +107,7 @@ void QuantizeBlockAC(const Quantizer& quantizer, const bool error_diffusion,
     for (size_t x = 0; x < xsize * kBlockDim; x += Lanes(df)) {
       auto threshold = Zero(df);
       if (xsize == 1) {
-        HWY_ALIGN static const uint32_t kMask[kBlockDim] = {
-            0, 0, 0, 0, ~0u, ~0u, ~0u, ~0u};
+        HWY_ALIGN uint32_t kMask[kBlockDim] = {0, 0, 0, 0, ~0u, ~0u, ~0u, ~0u};
         const auto mask = MaskFromVec(BitCast(df, Load(du, kMask + x)));
         threshold = IfThenElse(mask, Set(df, thresholds[yfix + 1]),
                                Set(df, thresholds[yfix]));
@@ -124,53 +123,6 @@ void QuantizeBlockAC(const Quantizer& quantizer, const bool error_diffusion,
       const auto nzero_mask = Ge(Abs(val), threshold);
       const auto v = ConvertTo(di, IfThenElseZero(nzero_mask, Round(val)));
       Store(v, di, block_out + off + x);
-    }
-  }
-}
-
-// Fused Y-channel quantize + reconstruct in one pass.
-// Replaces QuantizeBlockAC(c=1) + separate reconstruction loop.
-// Removes store→reload dependency on the Y int32 buffer.
-void QuantizeAndReconstructYBlockAC(
-    const Quantizer& quantizer, AcStrategyType quant_kind, size_t xsize,
-    size_t ysize, const float* JXL_RESTRICT biases, float* JXL_RESTRICT thres,
-    const float* JXL_RESTRICT block_in, const int32_t* quant,
-    int32_t* JXL_RESTRICT block_out, float* JXL_RESTRICT block_recon) {
-  const float* JXL_RESTRICT qm = quantizer.InvDequantMatrix(quant_kind, 1);
-  const float* JXL_RESTRICT dqm = quantizer.DequantMatrix(quant_kind, 1);
-  const float qac = quantizer.Scale() * (*quant);
-
-  HWY_CAPPED(float, kBlockDim) df;
-  HWY_CAPPED(int32_t, kBlockDim) di;
-  HWY_CAPPED(uint32_t, kBlockDim) du;
-
-  const auto quantv = Set(df, qac);  // qm_multiplier == 1.0 for Y
-  const auto inv_qac = Set(df, quantizer.inv_quant_ac(*quant));
-
-  for (size_t y = 0; y < ysize * kBlockDim; y++) {
-    const size_t yfix = static_cast<size_t>(y >= ysize * kBlockDim / 2) * 2;
-    const size_t off = y * kBlockDim * xsize;
-    for (size_t x = 0; x < xsize * kBlockDim; x += Lanes(df)) {
-      auto threshold = Zero(df);
-      if (xsize == 1) {
-        HWY_ALIGN static const uint32_t kMask[kBlockDim] = {
-            0, 0, 0, 0, ~0u, ~0u, ~0u, ~0u};
-        const auto mask = MaskFromVec(BitCast(df, Load(du, kMask + x)));
-        threshold = IfThenElse(mask, Set(df, thres[yfix + 1]),
-                               Set(df, thres[yfix]));
-      } else {
-        threshold = Set(df, thres[yfix + static_cast<size_t>(
-                                       x >= xsize * kBlockDim / 2)]);
-      }
-      const auto q = Mul(Load(df, qm + off + x), quantv);
-      const auto val = Mul(q, Load(df, block_in + off + x));
-      const auto nzero_mask = Ge(Abs(val), threshold);
-      const auto v = ConvertTo(di, IfThenElseZero(nzero_mask, Round(val)));
-      Store(v, di, block_out + off + x);
-      // Reconstruct immediately — avoids store→reload of Y int32 coefficients.
-      const auto adj = AdjustQuantBias(di, 1, v, biases);
-      Store(Mul(Mul(adj, Load(df, dqm + off + x)), inv_qac), df,
-            block_recon + off + x);
     }
   }
 }
@@ -214,9 +166,11 @@ void AdjustQuantBlockAC(const Quantizer& quantizer, size_t c,
   float hfMaxError[4] = {};
 
   for (size_t y = 0; y < ysize * kBlockDim; y++) {
-    const size_t x_begin = (y < ysize) ? xsize : 0;
-    for (size_t x = x_begin; x < xsize * kBlockDim; x++) {
+    for (size_t x = 0; x < xsize * kBlockDim; x++) {
       const size_t pos = y * kBlockDim * xsize + x;
+      if (x < xsize && y < ysize) {
+        continue;
+      }
       const size_t hfix = (static_cast<size_t>(y >= ysize * kBlockDim / 2) * 2 +
                            static_cast<size_t>(x >= xsize * kBlockDim / 2));
       const float val = block_in[pos] * (qm[pos] * qac * qm_multiplier);
@@ -356,17 +310,17 @@ void AdjustQuantBlockAC(const Quantizer& quantizer, size_t c,
       } else if (quant_kind == AcStrategyType::DCT32X32) {
         ix = 2;
       }
-      const double denom =
-          kMul1[ix][c] * xsize * ysize * kBlockDim * kBlockDim +
-          kMul2[ix][c] * sum_of_vals;
-      int step = static_cast<int>(sum_of_error / denom);
+      int step =
+          sum_of_error / (kMul1[ix][c] * xsize * ysize * kBlockDim * kBlockDim +
+                          kMul2[ix][c] * sum_of_vals);
       if (step >= 2) {
         step = 2;
       }
       if (step < 0) {
         step = 0;
       }
-      if (sum_of_error > denom) {
+      if (sum_of_error > kMul1[ix][c] * xsize * ysize * kBlockDim * kBlockDim +
+                             kMul2[ix][c] * sum_of_vals) {
         *quant += step;
         if (*quant >= Quantizer::kQuantMax) {
           *quant = Quantizer::kQuantMax - 1;
@@ -432,9 +386,21 @@ void QuantizeRoundtripYBlockAC(PassesEncoderState* enc_state, const size_t size,
     thres_y[3] = 0.62;
   }
 
-  QuantizeAndReconstructYBlockAC(quantizer, quant_kind, xsize, ysize, biases,
-                                 &thres_y[0], inout + size, quant,
-                                 quantized + size, inout + size);
+  QuantizeBlockAC(quantizer, error_diffusion, 1, 1.0f, quant_kind, xsize, ysize,
+                  &thres_y[0], inout + size, quant, quantized + size);
+
+  const float* JXL_RESTRICT dequant_matrix =
+      quantizer.DequantMatrix(quant_kind, 1);
+
+  HWY_CAPPED(float, kDCTBlockSize) df;
+  HWY_CAPPED(int32_t, kDCTBlockSize) di;
+  const auto inv_qac = Set(df, quantizer.inv_quant_ac(*quant));
+  for (size_t k = 0; k < kDCTBlockSize * xsize * ysize; k += Lanes(df)) {
+    const auto oquant = Load(di, quantized + size + k);
+    const auto adj_quant = AdjustQuantBias(di, 1, oquant, biases);
+    const auto dequantm = Load(df, dequant_matrix + k);
+    Store(Mul(Mul(adj_quant, dequantm), inv_qac), df, inout + size + k);
+  }
 }
 
 Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
@@ -493,20 +459,15 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
     HWY_ALIGN float* coeffs_in = fmem.address<float>();
     HWY_ALIGN int32_t* quantized = mem.address<int32_t>();
 
-    // Cache cmap row pointers; update only at colour-tile-row boundaries.
-    size_t cur_ty = static_cast<size_t>(-1);
-    const int8_t* JXL_RESTRICT ytox_row = nullptr;
-    const int8_t* JXL_RESTRICT ytob_row = nullptr;
-
     for (size_t by = 0; by < ysize_blocks; ++by) {
       int32_t* JXL_RESTRICT row_quant_ac =
           block_group_rect.Row(&full_quant_field, by);
-      const size_t ty = by / kColorTileDimInBlocks;
-      if (ty != cur_ty) {
-        cur_ty = ty;
-        ytox_row = cmap_rect.ConstRow(enc_state->shared.cmap.ytox_map, ty);
-        ytob_row = cmap_rect.ConstRow(enc_state->shared.cmap.ytob_map, ty);
-      }
+      size_t ty = by / kColorTileDimInBlocks;
+      const int8_t* JXL_RESTRICT row_cmap[3] = {
+          cmap_rect.ConstRow(enc_state->shared.cmap.ytox_map, ty),
+          nullptr,
+          cmap_rect.ConstRow(enc_state->shared.cmap.ytob_map, ty),
+      };
       const float* JXL_RESTRICT opsin_rows[3] = {
           group_rect.ConstPlaneRow(opsin, 0, by * kBlockDim),
           group_rect.ConstPlaneRow(opsin, 1, by * kBlockDim),
@@ -521,33 +482,16 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
           enc_state->shared.ac_strategy.ConstRow(block_group_rect, by);
       for (size_t tx = 0; tx < DivCeil(xsize_blocks, kColorTileDimInBlocks);
            tx++) {
-        // Resolve CfL mode for this colour tile (4 cases: none/X/B/both).
-        const int8_t ytox = ytox_row[tx];
-        const int8_t ytob = ytob_row[tx];
-        const uint8_t cfl_mask =
-            static_cast<uint8_t>((ytox != 0 ? 1u : 0u) | (ytob != 0 ? 2u : 0u));
-        const auto x_factor = Set(
-            d, (cfl_mask & 1)
-                   ? enc_state->shared.cmap.base().YtoXRatio(ytox)
-                   : 0.0f);
-        const auto b_factor = Set(
-            d, (cfl_mask & 2)
-                   ? enc_state->shared.cmap.base().YtoBRatio(ytob)
-                   : 0.0f);
-
-        // Strategy-aware walk: advance by covered_blocks_x() at first block,
-        // fall back to ++bx only for interior cells at tile boundaries.
-        const size_t tile_x_end =
-            std::min(xsize_blocks, (tx + 1) * kColorTileDimInBlocks);
-        for (size_t bx = tx * kColorTileDimInBlocks; bx < tile_x_end;) {
+        const auto x_factor =
+            Set(d, enc_state->shared.cmap.base().YtoXRatio(row_cmap[0][tx]));
+        const auto b_factor =
+            Set(d, enc_state->shared.cmap.base().YtoBRatio(row_cmap[2][tx]));
+        for (size_t bx = tx * kColorTileDimInBlocks;
+             bx < xsize_blocks && bx < (tx + 1) * kColorTileDimInBlocks; ++bx) {
           const AcStrategy acs = ac_strategy_row[bx];
-          if (JXL_UNLIKELY(!acs.IsFirstBlock())) {
-            ++bx;
-            continue;
-          }
+          if (!acs.IsFirstBlock()) continue;
 
-          const size_t spatial_xblocks = acs.covered_blocks_x();
-          size_t xblocks = spatial_xblocks;
+          size_t xblocks = acs.covered_blocks_x();
           size_t yblocks = acs.covered_blocks_y();
 
           CoefficientLayout(&yblocks, &xblocks);
@@ -569,31 +513,16 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
               acs.Strategy(), xblocks, yblocks, kDefaultQuantBias, &quant_ac,
               coeffs_in, quantized);
 
-          // Unapply colour correlation — skip when both factors are zero.
-          if (cfl_mask == 1) {
-            for (size_t k = 0; k < size; k += Lanes(d)) {
-              const auto in_y = Load(d, coeffs_in + size + k);
-              Store(NegMulAdd(x_factor, in_y, Load(d, coeffs_in + k)), d,
-                    coeffs_in + k);
-            }
-          } else if (cfl_mask == 2) {
-            for (size_t k = 0; k < size; k += Lanes(d)) {
-              const auto in_y = Load(d, coeffs_in + size + k);
-              Store(NegMulAdd(b_factor, in_y,
-                              Load(d, coeffs_in + 2 * size + k)),
-                    d, coeffs_in + 2 * size + k);
-            }
-          } else if (cfl_mask == 3) {
-            for (size_t k = 0; k < size; k += Lanes(d)) {
-              const auto in_y = Load(d, coeffs_in + size + k);
-              Store(NegMulAdd(x_factor, in_y, Load(d, coeffs_in + k)), d,
-                    coeffs_in + k);
-              Store(NegMulAdd(b_factor, in_y,
-                              Load(d, coeffs_in + 2 * size + k)),
-                    d, coeffs_in + 2 * size + k);
-            }
+          // Unapply color correlation
+          for (size_t k = 0; k < size; k += Lanes(d)) {
+            const auto in_x = Load(d, coeffs_in + k);
+            const auto in_y = Load(d, coeffs_in + size + k);
+            const auto in_b = Load(d, coeffs_in + 2 * size + k);
+            const auto out_x = NegMulAdd(x_factor, in_y, in_x);
+            const auto out_b = NegMulAdd(b_factor, in_y, in_b);
+            Store(out_x, d, coeffs_in + k);
+            Store(out_b, d, coeffs_in + 2 * size + k);
           }
-          // cfl_mask == 0: X and B are already correct, nothing to do.
 
           // Quantize X and B channels and set DC.
           for (size_t c : {0, 2}) {
@@ -608,22 +537,13 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
                                     dc_rows[c] + bx, dc_stride, scratch_space);
           }
           row_quant_ac[bx] = quant_ac;
-          if (num_passes == 1) {
-            for (size_t c = 0; c < 3; c++) {
-              enc_state->progressive_splitter.SplitACCoefficients(
-                  quantized + c * size, acs, bx, by, coeffs[c]);
-              coeffs[c][0] += size;
-            }
-          } else {
-            for (size_t c = 0; c < 3; c++) {
-              enc_state->progressive_splitter.SplitACCoefficients(
-                  quantized + c * size, acs, bx, by, coeffs[c]);
-              for (size_t p = 0; p < num_passes; p++) {
-                coeffs[c][p] += size;
-              }
+          for (size_t c = 0; c < 3; c++) {
+            enc_state->progressive_splitter.SplitACCoefficients(
+                quantized + c * size, acs, bx, by, coeffs[c]);
+            for (size_t p = 0; p < num_passes; p++) {
+              coeffs[c][p] += size;
             }
           }
-          bx += spatial_xblocks;
         }
       }
     }
