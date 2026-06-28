@@ -33,7 +33,9 @@ StatusOr<Channel> Channel::Create(JxlMemoryManager *memory_manager, size_t iw,
 void Image::undo_transforms(const weighted::Header &wp_header,
                             jxl::ThreadPool *pool) {
   while (!transform.empty()) {
-    Transform t = transform.back();
+    // Inverse() is const and does not touch `transform`, so bind a reference
+    // instead of copying the Transform (which owns a SqueezeParams vector).
+    const Transform &t = transform.back();
     JXL_DEBUG_V(4, "Undoing transform");
     Status result = t.Inverse(*this, wp_header, pool);
     if (result == false) {

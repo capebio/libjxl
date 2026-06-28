@@ -8,6 +8,7 @@
 #include <cinttypes>  // PRIu32
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/data_parallel.h"
@@ -116,11 +117,13 @@ Status Transform::MetaApply(Image &input) {
       JXL_DEBUG_V(2, "Transform: kSqueeze:");
 #if JXL_DEBUG_V_LEVEL >= 2
       {
-        auto squeezes_copy = squeezes;
-        if (squeezes_copy.empty()) {
-          DefaultSqueezeParameters(&squeezes_copy, input);
+        std::vector<SqueezeParams> default_squeezes;
+        const std::vector<SqueezeParams> *squeezes_copy = &squeezes;
+        if (squeezes_copy->empty()) {
+          DefaultSqueezeParameters(&default_squeezes, input);
+          squeezes_copy = &default_squeezes;
         }
-        for (const auto &params : squeezes_copy) {
+        for (const auto &params : *squeezes_copy) {
           JXL_DEBUG_V(
               2,
               "  squeeze params: horizontal=%d, in_place=%d, begin_c=%" PRIu32
