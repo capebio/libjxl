@@ -427,7 +427,8 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
     // sort on luma (multiplied by alpha if available)
     std::sort(candidate_palette_imageorder.begin(),
               candidate_palette_imageorder.end(),
-              [&](std::vector<pixel_type> ap, std::vector<pixel_type> bp) {
+              [&](const std::vector<pixel_type> &ap,
+                  const std::vector<pixel_type> &bp) {
                 float ay;
                 float by;
                 ay = (0.299f * ap[0] + 0.587f * ap[1] + 0.114f * ap[2] + 0.1f);
@@ -444,7 +445,7 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
     JXL_DEBUG_V(7, "Palette of %i colors, using image order", nb_colors);
   }
 
-  for (auto pcol : candidate_palette_imageorder) {
+  for (const auto &pcol : candidate_palette_imageorder) {
     JXL_DEBUG_V(9, "  Color %i :  ", clr);
     for (size_t i = 0; i < nb; i++) {
       p_palette[nb_deltas + i * onerow + clr] = pcol[i];
@@ -454,10 +455,18 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
     clr++;
   }
   std::vector<weighted::State> wp_states;
+  wp_states.reserve(nb);
   for (size_t c = 0; c < nb; c++) {
     wp_states.emplace_back(wp_header, w, h);
   }
   std::vector<pixel_type *> p_quant(nb);
+  // Lossy per-pixel scratch, reused across the whole image. Each buffer is
+  // fully overwritten before it is read (best_val/ideal_residual via the
+  // guaranteed first TryIndex swap, quantized_val/predictions per candidate).
+  std::vector<pixel_type> best_val(nb);
+  std::vector<pixel_type> ideal_residual(nb);
+  std::vector<pixel_type> quantized_val(nb);
+  std::vector<pixel_type> predictions(nb);
   // Three rows of error for dithering: y to y + 2.
   // Each row has two pixels of padding in the ends, which is
   // beneficial for both precision and encoding speed.
@@ -485,10 +494,6 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
         int best_index = 0;
         bool best_is_delta = false;
         float best_distance = std::numeric_limits<float>::infinity();
-        std::vector<pixel_type> best_val(nb, 0);
-        std::vector<pixel_type> ideal_residual(nb, 0);
-        std::vector<pixel_type> quantized_val(nb);
-        std::vector<pixel_type> predictions(nb);
         for (double diffusion_multiplier : {0.55, 0.75}) {
           for (size_t c = 0; c < nb; c++) {
             color_with_error[c] =

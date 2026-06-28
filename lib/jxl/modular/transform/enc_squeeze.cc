@@ -24,7 +24,7 @@ namespace jxl {
 
 #define AVERAGE(X, Y) (((X) + (Y) + (((X) > (Y)) ? 1 : 0)) >> 1)
 
-Status FwdHSqueeze(Image &input, int c, int rc) {
+Status FwdHSqueeze(Image &input, int c, int rc, ThreadPool *pool) {
   const Channel &chin = input.channel[c];
   JxlMemoryManager *memory_manager = input.memory_manager();
 
@@ -40,7 +40,11 @@ Status FwdHSqueeze(Image &input, int c, int rc) {
   chout.component = chin.component;
   chout_residual.component = chin.component;
 
-  for (size_t y = 0; y < chout.h; y++) {
+  // Each output row reads only the (const) source channel and writes disjoint
+  // destination rows, so rows are independent and can run in parallel.
+  const auto process_row = [&](const uint32_t task, size_t /* thread */)
+      -> Status {
+    const size_t y = task;
     const pixel_type *JXL_RESTRICT p_in = chin.Row(y);
     pixel_type *JXL_RESTRICT p_out = chout.Row(y);
     pixel_type *JXL_RESTRICT p_res = chout_residual.Row(y);
@@ -69,13 +73,16 @@ Status FwdHSqueeze(Image &input, int c, int rc) {
       int x = chout.w - 1;
       p_out[x] = p_in[x * 2];
     }
-  }
+    return true;
+  };
+  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, chout.h, ThreadPool::NoInit,
+                                process_row, "FwdHSqueeze"));
   input.channel[c] = std::move(chout);
   input.channel.insert(input.channel.begin() + rc, std::move(chout_residual));
   return true;
 }
 
-Status FwdVSqueeze(Image &input, int c, int rc) {
+Status FwdVSqueeze(Image &input, int c, int rc, ThreadPool *pool) {
   const Channel &chin = input.channel[c];
   JxlMemoryManager *memory_manager = input.memory_manager();
 
@@ -92,7 +99,10 @@ Status FwdVSqueeze(Image &input, int c, int rc) {
   chout_residual.component = chin.component;
 
   ptrdiff_t onerow_in = chin.plane.PixelsPerRow();
-  for (size_t y = 0; y < chout_residual.h; y++) {
+  // Output row pairs are independent (see FwdHSqueeze note).
+  const auto process_row = [&](const uint32_t task, size_t /* thread */)
+      -> Status {
+    const size_t y = task;
     const pixel_type *JXL_RESTRICT p_in = chin.Row(y * 2);
     pixel_type *JXL_RESTRICT p_out = chout.Row(y);
     pixel_type *JXL_RESTRICT p_res = chout_residual.Row(y);
@@ -118,7 +128,10 @@ Status FwdVSqueeze(Image &input, int c, int rc) {
 
       p_res[x] = diff - tendency;
     }
-  }
+    return true;
+  };
+  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, chout_residual.h, ThreadPool::NoInit,
+                                process_row, "FwdVSqueeze"));
   if (chin.h & 1) {
     size_t y = chout.h - 1;
     const pixel_type *p_in = chin.Row(y * 2);
@@ -154,9 +167,9 @@ Status FwdSqueeze(Image &input, std::vector<SqueezeParams> parameters,
     }
     for (uint32_t c = beginc; c <= endc; c++) {
       if (horizontal) {
-        JXL_RETURN_IF_ERROR(FwdHSqueeze(input, c, offset + c - beginc));
+        JXL_RETURN_IF_ERROR(FwdHSqueeze(input, c, offset + c - beginc, pool));
       } else {
-        JXL_RETURN_IF_ERROR(FwdVSqueeze(input, c, offset + c - beginc));
+        JXL_RETURN_IF_ERROR(FwdVSqueeze(input, c, offset + c - beginc, pool));
       }
     }
   }
