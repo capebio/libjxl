@@ -241,7 +241,7 @@ Status StoreHuffmanTree(const uint8_t* depths, size_t num, BitWriter* writer,
   if (packed_scratch != nullptr) {
     packed = packed_scratch;
   } else {
-    packed_owned = jxl::make_uninitialized_vector<uint8_t>(num);
+    packed_owned.resize(num);
     packed = packed_owned.data();
   }
   size_t huffman_tree_size = 0;
