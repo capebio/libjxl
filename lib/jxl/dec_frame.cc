@@ -318,7 +318,6 @@ Status FrameDecoder::ProcessDCGlobal(BitReader* br) {
 Status FrameDecoder::ProcessDCGroup(size_t dc_group_id, BitReader* br) {
   const size_t gx = dc_group_id % frame_dim_.xsize_dc_groups;
   const size_t gy = dc_group_id / frame_dim_.xsize_dc_groups;
-  const LoopFilter& lf = frame_header_.loop_filter;
   if (frame_header_.encoding == FrameEncoding::kVarDCT &&
       !(frame_header_.flags & FrameHeader::kUseDcFrame)) {
     JXL_RETURN_IF_ERROR(modular_frame_decoder_.DecodeVarDCTDC(
@@ -334,9 +333,12 @@ Status FrameDecoder::ProcessDCGroup(size_t dc_group_id, BitReader* br) {
   if (frame_header_.encoding == FrameEncoding::kVarDCT) {
     JXL_RETURN_IF_ERROR(modular_frame_decoder_.DecodeAcMetadata(
         frame_header_, dc_group_id, br, dec_state_));
-  } else if (lf.epf_iters > 0) {
-    FillImage(kInvSigmaNum / lf.epf_sigma_for_modular, &dec_state_->sigma);
   }
+  // Note: for the modular + EPF case the flat sigma fill is hoisted to the
+  // once-only DC-finalize path in ProcessSections. Doing it here ran on every
+  // parallel DC group and rewrote the whole-frame sigma N times (and is a
+  // concurrent write to shared state); the value is uniform and consumed only
+  // after DC finalization, so filling it once is equivalent.
   decoded_dc_groups_[dc_group_id] = JXL_TRUE;
   return true;
 }
@@ -685,6 +687,13 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
         pipeline_options));
     JXL_RETURN_IF_ERROR(FinalizeDC());
     JXL_RETURN_IF_ERROR(AllocateOutput());
+    // Modular frames fill sigma with a single uniform value (VarDCT computes it
+    // per block via ComputeSigma). Done once here, after all DC groups, instead
+    // of redundantly in every parallel ProcessDCGroup.
+    const LoopFilter& lf = frame_header_.loop_filter;
+    if (frame_header_.encoding != FrameEncoding::kVarDCT && lf.epf_iters > 0) {
+      FillImage(kInvSigmaNum / lf.epf_sigma_for_modular, &dec_state_->sigma);
+    }
     if (progressive_detail_ >= JxlProgressiveDetail::kDC) {
       MarkSections(sections, num, section_status);
       return true;
