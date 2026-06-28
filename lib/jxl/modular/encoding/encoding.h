@@ -6,6 +6,7 @@
 #ifndef LIB_JXL_MODULAR_ENCODING_ENCODING_H_
 #define LIB_JXL_MODULAR_ENCODING_ENCODING_H_
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -76,6 +77,7 @@ bool TreeToLookupTable(const FlatTree &tree,
     size_t pos;
   };
   std::vector<TreeRange> ranges;
+  ranges.reserve(tree.size());
   ranges.push_back(TreeRange{-kPropRangeFast - 1, kPropRangeFast - 1, 0});
   while (!ranges.empty()) {
     TreeRange cur = ranges.back();
@@ -102,13 +104,23 @@ bool TreeToLookupTable(const FlatTree &tree,
       if (!HAS_OFFSETS && node.predictor_offset != 0) {
         return false;
       }
-      for (int i = cur.begin + 1; i < cur.end + 1; i++) {
-        lut.context_lookup[i + kPropRangeFast] = node.childID;
+      // Same writes as the per-element loop [cur.begin+1, cur.end], but as
+      // contiguous fills. Guard preserves the loop's "no iterations when the
+      // range is empty/inverted" behavior (splitvals are untrusted).
+      const int fill_lo = cur.begin + 1;
+      const int fill_hi = cur.end + 1;  // exclusive
+      if (fill_hi > fill_lo) {
+        const size_t fill_begin = static_cast<size_t>(fill_lo + kPropRangeFast);
+        const size_t fill_count = static_cast<size_t>(fill_hi - fill_lo);
+        std::fill_n(lut.context_lookup.data() + fill_begin, fill_count,
+                    static_cast<T>(node.childID));
         if (HAS_MULTIPLIERS) {
-          lut.multipliers[i + kPropRangeFast] = node.multiplier;
+          std::fill_n(lut.multipliers.data() + fill_begin, fill_count,
+                      static_cast<int8_t>(node.multiplier));
         }
         if (HAS_OFFSETS) {
-          lut.offsets[i + kPropRangeFast] = node.predictor_offset;
+          std::fill_n(lut.offsets.data() + fill_begin, fill_count,
+                      static_cast<int8_t>(node.predictor_offset));
         }
       }
       continue;

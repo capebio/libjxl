@@ -12,7 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <queue>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -58,17 +58,19 @@ FlatTree FilterTree(const Tree &global_tree,
     }
   };
   FlatTree output;
-  std::queue<size_t> nodes;
-  nodes.push(0);
+  // BFS worklist: a vector with a monotonic read index, which avoids the
+  // per-node deque-block allocation of std::queue while keeping FIFO order.
+  std::vector<size_t> nodes;
+  size_t nodes_head = 0;
+  nodes.push_back(0);
   // Produces a trimmed and flattened tree by doing a BFS visit of the original
   // tree, ignoring branches that are known to be false and proceeding two
   // levels at a time to collapse nodes in a flatter tree; if an inner parent
   // node has a leaf as a child, the leaf is duplicated and an implicit fake
   // node is added. This allows to reduce the number of branches when traversing
   // the resulting flat tree.
-  while (!nodes.empty()) {
-    size_t cur = nodes.front();
-    nodes.pop();
+  while (nodes_head < nodes.size()) {
+    size_t cur = nodes[nodes_head++];
     // Skip nodes that we can decide now, by jumping directly to their children.
     while (global_tree[cur].property < kNumStaticProperties &&
            global_tree[cur].property != -1) {
@@ -91,7 +93,7 @@ FlatTree FilterTree(const Tree &global_tree,
       output.push_back(flat);
       continue;
     }
-    flat.childID = output.size() + nodes.size() + 1;
+    flat.childID = output.size() + (nodes.size() - nodes_head) + 1;
 
     flat.property0 = global_tree[cur].property;
     *num_props = std::max<size_t>(flat.property0 + 1, *num_props);
@@ -115,13 +117,13 @@ FlatTree FilterTree(const Tree &global_tree,
       if (global_tree[cur_child].property == -1) {
         flat.properties[i] = 0;
         flat.splitvals[i] = 0;
-        nodes.push(cur_child);
-        nodes.push(cur_child);
+        nodes.push_back(cur_child);
+        nodes.push_back(cur_child);
       } else {
         flat.properties[i] = global_tree[cur_child].property;
         flat.splitvals[i] = global_tree[cur_child].splitval;
-        nodes.push(global_tree[cur_child].lchild);
-        nodes.push(global_tree[cur_child].rchild);
+        nodes.push_back(global_tree[cur_child].lchild);
+        nodes.push_back(global_tree[cur_child].rchild);
         *num_props = std::max<size_t>(flat.properties[i] + 1, *num_props);
       }
     }
@@ -146,14 +148,13 @@ FlatTree FilterTree(const Tree &global_tree,
 
 namespace detail {
 template <bool uses_lz77>
-Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
-                                 const std::vector<uint8_t> &context_map,
-                                 const Tree &global_tree,
-                                 const weighted::Header &wp_header,
-                                 pixel_type chan, size_t group_id,
-                                 TreeLut<uint8_t, false, false> &tree_lut,
-                                 Image *image, uint32_t &fl_run,
-                                 uint32_t &fl_v) {
+Status DecodeModularChannelMAANS(
+    BitReader *br, ANSSymbolReader *reader,
+    const std::vector<uint8_t> &context_map, const Tree &global_tree,
+    const weighted::Header &wp_header, pixel_type chan, size_t group_id,
+    bool global_tree_is_all_gradient_noop,
+    std::unique_ptr<TreeLut<uint8_t, false, false>> &tree_lut, Image *image,
+    uint32_t &fl_run, uint32_t &fl_v) {
   JxlMemoryManager *memory_manager = image->memory_manager();
   Channel &channel = image->channel[chan];
 
@@ -191,23 +192,8 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
     return val * multiplier + offset;
   };
 
-  // True iff every decision node in global_tree splits on a static property
-  // (channel or group_id) and every leaf has Gradient predictor with identity
-  // transform. When this holds, all channels collapse to a single-leaf
-  // Gradient+noop tree regardless of channel index, so the shared fl_run/fl_v
-  // RLE state remains consistent across channel calls.
-  const bool global_tree_is_all_gradient_noop = [&] {
-    for (const auto& n : global_tree) {
-      if (n.property == -1) {
-        if (n.predictor != Predictor::Gradient || n.predictor_offset != 0 ||
-            n.multiplier != 1)
-          return false;
-      } else if (n.property >= kNumStaticProperties) {
-        return false;
-      }
-    }
-    return true;
-  }();
+  // global_tree_is_all_gradient_noop is computed once by the caller (it does
+  // not depend on the channel) and threaded in.
 
   if (tree.size() == 1) {
     // special optimized case: no meta-adaptation, so no need
@@ -289,14 +275,49 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
     } else if (predictor == Predictor::Gradient && offset == 0 &&
                multiplier == 1) {
       JXL_DEBUG_V(8, "Gradient very fast track.");
-      const ptrdiff_t onerow = channel.plane.PixelsPerRow();
-      for (size_t y = 0; y < channel.h; y++) {
-        pixel_type *JXL_RESTRICT r = channel.Row(y);
+      // Single-symbol histogram: the whole channel is one Gradient residual.
+      uint32_t single;
+      if (reader->IsSingleValueAndAdvance(ctx_id, &single,
+                                          channel.w * channel.h)) {
+        const pixel_type_w sv = static_cast<pixel_type_w>(UnpackSigned(single));
+        if (sv == 0) {
+          // Gradient of an all-zero channel is zero everywhere.
+          ZeroFillImage(&channel.plane);
+          return true;
+        }
+        const ptrdiff_t onerow = channel.plane.PixelsPerRow();
+        for (size_t y = 0; y < channel.h; y++) {
+          pixel_type *JXL_RESTRICT r = channel.Row(y);
+          for (size_t x = 0; x < channel.w; x++) {
+            pixel_type left = (x ? r[x - 1] : y ? *(r + x - onerow) : 0);
+            pixel_type top = (y ? *(r + x - onerow) : left);
+            pixel_type topleft = (x && y ? *(r + x - 1 - onerow) : left);
+            pixel_type guess = ClampedGradient(top, left, topleft);
+            r[x] = static_cast<pixel_type>(static_cast<pixel_type_w>(guess) + sv);
+          }
+        }
+        return true;
+      }
+      // First row reduces to a prefix sum (Gradient predicts the left sample);
+      // later rows only special-case x == 0, leaving a branch-free interior.
+      {
+        pixel_type *JXL_RESTRICT r = channel.Row(0);
+        pixel_type previous = 0;
         for (size_t x = 0; x < channel.w; x++) {
-          pixel_type left = (x ? r[x - 1] : y ? *(r + x - onerow) : 0);
-          pixel_type top = (y ? *(r + x - onerow) : left);
-          pixel_type topleft = (x && y ? *(r + x - 1 - onerow) : left);
-          pixel_type guess = ClampedGradient(top, left, topleft);
+          uint64_t v = reader->ReadHybridUintClusteredMaybeInlined<uses_lz77>(
+              ctx_id, br);
+          previous = make_pixel(v, 1, previous);
+          r[x] = previous;
+        }
+      }
+      for (size_t y = 1; y < channel.h; y++) {
+        pixel_type *JXL_RESTRICT r = channel.Row(y);
+        const pixel_type *JXL_RESTRICT top = channel.Row(y - 1);
+        uint64_t v0 =
+            reader->ReadHybridUintClusteredMaybeInlined<uses_lz77>(ctx_id, br);
+        r[0] = make_pixel(v0, 1, top[0]);
+        for (size_t x = 1; x < channel.w; x++) {
+          pixel_type guess = ClampedGradient(top[x], r[x - 1], top[x - 1]);
           uint64_t v = reader->ReadHybridUintClusteredMaybeInlined<uses_lz77>(
               ctx_id, br);
           r[x] = make_pixel(v, 1, guess);
@@ -308,11 +329,16 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
 
   // Check if this tree is a WP-only tree with a small enough property value
   // range.
+  // The 16 KiB lookup table is only needed by the WP-only / Gradient-only
+  // tracks, so allocate it lazily instead of once per modular group.
+  if ((is_wp_only || is_gradient_only) && tree_lut == nullptr) {
+    tree_lut = jxl::make_unique<TreeLut<uint8_t, false, false>>();
+  }
   if (is_wp_only) {
-    is_wp_only = TreeToLookupTable(tree, tree_lut);
+    is_wp_only = TreeToLookupTable(tree, *tree_lut);
   }
   if (is_gradient_only) {
-    is_gradient_only = TreeToLookupTable(tree, tree_lut);
+    is_gradient_only = TreeToLookupTable(tree, *tree_lut);
   }
 
   if (is_gradient_only) {
@@ -330,7 +356,7 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
             std::min<pixel_type_w>(
                 std::max<pixel_type_w>(-kPropRangeFast, top + left - topleft),
                 kPropRangeFast - 1);
-        uint32_t ctx_id = tree_lut.context_lookup[pos];
+        uint32_t ctx_id = tree_lut->context_lookup[pos];
         uint64_t v =
             reader->ReadHybridUintClusteredMaybeInlined<uses_lz77>(ctx_id, br);
         r[x] = make_pixel(v, 1, guess);
@@ -361,7 +387,7 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
         uint32_t pos =
             kPropRangeFast +
             jxl::Clamp1(properties[0], -kPropRangeFast, kPropRangeFast - 1);
-        uint32_t ctx_id = tree_lut.context_lookup[pos];
+        uint32_t ctx_id = tree_lut->context_lookup[pos];
         uint64_t v =
             reader->ReadHybridUintClusteredInlined<uses_lz77>(ctx_id, br);
         r[x] = make_pixel(v, 1, guess);
@@ -375,7 +401,7 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
         uint32_t pos =
             kPropRangeFast +
             jxl::Clamp1(properties[0], -kPropRangeFast, kPropRangeFast - 1);
-        uint32_t ctx_id = tree_lut.context_lookup[pos];
+        uint32_t ctx_id = tree_lut->context_lookup[pos];
         uint64_t v =
             reader->ReadHybridUintClusteredInlined<uses_lz77>(ctx_id, br);
         r[x] = make_pixel(v, 1, guess);
@@ -389,7 +415,7 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
         uint32_t pos =
             kPropRangeFast +
             jxl::Clamp1(properties[0], -kPropRangeFast, kPropRangeFast - 1);
-        uint32_t ctx_id = tree_lut.context_lookup[pos];
+        uint32_t ctx_id = tree_lut->context_lookup[pos];
         uint64_t v =
             reader->ReadHybridUintClusteredInlined<uses_lz77>(ctx_id, br);
         r[x] = make_pixel(v, 1, guess);
@@ -407,9 +433,14 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
         Channel references,
         Channel::Create(memory_manager,
                         properties.size() - kNumNonrefProperties, channel.w));
+    // When there are no reference channels, PrecomputeReferences only zero-
+    // fills an empty plane, so it can be skipped entirely.
+    const bool has_references = references.w != 0;
     for (size_t y = 0; y < channel.h; y++) {
       pixel_type *JXL_RESTRICT p = channel.Row(y);
-      PrecomputeReferences(channel, y, *image, chan, &references);
+      if (has_references) {
+        PrecomputeReferences(channel, y, *image, chan, &references);
+      }
       InitPropsRow(&properties, static_props, y);
       if (y > 1 && channel.w > 8 && references.w == 0) {
         for (size_t x = 0; x < 2; x++) {
@@ -457,10 +488,14 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
         Channel::Create(memory_manager,
                         properties.size() - kNumNonrefProperties, channel.w));
     weighted::State wp_state(wp_header, channel.w, channel.h);
+    // See note above: skip the no-op call when there are no reference channels.
+    const bool has_references = references.w != 0;
     for (size_t y = 0; y < channel.h; y++) {
       pixel_type *JXL_RESTRICT p = channel.Row(y);
       InitPropsRow(&properties, static_props, y);
-      PrecomputeReferences(channel, y, *image, chan, &references);
+      if (has_references) {
+        PrecomputeReferences(channel, y, *image, chan, &references);
+      }
       if (!uses_lz77 && y > 1 && channel.w > 8 && references.w == 0) {
         for (size_t x = 0; x < 2; x++) {
           PredictionResult res =
@@ -506,22 +541,21 @@ Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
 }
 }  // namespace detail
 
-Status DecodeModularChannelMAANS(BitReader *br, ANSSymbolReader *reader,
-                                 const std::vector<uint8_t> &context_map,
-                                 const Tree &global_tree,
-                                 const weighted::Header &wp_header,
-                                 pixel_type chan, size_t group_id,
-                                 TreeLut<uint8_t, false, false> &tree_lut,
-                                 Image *image, uint32_t &fl_run,
-                                 uint32_t &fl_v) {
+Status DecodeModularChannelMAANS(
+    BitReader *br, ANSSymbolReader *reader,
+    const std::vector<uint8_t> &context_map, const Tree &global_tree,
+    const weighted::Header &wp_header, pixel_type chan, size_t group_id,
+    bool global_tree_is_all_gradient_noop,
+    std::unique_ptr<TreeLut<uint8_t, false, false>> &tree_lut, Image *image,
+    uint32_t &fl_run, uint32_t &fl_v) {
   if (reader->UsesLZ77()) {
     return detail::DecodeModularChannelMAANS</*uses_lz77=*/true>(
         br, reader, context_map, global_tree, wp_header, chan, group_id,
-        tree_lut, image, fl_run, fl_v);
+        global_tree_is_all_gradient_noop, tree_lut, image, fl_run, fl_v);
   } else {
     return detail::DecodeModularChannelMAANS</*uses_lz77=*/false>(
         br, reader, context_map, global_tree, wp_header, chan, group_id,
-        tree_lut, image, fl_run, fl_v);
+        global_tree_is_all_gradient_noop, tree_lut, image, fl_run, fl_v);
   }
 }
 
@@ -650,7 +684,24 @@ Status ModularDecode(BitReader *br, Image &image, GroupHeader &header,
   // Read channels
   JXL_ASSIGN_OR_RETURN(ANSSymbolReader reader,
                        ANSSymbolReader::Create(code, br, distance_multiplier));
-  auto tree_lut = jxl::make_unique<TreeLut<uint8_t, false, false>>();
+  // True iff every decision node in the tree splits on a static property
+  // (channel or group_id) and every leaf has Gradient predictor with identity
+  // transform. This is independent of the channel, so compute it once instead
+  // of once per channel inside DecodeModularChannelMAANS.
+  const bool global_tree_is_all_gradient_noop = [&] {
+    for (const auto &n : *tree) {
+      if (n.property == -1) {
+        if (n.predictor != Predictor::Gradient || n.predictor_offset != 0 ||
+            n.multiplier != 1)
+          return false;
+      } else if (n.property >= kNumStaticProperties) {
+        return false;
+      }
+    }
+    return true;
+  }();
+  // Allocated lazily by DecodeModularChannelMAANS only if a LUT track is hit.
+  std::unique_ptr<TreeLut<uint8_t, false, false>> tree_lut;
   uint32_t fl_run = 0;
   uint32_t fl_v = 0;
   for (; next_channel < nb_channels; next_channel++) {
@@ -665,7 +716,8 @@ Status ModularDecode(BitReader *br, Image &image, GroupHeader &header,
     }
     JXL_RETURN_IF_ERROR(DecodeModularChannelMAANS(
         br, &reader, *context_map, *tree, header.wp_header, next_channel,
-        group_id, *tree_lut, &image, fl_run, fl_v));
+        group_id, global_tree_is_all_gradient_noop, tree_lut, &image, fl_run,
+        fl_v));
 
     // Truncated group.
     if (!br->AllReadsWithinBounds()) {
@@ -689,10 +741,13 @@ Status ModularGenericDecompress(BitReader *br, Image &image,
                                 const Tree *tree, const ANSCode *code,
                                 const std::vector<uint8_t> *ctx_map,
                                 bool allow_truncated_group) {
+  // req_sizes is only consulted when transforms are undone below.
   std::vector<std::pair<size_t, size_t>> req_sizes;
-  req_sizes.reserve(image.channel.size());
-  for (const auto &c : image.channel) {
-    req_sizes.emplace_back(c.w, c.h);
+  if (undo_transforms) {
+    req_sizes.reserve(image.channel.size());
+    for (const auto &c : image.channel) {
+      req_sizes.emplace_back(c.w, c.h);
+    }
   }
   GroupHeader local_header;
   if (header == nullptr) header = &local_header;
