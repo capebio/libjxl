@@ -53,10 +53,19 @@ Status ComputeSigma(const LoopFilter& lf, const Rect& block_rect,
     const int32_t* const JXL_RESTRICT row_quant =
         block_rect.ConstRow(state->shared->raw_quant_field, by);
 
-    for (size_t bx = 0; bx < block_rect.xsize(); bx++) {
+    // Advance bx by the covered transform width: cells inside a multiblock
+    // transform are never first blocks and write no sigma here, so visiting
+    // them one-by-one only re-decodes the strategy and re-tests IsFirstBlock.
+    // block_rect is always group-aligned (transforms never cross an AC-group
+    // boundary), so every cell we land on is a transform's left column and
+    // stepping by covered_blocks_x() is exact. Byte-identical output.
+    for (size_t bx = 0; bx < block_rect.xsize();) {
       AcStrategy acs = acs_row[bx];
       size_t llf_x = acs.covered_blocks_x();
-      if (!acs.IsFirstBlock()) continue;
+      if (!acs.IsFirstBlock()) {
+        bx += llf_x;
+        continue;
+      }
       // quant_scale is smaller for low quality.
       // quant_scale is roughly 0.08 / butteraugli score.
       //
@@ -127,6 +136,7 @@ Status ComputeSigma(const LoopFilter& lf, const Rect& block_rect,
               num * sizeof(*sigma_row));
         }
       }
+      bx += llf_x;
     }
   }
   return true;
