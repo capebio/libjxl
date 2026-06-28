@@ -84,8 +84,11 @@ struct ImageOutput {
 // Temp images required for decoding a single group. Reduces memory allocations
 // for large images because we only initialize min(#threads, #groups) instances.
 struct HWY_ALIGN_MAX GroupDecCache {
+  // max_block_area: precomputed from the frame's used_acs bitmap (see
+  // PassesDecoderState::max_ac_block_area). Passing it directly avoids
+  // re-scanning all 27 strategies on every group call.
   Status InitOnce(JxlMemoryManager* memory_manager, size_t num_passes,
-                  size_t used_acs);
+                  size_t max_block_area);
 
   Status InitDCBufferOnce(JxlMemoryManager* memory_manager) {
     if (dc_buffer.xsize() == 0) {
@@ -179,6 +182,11 @@ struct PassesDecoderState {
 
   // Keep track of the transform types used.
   std::atomic<uint32_t> used_acs{0};
+
+  // Maximum block area (in coefficients) required by any strategy in used_acs.
+  // Computed once in InitForAC; passed to GroupDecCache::InitOnce so each
+  // group skips the 27-strategy scan.
+  size_t max_ac_block_area = 0;
 
   // Storage for coefficients if in "accumulate" mode.
   std::unique_ptr<ACImage> coefficients = make_unique<ACImageT<int32_t>>();

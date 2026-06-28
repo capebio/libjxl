@@ -502,7 +502,8 @@ Status FrameDecoder::ProcessACGroup(size_t ac_group_id, PassesReaders& br,
 
   if (frame_header_.encoding == FrameEncoding::kVarDCT) {
     JXL_RETURN_IF_ERROR(dec_state_->group_dec_caches[thread].InitOnce(
-        memory_manager, frame_header_.passes.num_passes, dec_state_->used_acs));
+        memory_manager, frame_header_.passes.num_passes,
+        dec_state_->max_ac_block_area));
     JXL_RETURN_IF_ERROR(DecodeGroup(
         frame_header_, br.data(), num_passes, ac_group_id, dec_state_,
         &dec_state_->group_dec_caches[thread], thread, render_pipeline_input,

@@ -1171,10 +1171,13 @@ Status DecodeGroupForRoundtrip(const FrameHeader& frame_header,
   JXL_ASSIGN_OR_RETURN(
       GetBlockFromEncoder get_block,
       GetBlockFromEncoder::Create(ac, group_idx, frame_header.passes.shift));
+  // Encoder-recon path may use any strategy; pass the known maximum area
+  // directly (AcStrategy::kMaxCoeffArea = DCT256 = 65536 coefficients) to
+  // avoid a full 27-strategy scan inside InitOnce.
   JXL_RETURN_IF_ERROR(group_dec_cache->InitOnce(
       memory_manager,
       /*num_passes=*/0,
-      /*used_acs=*/(1u << AcStrategy::kNumValidStrategies) - 1));
+      /*max_block_area=*/AcStrategy::kMaxCoeffArea));
 
   const JpegGroupParams* jpeg_params_ptr = nullptr;
   JpegGroupParams jpeg_params;

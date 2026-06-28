@@ -49,27 +49,17 @@
 namespace jxl {
 
 Status GroupDecCache::InitOnce(JxlMemoryManager* memory_manager,
-                               size_t num_passes, size_t used_acs) {
+                               size_t num_passes, size_t max_block_area) {
   for (size_t i = 0; i < num_passes; i++) {
     if (num_nzeroes[i].xsize() == 0) {
       // Allocate enough for a whole group - partial groups on the
       // right/bottom border just use a subset. The valid size is passed via
       // Rect.
-
       JXL_ASSIGN_OR_RETURN(
           num_nzeroes[i],
           Image3<uint8_t>::Create(memory_manager, kGroupDimInBlocks,
                                   kGroupDimInBlocks));
     }
-  }
-  size_t max_block_area = 0;
-
-  for (uint8_t o = 0; o < AcStrategy::kNumValidStrategies; ++o) {
-    AcStrategy acs = AcStrategy::FromRawStrategy(o);
-    if ((used_acs & (1 << o)) == 0) continue;
-    size_t area =
-        acs.covered_blocks_x() * acs.covered_blocks_y() * kDCTBlockSize;
-    max_block_area = std::max(area, max_block_area);
   }
 
   if (max_block_area > max_block_area_) {
@@ -86,30 +76,36 @@ Status GroupDecCache::InitOnce(JxlMemoryManager* memory_manager,
                               max_block_area * 7 * sizeof(float)));
     float_memory_ = std::move(new_memory);
     max_block_area_ = max_block_area;
-  }
 
-  dec_group_block = float_memory_.address<float>();
-  scratch_space = dec_group_block + max_block_area_ * 3;
-  // Intentionally alias the scratch region (lifetimes are disjoint, see header).
-  // Byte offset 3*max_block_area*sizeof(float) == 3*max_block_area*sizeof(int32)
-  // == 6*max_block_area*sizeof(int16), so all three start at scratch_space.
-  dec_group_qblock = float_memory_.address<int32_t>() + max_block_area_ * 3;
-  dec_group_qblock16 = float_memory_.address<int16_t>() + max_block_area_ * 6;
+    // Pointers only change when the arena grows; skip reassignment otherwise.
+    // Intentionally alias the scratch region (lifetimes are disjoint, see header).
+    // Byte offset 3*max_block_area*sizeof(float) == 3*max_block_area*sizeof(int32)
+    // == 6*max_block_area*sizeof(int16), so all three start at scratch_space.
+    dec_group_block = float_memory_.address<float>();
+    scratch_space = dec_group_block + max_block_area_ * 3;
+    dec_group_qblock = float_memory_.address<int32_t>() + max_block_area_ * 3;
+    dec_group_qblock16 = float_memory_.address<int16_t>() + max_block_area_ * 6;
+  }
   return true;
 }
 
 // Initialize the decoder state after all of DC is decoded.
 Status PassesDecoderState::InitForAC(size_t num_passes, ThreadPool* pool) {
   shared_storage.coeff_order_size = 0;
-  // Snapshot the atomic once instead of re-loading it on every strategy
-  // iteration (cold path; purely a cleanup, the value is stable here).
+  max_ac_block_area = 0;
+  // Snapshot the atomic once: value is stable here (DC is fully decoded, no
+  // groups are running yet) and we need it for two scans below.
   const uint32_t used_acs_snapshot = used_acs.load(std::memory_order_acquire);
   for (uint8_t o = 0; o < AcStrategy::kNumValidStrategies; ++o) {
     if (((1u << o) & used_acs_snapshot) == 0) continue;
+    AcStrategy acs = AcStrategy::FromRawStrategy(o);
     uint8_t ord = kStrategyOrder[o];
     shared_storage.coeff_order_size =
         std::max(kCoeffOrderOffset[3 * (ord + 1)] * kDCTBlockSize,
                  shared_storage.coeff_order_size);
+    max_ac_block_area = std::max(
+        acs.covered_blocks_x() * acs.covered_blocks_y() * kDCTBlockSize,
+        max_ac_block_area);
   }
   size_t sz = num_passes * shared_storage.coeff_order_size;
   if (sz > shared_storage.coeff_orders.size()) {
