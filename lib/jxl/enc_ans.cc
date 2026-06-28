@@ -663,8 +663,10 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreANSEncodingData(
     }
     if (huff_depths_.size() < size) huff_depths_.resize(size);
     if (huff_bits_.size() < size) huff_bits_.resize(size);
+    if (huff_packed_.size() < size) huff_packed_.resize(size);
     std::fill(huff_depths_.data(), huff_depths_.data() + size, uint8_t{0});
     std::fill(huff_bits_.data(), huff_bits_.data() + size, uint16_t{0});
+    uint8_t* const packed_scratch = huff_packed_.data();
     if (writer == nullptr) {
       BitWriter tmp_writer{memory_manager};
       JXL_RETURN_IF_ERROR(tmp_writer.WithMaxBits(
@@ -672,14 +674,15 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreANSEncodingData(
           LayerType::Header, /*aux_out=*/nullptr, [&] {
             return BuildAndStoreHuffmanTree(huff_histo_.data(), size,
                                             huff_depths_.data(),
-                                            huff_bits_.data(), &tmp_writer);
+                                            huff_bits_.data(), &tmp_writer,
+                                            packed_scratch);
           }));
       cost = tmp_writer.BitsWritten();
     } else {
       size_t start = writer->BitsWritten();
       JXL_RETURN_IF_ERROR(BuildAndStoreHuffmanTree(
           huff_histo_.data(), size, huff_depths_.data(), huff_bits_.data(),
-          writer));
+          writer, packed_scratch));
       cost = writer->BitsWritten() - start;
     }
     for (size_t i = 0; i < size; i++) {

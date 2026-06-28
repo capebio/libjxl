@@ -134,11 +134,12 @@ struct EntropyEncodingData {
                            std::vector<Histogram>& clustered_histograms);
 
   // Scratch storage for BuildAndStoreANSEncodingData (prefix-code path).
-  // Grown to high-water-mark alphabet size, never shrunk — eliminates three
+  // Grown to high-water-mark alphabet size, never shrunk — eliminates four
   // per-call heap allocations without introducing shared state.
   std::vector<uint32_t> huff_histo_;
   std::vector<uint8_t>  huff_depths_;
   std::vector<uint16_t> huff_bits_;
+  std::vector<uint8_t>  huff_packed_;
 };
 
 // Writes the context map to the bitstream and concatenates the individual

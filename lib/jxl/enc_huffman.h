@@ -17,9 +17,12 @@ namespace jxl {
 // Builds a Huffman tree for the given histogram, and encodes it into writer
 // in a format that can be read by HuffmanDecodingData::ReadFromBitstream.
 // An allotment for `writer` must already have been created by the caller.
+// packed_scratch: caller-owned buffer of at least `length` bytes used as
+// scratch space for the RLE token stream. If null, a temporary is allocated.
 Status BuildAndStoreHuffmanTree(const uint32_t* histogram, size_t length,
                                 uint8_t* depth, uint16_t* bits,
-                                BitWriter* writer);
+                                BitWriter* writer,
+                                uint8_t* packed_scratch = nullptr);
 
 }  // namespace jxl
 

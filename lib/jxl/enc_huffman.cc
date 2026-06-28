@@ -230,14 +230,23 @@ static void BuildFourSymbolHuffmanCodes(const uint32_t* histogram,
 
 // num = alphabet size
 // depths = symbol depths
-Status StoreHuffmanTree(const uint8_t* depths, size_t num, BitWriter* writer) {
+// packed_scratch: caller-supplied buffer of >= num bytes, or null to allocate.
+Status StoreHuffmanTree(const uint8_t* depths, size_t num, BitWriter* writer,
+                        uint8_t* packed_scratch) {
   // Write the Huffman tree into the packed representation and accumulate the
   // secondary histogram in one pass. Each byte: low 5 bits = code-length
   // symbol (0..17), high 3 bits = RLE extra payload.
-  auto packed = jxl::make_uninitialized_vector<uint8_t>(num);
+  std::vector<uint8_t> packed_owned;
+  uint8_t* packed;
+  if (packed_scratch != nullptr) {
+    packed = packed_scratch;
+  } else {
+    packed_owned = jxl::make_uninitialized_vector<uint8_t>(num);
+    packed = packed_owned.data();
+  }
   size_t huffman_tree_size = 0;
   uint32_t huffman_tree_histogram[kCodeLengthCodes] = {0};
-  WriteHuffmanTree(depths, num, &huffman_tree_size, packed.data(),
+  WriteHuffmanTree(depths, num, &huffman_tree_size, packed,
                    huffman_tree_histogram);
 
   // The compact stream uses only the 18 code-length symbols. Avoid the
@@ -288,7 +297,7 @@ Status StoreHuffmanTree(const uint8_t* depths, size_t num, BitWriter* writer) {
 
   // Store the real huffman tree now.
   JXL_RETURN_IF_ERROR(StoreHuffmanTreeToBitMask(
-      huffman_tree_size, packed.data(),
+      huffman_tree_size, packed,
       &code_length_bitdepth[0], code_length_bitdepth_symbols, writer));
   return true;
 }
@@ -297,7 +306,7 @@ Status StoreHuffmanTree(const uint8_t* depths, size_t num, BitWriter* writer) {
 
 Status BuildAndStoreHuffmanTree(const uint32_t* histogram, const size_t length,
                                 uint8_t* depth, uint16_t* bits,
-                                BitWriter* writer) {
+                                BitWriter* writer, uint8_t* packed_scratch) {
   size_t count = 0;
   size_t s4[4] = {0};
   for (size_t i = 0; i < length; i++) {
@@ -361,7 +370,7 @@ Status BuildAndStoreHuffmanTree(const uint32_t* histogram, const size_t length,
 
   CreateHuffmanTree(histogram, length, 15, depth);
   ConvertBitDepthsToSymbols(depth, length, bits);
-  JXL_RETURN_IF_ERROR(StoreHuffmanTree(depth, length, writer));
+  JXL_RETURN_IF_ERROR(StoreHuffmanTree(depth, length, writer, packed_scratch));
   return true;
 }
 
