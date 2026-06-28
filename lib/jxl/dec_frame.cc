@@ -659,18 +659,25 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
   }
 
   if (decoded_dc_global_) {
-    const auto process_section = [this, &dc_group_sec, &num, &sections,
-                                  &section_status](size_t i,
-                                                   size_t thread) -> Status {
-      if (dc_group_sec[i] != num) {
+    // Compact list of DC groups with a section to process this call, so
+    // RunOnPool fans out only over runnable work (byte-exact: see ps_* decls).
+    ps_dc_runnable_.clear();
+    for (size_t i = 0; i < dc_group_sec.size(); i++) {
+      if (dc_group_sec[i] != num) ps_dc_runnable_.push_back(i);
+    }
+    if (!ps_dc_runnable_.empty()) {
+      const auto process_section = [this, &dc_group_sec, &sections,
+                                    &section_status](size_t idx,
+                                                     size_t thread) -> Status {
+        const size_t i = ps_dc_runnable_[idx];
         JXL_RETURN_IF_ERROR(ProcessDCGroup(i, sections[dc_group_sec[i]].br));
         section_status[dc_group_sec[i]] = SectionStatus::kDone;
-      }
-      return true;
-    };
-    JXL_RETURN_IF_ERROR(RunOnPool(pool_, 0, dc_group_sec.size(),
-                                  ThreadPool::NoInit, process_section,
-                                  "DecodeDCGroup"));
+        return true;
+      };
+      JXL_RETURN_IF_ERROR(RunOnPool(pool_, 0, ps_dc_runnable_.size(),
+                                    ThreadPool::NoInit, process_section,
+                                    "DecodeDCGroup"));
+    }
   }
 
   const bool render_noise =
@@ -709,49 +716,62 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
     // Mark that we only want the next progression pass.
     size_t target_complete_passes = NextNumPassesToPause();
     for (size_t i = 0; i < num_groups; i++) {
-      desired_num_ac_passes[i] =
-          std::min(desired_num_ac_passes[i],
-                   target_complete_passes - decoded_passes_per_ac_group_[i]);
+      // Guard the subtraction: when sections arrive unevenly a group can already
+      // be past the next pause threshold, which would unsigned-underflow and
+      // disable the cap (decoding beyond the requested pause). Clamp to 0.
+      const size_t decoded = decoded_passes_per_ac_group_[i];
+      const size_t remaining =
+          target_complete_passes > decoded ? target_complete_passes - decoded
+                                           : 0;
+      desired_num_ac_passes[i] = std::min(desired_num_ac_passes[i], remaining);
     }
   }
 
   if (decoded_ac_global_) {
-    // Mark all the AC groups that we received as not complete yet.
-    for (size_t i = 0; i < num_groups; i++) {
-      if (desired_num_ac_passes[i] != 0) {
-        dec_state_->render_pipeline->ClearDone(i);
+    // Build the compact list of AC groups that have new passes to decode this
+    // call, folding in the per-group ClearDone (which touches exactly this set).
+    // RunOnPool then fans out only over runnable groups and storage is sized to
+    // that count. Byte-exact: groups decode independently and the group-dec-cache
+    // slot is interchangeable scratch (see ps_* decls), so the task index used
+    // for GetStorageLocation does not affect decoded output.
+    ps_ac_runnable_.clear();
+    for (size_t g = 0; g < num_groups; g++) {
+      if (desired_num_ac_passes[g] != 0) {
+        dec_state_->render_pipeline->ClearDone(g);
+        ps_ac_runnable_.push_back(g);
       }
     }
 
-    const auto prepare_storage = [this](size_t num_threads) -> Status {
-      JXL_RETURN_IF_ERROR(
-          PrepareStorage(num_threads, decoded_passes_per_ac_group_.size()));
-      return true;
-    };
-    const auto process_group = [this, &ac_group_sec, &desired_num_ac_passes,
-                                num_passes, &num, &sections, &section_status](
-                                   size_t g, size_t thread) -> Status {
-      if (desired_num_ac_passes[g] == 0) {
-        // no new AC pass, nothing to do
+    if (!ps_ac_runnable_.empty()) {
+      const auto prepare_storage = [this](size_t num_threads) -> Status {
+        JXL_RETURN_IF_ERROR(PrepareStorage(num_threads, ps_ac_runnable_.size()));
         return true;
-      }
-      size_t first_pass = decoded_passes_per_ac_group_[g];
-      PassesReaders readers = {};
-      for (size_t i = 0; i < desired_num_ac_passes[g]; i++) {
-        JXL_ENSURE(ac_group_sec[g * num_passes + first_pass + i] != num);
-        readers[i] = sections[ac_group_sec[g * num_passes + first_pass + i]].br;
-      }
-      JXL_RETURN_IF_ERROR(ProcessACGroup(
-          g, readers, desired_num_ac_passes[g], GetStorageLocation(thread, g),
-          /*force_draw=*/false, /*dc_only=*/false));
-      for (size_t i = 0; i < desired_num_ac_passes[g]; i++) {
-        section_status[ac_group_sec[g * num_passes + first_pass + i]] =
-            SectionStatus::kDone;
-      }
-      return true;
-    };
-    JXL_RETURN_IF_ERROR(RunOnPool(pool_, 0, num_groups, prepare_storage,
-                                  process_group, "DecodeGroup"));
+      };
+      const auto process_group = [this, &ac_group_sec, &desired_num_ac_passes,
+                                  num_passes, &num, &sections, &section_status](
+                                     size_t idx, size_t thread) -> Status {
+        const size_t g = ps_ac_runnable_[idx];
+        size_t first_pass = decoded_passes_per_ac_group_[g];
+        PassesReaders readers = {};
+        for (size_t i = 0; i < desired_num_ac_passes[g]; i++) {
+          JXL_ENSURE(ac_group_sec[g * num_passes + first_pass + i] != num);
+          readers[i] =
+              sections[ac_group_sec[g * num_passes + first_pass + i]].br;
+        }
+        JXL_RETURN_IF_ERROR(ProcessACGroup(g, readers, desired_num_ac_passes[g],
+                                           GetStorageLocation(thread, idx),
+                                           /*force_draw=*/false,
+                                           /*dc_only=*/false));
+        for (size_t i = 0; i < desired_num_ac_passes[g]; i++) {
+          section_status[ac_group_sec[g * num_passes + first_pass + i]] =
+              SectionStatus::kDone;
+        }
+        return true;
+      };
+      JXL_RETURN_IF_ERROR(RunOnPool(pool_, 0, ps_ac_runnable_.size(),
+                                    prepare_storage, process_group,
+                                    "DecodeGroup"));
+    }
   }
 
   MarkSections(sections, num, section_status);

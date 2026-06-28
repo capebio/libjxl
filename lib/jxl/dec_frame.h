@@ -414,6 +414,14 @@ class FrameDecoder {
   std::vector<size_t> ps_dc_group_sec_;
   std::vector<size_t> ps_ac_group_sec_;
   std::vector<size_t> ps_desired_num_ac_passes_;
+  // Compact lists of the DC/AC groups that actually have runnable work in the
+  // current ProcessSections call, so RunOnPool fans out only over real tasks
+  // instead of every group (most of which no-op on the streaming/progressive
+  // path). Output is unchanged: groups decode independently and group-dec-cache
+  // storage slots are interchangeable scratch, so dispatching a runnable subset
+  // (and sizing storage to it) is byte-exact with iterating all groups.
+  std::vector<size_t> ps_dc_runnable_;
+  std::vector<size_t> ps_ac_runnable_;
 };
 
 }  // namespace jxl
