@@ -6,6 +6,7 @@
 #include "lib/jxl/enc_noise.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -28,36 +29,58 @@ namespace {
 
 using OptimizeArray = optimize::Array<double, NoiseParams::kNumNoisePoints>;
 
+constexpr int kNoiseBlockSize = 8;
+
+using NoiseTile = std::array<std::array<float, kNoiseBlockSize>,
+                             kNoiseBlockSize>;
+
+// Loads the estimator's XY channel once per 8x8 tile. The expression is kept
+// as 0.5f * (Y + X), matching the original source-level floating-point order.
+NoiseTile LoadNoiseTileXY(const Image3F& opsin, const size_t x,
+                          const size_t y) {
+  NoiseTile xy;
+  for (int y_bl = 0; y_bl < kNoiseBlockSize; ++y_bl) {
+    const float* const x_row = opsin.PlaneRow(0, y + y_bl);
+    const float* const y_row = opsin.PlaneRow(1, y + y_bl);
+    for (int x_bl = 0; x_bl < kNoiseBlockSize; ++x_bl) {
+      xy[y_bl][x_bl] = 0.5f * (y_row[x + x_bl] + x_row[x + x_bl]);
+    }
+  }
+  return xy;
+}
+
 float GetScoreSumsOfAbsoluteDifferences(const Image3F& opsin, const int x,
                                         const int y, const int block_size) {
-  const int small_bl_size_x = 3;
-  const int small_bl_size_y = 4;
-  const int kNumSAD =
-      (block_size - small_bl_size_x) * (block_size - small_bl_size_y);
-  // block_size x block_size reference pixels
-  int counter = 0;
-  const int offset = 2;
+  constexpr int kSmallBlockSizeX = 3;
+  constexpr int kSmallBlockSizeY = 4;
+  constexpr int kNumSAD =
+      (kNoiseBlockSize - kSmallBlockSizeX) *
+      (kNoiseBlockSize - kSmallBlockSizeY);
+  constexpr int kOffset = 2;
+  JXL_DASSERT(block_size == kNoiseBlockSize);
 
-  std::vector<float> sad(kNumSAD, 0);
-  for (int y_bl = 0; y_bl + small_bl_size_y < block_size; ++y_bl) {
-    for (int x_bl = 0; x_bl + small_bl_size_x < block_size; ++x_bl) {
+  const NoiseTile xy = LoadNoiseTileXY(opsin, x, y);
+
+  int counter = 0;
+  std::array<float, kNumSAD> sad;
+  for (int y_bl = 0; y_bl + kSmallBlockSizeY < block_size; ++y_bl) {
+    for (int x_bl = 0; x_bl + kSmallBlockSizeX < block_size; ++x_bl) {
       float sad_sum = 0;
-      // size of the center patch, we compare all the patches inside window with
-      // the center one
-      for (int cy = 0; cy < small_bl_size_y; ++cy) {
-        for (int cx = 0; cx < small_bl_size_x; ++cx) {
-          float wnd = 0.5f * (opsin.PlaneRow(1, y + y_bl + cy)[x + x_bl + cx] +
-                              opsin.PlaneRow(0, y + y_bl + cy)[x + x_bl + cx]);
-          float center =
-              0.5f * (opsin.PlaneRow(1, y + offset + cy)[x + offset + cx] +
-                      opsin.PlaneRow(0, y + offset + cy)[x + offset + cx]);
+      // Size of the center patch: compare all patches inside the window with
+      // the center one.
+      for (int cy = 0; cy < kSmallBlockSizeY; ++cy) {
+        for (int cx = 0; cx < kSmallBlockSizeX; ++cx) {
+          const float wnd = xy[y_bl + cy][x_bl + cx];
+          const float center = xy[kOffset + cy][kOffset + cx];
           sad_sum += std::abs(center - wnd);
         }
       }
       sad[counter++] = sad_sum;
     }
   }
-  const int kSamples = (kNumSAD) / 2;
+  JXL_DASSERT(counter == kNumSAD);
+
+  constexpr int kSamples = kNumSAD / 2;
   // As with ROAD (rank order absolute distance), we keep the smallest half of
   // the values in SAD (we use here the more robust patch SAD instead of
   // absolute single-pixel differences).
@@ -129,15 +152,16 @@ std::vector<float> GetSADScoresForPatches(const Image3F& opsin,
                                           const size_t block_s,
                                           const size_t num_bin,
                                           NoiseHistogram* sad_histogram) {
-  std::vector<float> sad_scores(
-      (opsin.ysize() / block_s) * (opsin.xsize() / block_s), 0.0f);
-
-  int block_index = 0;
+  const size_t num_blocks =
+      (opsin.ysize() / block_s) * (opsin.xsize() / block_s);
+  std::vector<float> sad_scores;
+  sad_scores.reserve(num_blocks);
 
   for (size_t y = 0; y + block_s <= opsin.ysize(); y += block_s) {
     for (size_t x = 0; x + block_s <= opsin.xsize(); x += block_s) {
-      float sad_sc = GetScoreSumsOfAbsoluteDifferences(opsin, x, y, block_s);
-      sad_scores[block_index++] = sad_sc;
+      const float sad_sc =
+          GetScoreSumsOfAbsoluteDifferences(opsin, x, y, block_s);
+      sad_scores.push_back(sad_sc);
       sad_histogram->Increment(sad_sc * num_bin);
     }
   }
@@ -156,7 +180,7 @@ float GetSADThreshold(const NoiseHistogram& histogram, const int num_bin) {
 // loss = sum asym * (F(x) - nl)^2 + kReg * num_points * sum (w[i] - w[i+1])^2
 // where asym = 1 if F(x) < nl, kAsym if F(x) > nl.
 struct LossFunction {
-  explicit LossFunction(std::vector<NoiseLevel> nl0) : nl(std::move(nl0)) {}
+  explicit LossFunction(const std::vector<NoiseLevel>& nl0) : nl(nl0) {}
 
   double Compute(const OptimizeArray& w, OptimizeArray* df,
                  bool skip_regularization = false) const {
@@ -166,7 +190,7 @@ struct LossFunction {
     for (size_t i = 0; i < w.size(); i++) {
       (*df)[i] = 0;
     }
-    for (auto ind : nl) {
+    for (const NoiseLevel& ind : nl) {
       std::pair<int, float> pos = IndexAndFrac(ind.intensity);
       JXL_DASSERT(pos.first >= 0 && static_cast<size_t>(pos.first) <
                                         NoiseParams::kNumNoisePoints - 1);
@@ -194,7 +218,7 @@ struct LossFunction {
     return loss_function;
   }
 
-  std::vector<NoiseLevel> nl;
+  const std::vector<NoiseLevel>& nl;
 };
 
 void OptimizeNoiseParameters(const std::vector<NoiseLevel>& noise_level,
@@ -202,6 +226,11 @@ void OptimizeNoiseParameters(const std::vector<NoiseLevel>& noise_level,
   constexpr double kMaxError = 1e-3;
   static const double kPrecision = 1e-8;
   static const int kMaxIter = 40;
+
+  if (noise_level.empty()) {
+    noise_params->Clear();
+    return;
+  }
 
   float avg = 0;
   for (const NoiseLevel& nl : noise_level) {
@@ -243,10 +272,13 @@ void OptimizeNoiseParameters(const std::vector<NoiseLevel>& noise_level,
 std::vector<NoiseLevel> GetNoiseLevel(
     const Image3F& opsin, const std::vector<float>& texture_strength,
     const float threshold, const size_t block_s) {
+  JXL_DASSERT(block_s == static_cast<size_t>(kNoiseBlockSize));
   std::vector<NoiseLevel> noise_level_per_intensity;
+  noise_level_per_intensity.reserve(texture_strength.size());
 
-  const int filt_size = 1;
-  static const float kLaplFilter[filt_size * 2 + 1][filt_size * 2 + 1] = {
+  constexpr int kFiltSize = 1;
+  constexpr int kPaddedBlockSize = kNoiseBlockSize + 2 * kFiltSize;
+  static const float kLaplFilter[kFiltSize * 2 + 1][kFiltSize * 2 + 1] = {
       {-0.25f, -1.0f, -0.25f},
       {-1.0f, 5.0f, -1.0f},
       {-0.25f, -1.0f, -0.25f},
@@ -259,58 +291,51 @@ std::vector<NoiseLevel> GetNoiseLevel(
   for (size_t y = 0; y + block_s <= opsin.ysize(); y += block_s) {
     for (size_t x = 0; x + block_s <= opsin.xsize(); x += block_s) {
       if (texture_strength[patch_index] <= threshold) {
-        // Calculate mean value
+        const NoiseTile xy = LoadNoiseTileXY(opsin, x, y);
+
+        // Fill a one-pixel mirror-without-edge-repeat border once per selected
+        // tile. This is exactly the y_bl - y_f / x_bl - x_f reflection used by
+        // the old boundary branches.
+        std::array<std::array<float, kPaddedBlockSize>, kPaddedBlockSize>
+            padded_xy;
+        for (int y_pad = 0; y_pad < kPaddedBlockSize; ++y_pad) {
+          const int y_bl = y_pad - kFiltSize;
+          const int source_y =
+              y_bl < 0 ? -y_bl
+                       : (y_bl >= kNoiseBlockSize
+                              ? 2 * kNoiseBlockSize - 2 - y_bl
+                              : y_bl);
+          for (int x_pad = 0; x_pad < kPaddedBlockSize; ++x_pad) {
+            const int x_bl = x_pad - kFiltSize;
+            const int source_x =
+                x_bl < 0 ? -x_bl
+                         : (x_bl >= kNoiseBlockSize
+                                ? 2 * kNoiseBlockSize - 2 - x_bl
+                                : x_bl);
+            padded_xy[y_pad][x_pad] = xy[source_y][source_x];
+          }
+        }
+
+        // Calculate mean value in the original row-major order.
         float mean_int = 0;
-        for (size_t y_bl = 0; y_bl < block_s; ++y_bl) {
-          for (size_t x_bl = 0; x_bl < block_s; ++x_bl) {
-            mean_int += 0.5f * (opsin.PlaneRow(1, y + y_bl)[x + x_bl] +
-                                opsin.PlaneRow(0, y + y_bl)[x + x_bl]);
+        for (int y_bl = 0; y_bl < kNoiseBlockSize; ++y_bl) {
+          for (int x_bl = 0; x_bl < kNoiseBlockSize; ++x_bl) {
+            mean_int += xy[y_bl][x_bl];
           }
         }
         mean_int /= block_s * block_s;
 
-        // Calculate Noise level
+        // Calculate the Laplacian response. The coefficient and accumulation
+        // order match the old y_f=-1..1, x_f=-1..1 loops exactly.
         float noise_level = 0;
         size_t count = 0;
-        for (size_t y_bl = 0; y_bl < block_s; ++y_bl) {
-          for (size_t x_bl = 0; x_bl < block_s; ++x_bl) {
+        for (int y_bl = 0; y_bl < kNoiseBlockSize; ++y_bl) {
+          for (int x_bl = 0; x_bl < kNoiseBlockSize; ++x_bl) {
             float filtered_value = 0;
-            for (int y_f = -1 * filt_size; y_f <= filt_size; ++y_f) {
-              if ((static_cast<ptrdiff_t>(y_bl) + y_f) >= 0 &&
-                  (y_bl + y_f) < block_s) {
-                for (int x_f = -1 * filt_size; x_f <= filt_size; ++x_f) {
-                  if ((static_cast<ptrdiff_t>(x_bl) + x_f) >= 0 &&
-                      (x_bl + x_f) < block_s) {
-                    filtered_value +=
-                        0.5f *
-                        (opsin.PlaneRow(1, y + y_bl + y_f)[x + x_bl + x_f] +
-                         opsin.PlaneRow(0, y + y_bl + y_f)[x + x_bl + x_f]) *
-                        kLaplFilter[y_f + filt_size][x_f + filt_size];
-                  } else {
-                    filtered_value +=
-                        0.5f *
-                        (opsin.PlaneRow(1, y + y_bl + y_f)[x + x_bl - x_f] +
-                         opsin.PlaneRow(0, y + y_bl + y_f)[x + x_bl - x_f]) *
-                        kLaplFilter[y_f + filt_size][x_f + filt_size];
-                  }
-                }
-              } else {
-                for (int x_f = -1 * filt_size; x_f <= filt_size; ++x_f) {
-                  if ((static_cast<ptrdiff_t>(x_bl) + x_f) >= 0 &&
-                      (x_bl + x_f) < block_s) {
-                    filtered_value +=
-                        0.5f *
-                        (opsin.PlaneRow(1, y + y_bl - y_f)[x + x_bl + x_f] +
-                         opsin.PlaneRow(0, y + y_bl - y_f)[x + x_bl + x_f]) *
-                        kLaplFilter[y_f + filt_size][x_f + filt_size];
-                  } else {
-                    filtered_value +=
-                        0.5f *
-                        (opsin.PlaneRow(1, y + y_bl - y_f)[x + x_bl - x_f] +
-                         opsin.PlaneRow(0, y + y_bl - y_f)[x + x_bl - x_f]) *
-                        kLaplFilter[y_f + filt_size][x_f + filt_size];
-                  }
-                }
+            for (int y_f = 0; y_f < 2 * kFiltSize + 1; ++y_f) {
+              for (int x_f = 0; x_f < 2 * kFiltSize + 1; ++x_f) {
+                filtered_value += padded_xy[y_bl + y_f][x_bl + x_f] *
+                                  kLaplFilter[y_f][x_f];
               }
             }
             noise_level += std::abs(filtered_value);
@@ -341,6 +366,13 @@ Status EncodeFloatParam(float val, float precision, BitWriter* writer) {
 
 Status GetNoiseParameter(const Image3F& opsin, NoiseParams* noise_params,
                          float quality_coef) {
+  // A non-positive multiplier cannot yield a valid emitted model. Avoid the
+  // full image analysis and make the output state explicit.
+  if (quality_coef <= 0.0f) {
+    noise_params->Clear();
+    return false;
+  }
+
   // The size of a patch in decoder might be different from encoder's patch
   // size.
   // For encoder: the patch size should be big enough to estimate
