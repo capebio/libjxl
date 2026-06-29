@@ -518,6 +518,32 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
         }
         offset += size;
 
+        // Populate per-block AC-occupancy sidecar for progressive redraws.
+        // block_idx = (offset - size) / kDCTBlockSize gives the block's
+        // position within the group's flat coefficient store.
+        if (kReadCoefficients && accumulate) {
+          const size_t block_idx = (offset - size) / kDCTBlockSize;
+          if (block_idx < dec_state->ac_occupancy.size()) {
+            uint8_t mask = 0;
+            if (ac_type == ACType::k16) {
+              for (size_t k = covered_blocks; k < size; k++) {
+                if (qblock[0].ptr16[k]) mask |= 0x1;
+                if (qblock[1].ptr16[k]) mask |= 0x2;
+                if (qblock[2].ptr16[k]) mask |= 0x4;
+                if (mask == 0x7) break;
+              }
+            } else {
+              for (size_t k = covered_blocks; k < size; k++) {
+                if (qblock[0].ptr32[k]) mask |= 0x1;
+                if (qblock[1].ptr32[k]) mask |= 0x2;
+                if (qblock[2].ptr32[k]) mask |= 0x4;
+                if (mask == 0x7) break;
+              }
+            }
+            dec_state->ac_occupancy[block_idx] |= mask;
+          }
+        }
+
         // DC-only fast path: detect channels where all AC coefficients are zero.
         // Fires on ~89% X, ~86% B, and ~2-49% Y blocks in real photos.
         // X/B dc_only valid only when no_cfl OR dc_only[Y]: with CfL active,
@@ -742,6 +768,8 @@ Status DecodeGroupFromStoredCoefficients(
     size_t group_idx, RenderPipelineInput& render_pipeline_input,
     jpeg::JPEGData* jpeg_data,
     const JpegGroupParams* JXL_RESTRICT jpeg_params) {
+  // TODO(perf): use dec_state->ac_occupancy to skip dequant for all-AC-zero
+  // blocks during stored-coefficient progressive redraws.
   JXL_ENSURE(!dec_state->coefficients->IsEmpty());
   return DecodeGroupImpl<false>(
       frame_header, nullptr, group_dec_cache, dec_state, thread, group_idx,
@@ -1190,6 +1218,15 @@ Status DecodeGroup(const FrameHeader& frame_header,
         jpeg_params,
         PrepareJpegGroupParams(frame_header, *dec_state, *jpeg_data));
     jpeg_params_ptr = &jpeg_params;
+  }
+
+  // Pre-size AC-occupancy sidecar for accumulate-mode groups.
+  if (!dec_state->coefficients->IsEmpty()) {
+    const size_t needed =
+        dec_state->shared->frame_dim.num_groups * kGroupDimInBlocks * kGroupDimInBlocks;
+    if (dec_state->ac_occupancy.size() < needed) {
+      dec_state->ac_occupancy.assign(needed, 0);
+    }
   }
 
   // A progressive redraw has no new entropy-coded passes. Coefficients were

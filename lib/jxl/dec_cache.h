@@ -206,6 +206,11 @@ struct PassesDecoderState {
   // Storage for coefficients if in "accumulate" mode.
   std::unique_ptr<ACImage> coefficients = make_unique<ACImageT<int32_t>>();
 
+  // Per-block AC-occupancy bitmask for the coefficient store. bit0=X, bit1=Y,
+  // bit2=B nonzero AC. OR'd across all accumulated passes. Valid only when
+  // !coefficients->IsEmpty(). Sized lazily to num_groups * max_blocks_per_group.
+  std::vector<uint8_t> ac_occupancy;
+
   // Rendering pipeline.
   std::unique_ptr<RenderPipeline> render_pipeline;
 
