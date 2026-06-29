@@ -269,10 +269,10 @@ V HfModulation(const D d, const size_t x, const size_t y, const ImageF& xyb_y,
   auto sum_y = Zero(d);
   static const float valmin_y = 0.0206;
   auto valminv_y = Set(d, valmin_y);
-  for (size_t dy = 0; dy < 8; ++dy) {
+  for (size_t dy = 0; dy < 7; ++dy) {
     const float* JXL_RESTRICT row_in_y = rect.ConstRow(xyb_y, y + dy) + x;
     const float* JXL_RESTRICT row_in_y_next =
-        dy == 7 ? row_in_y : rect.ConstRow(xyb_y, y + dy + 1) + x;
+        rect.ConstRow(xyb_y, y + dy + 1) + x;
 
     // In SCALAR, there is no guarantee of having extra row padding.
     // Hence, we need to ensure we don't access pixels outside the row itself.
@@ -298,6 +298,25 @@ V HfModulation(const D d, const size_t x, const size_t y, const ImageF& xyb_y,
     const auto pd_y = Load(d, row_in_y_next + 7);
     sum_y = Add(sum_y, Min(valminv_y, AbsDiff(p_y, pd_y)));
 #endif
+  }
+  // dy == 7: the original code aliased the "next" row back to the current row,
+  // so every vertical term was Min(valmin, AbsDiff(p, p)) == 0 and added
+  // nothing. Adding 0.0f is an identity for the (non-negative, finite) running
+  // sum, so emit the horizontal term only — bit-identical to the original
+  // dy == 7 iteration but without the dead vertical loads/work.
+  {
+    const float* JXL_RESTRICT row_in_y = rect.ConstRow(xyb_y, y + 7) + x;
+#if HWY_TARGET != HWY_SCALAR
+    for (size_t dx = 0; dx < 8; dx += Lanes(d)) {
+#else
+    for (size_t dx = 0; dx < 7; dx += Lanes(d)) {
+#endif
+      const auto mask = BitCast(d, Load(du, kMaskRight + dx));
+      const auto p_y = Load(d, row_in_y + dx);
+      const auto pr_y = LoadU(d, row_in_y + dx + 1);
+      sum_y = Add(sum_y, And(mask, Min(valminv_y, AbsDiff(p_y, pr_y))));
+    }
+    // No vertical (down) term and no SCALAR vertical tail: both were exactly 0.
   }
   static const float kMul_y = -0.38;
   sum_y = SumOfLanes(d, sum_y);
@@ -338,8 +357,16 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
       auto mask_val = ComputeMask(df, Set(df, row_out[ix]));
       mask_val = GammaModulation(df, x, y, xyb_x, xyb_y, rect_in, mask_val);
       auto out_val = HfModulation(df, x, y, xyb_y, rect_in, mask_val);
-      out_val = Min(out_val, BlueModulation(df, x, y, xyb_x, xyb_y, xyb_b,
-                                            rect_in, mask_val));
+      // BlueModulation returns mask_val + (non-negative) boost, so its result is
+      // always >= mask_val. When HfModulation already sits at or below mask_val
+      // the Min is already decided (Blue cannot lower it), so skip the whole
+      // BlueModulation 8x8x3-plane scan. All of mask_val/out_val/Blue are
+      // lane-uniform broadcasts (built from SumOfLanes scalars), so the scalar
+      // GetLane comparison is exact and the kept result is bit-identical.
+      if (GetLane(out_val) > GetLane(mask_val)) {
+        out_val = Min(out_val, BlueModulation(df, x, y, xyb_x, xyb_y, xyb_b,
+                                              rect_in, mask_val));
+      }
       // We want multiplicative quantization field, so everything
       // until this point has been modulating the exponent.
       row_out[ix] = FastPow2f(GetLane(out_val) * 1.442695041f) * mul + add;
@@ -1134,10 +1161,22 @@ Status FindBestQuantization(const FrameHeader& frame_header,
     const float inv_global_scale = quantizer.InvGlobalScale();
     const float quant_scale = quantizer.Scale();
     if (cur_pow == 0.0) {
+      // In the cur_pow == 0 (monotone) regime the update only ever *raises* a
+      // block's quant value (diff > 1 path) or leaves it untouched (diff <= 1
+      // path is a no-op here). A block left untouched this pass reproduces the
+      // same roundtrip -> same diff -> untouched again, so it is a permanent
+      // fixed point. If nothing changed across the whole field we have
+      // converged: every remaining roundtrip would be byte-identical and the
+      // coefficients from this iteration's RoundtripImage are already final.
+      // Stop early. (Same fixed-point logic as FindBestQuantizationMaxError's
+      // `any_change` exit; the trailing SetQuantField re-derives the identical
+      // raw_quant_field, so the encoded output is unchanged.)
+      bool any_change = false;
       for (size_t y = 0; y < quant_field.ysize(); ++y) {
         const float* const JXL_RESTRICT row_dist = tile_distmap.Row(y);
         float* const JXL_RESTRICT row_q = quant_field.Row(y);
         for (size_t x = 0; x < quant_field.xsize(); ++x) {
+          const float prev = row_q[x];
           const float diff = row_dist[x] / original_butteraugli;
           if (diff > 1.0f) {
             float old = row_q[x];
@@ -1152,8 +1191,10 @@ Status FindBestQuantization(const FrameHeader& frame_header,
           }
           if (row_q[x] > qf_higher) row_q[x] = qf_higher;
           if (row_q[x] < qf_lower) row_q[x] = qf_lower;
+          if (row_q[x] != prev) any_change = true;
         }
       }
+      if (!any_change) break;
     } else {
       for (size_t y = 0; y < quant_field.ysize(); ++y) {
         const float* const JXL_RESTRICT row_dist = tile_distmap.Row(y);
