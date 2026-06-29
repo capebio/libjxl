@@ -42,17 +42,37 @@ decode stayed identical. More block contexts cost more in map signalling +
 extra histograms than the greedy ANS clusterer recovers. The cap of 9 is
 well-tuned. **Reverted.**
 
+## Landed: fix discarded simple-ctx-map for `decoding_speed_tier >= 1` (`enc_heuristics.cc`)
+
+`FindBestBlockEntropyModel`'s fast-decode branch built the 2-context
+`kSimpleCtxMap` into a **local copy** (`auto bcm = *block_ctx_map;`) then
+returned, discarding it — so `decoding_speed_tier >= 1` silently kept the
+default 15-context map and never delivered the faster-decode trade the tier
+promises. Fixed to assign into `*block_ctx_map`.
+
+This is **output-changing for `--faster_decoding >= 1` only** (the app's default
+tier 0 is untouched). Decode stays bit-identical (the map changes entropy
+coding, not coefficients). Measured at `--faster_decoding=1`, e7, vs the buggy
+build:
+
+| image | size Δ | decode Δ |
+|---|---|---|
+| big2048 (4 MP, RAW-like) | +1.5% | **−9.1% faster** |
+| torture | +2.1% | −0.1% |
+| splines (graphic) | −8.0% | +9.6% slower |
+| hdr_room | −0.2% | +0.6% |
+
+The promised decode speedup is real on **large detailed frames** (big2048 −9%,
+the closest match to real RAW) at a small (~1.5%) size cost; smaller/graphic
+content is neutral-to-worse on both axes. So it is a **correctness fix** that
+makes the mode behave as designed; whether to *enable* `--faster_decoding` for
+the app is a separate TTFP-vs-size product call, now actually available.
+
 ## Considered & not pursued
 
 - **Split large-transform contexts** (square vs rect): subsumed by
   `FindBestBlockEntropyModel` (already clusters orders for large frames) and
   hard-capped at 16 contexts (default already uses 15 → 1 free slot). Marginal.
-- **`enc_heuristics.cc:83` bug**: the `decoding_speed_tier ≥ 1` branch assigns
-  the simple 2-context map into a local **copy** (`auto bcm = *block_ctx_map;`)
-  then returns, discarding it — so that tier silently keeps the default map.
-  Real, but fixing it is output-changing (and would *enlarge* files: the simple
-  map trades compression for decode speed) and only affects the niche
-  `decoding_speed_tier ≥ 1` mode. Left alone.
 
 ## Reproduce
 

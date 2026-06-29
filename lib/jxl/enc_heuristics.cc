@@ -80,10 +80,15 @@ void FindBestBlockEntropyModel(const CompressParams& cparams, const ImageI& rqf,
         3 * kNumOrders == sizeof(kSimpleCtxMap) / sizeof *kSimpleCtxMap,
         "Update simple context map");
 
-    auto bcm = *block_ctx_map;
-    bcm.ctx_map.assign(std::begin(kSimpleCtxMap), std::end(kSimpleCtxMap));
-    bcm.num_ctxs = 2;
-    bcm.num_dc_ctxs = 1;
+    // NB: assign into *block_ctx_map, not a local copy. This previously read
+    // `auto bcm = *block_ctx_map; bcm... ; return;`, which mutated a discarded
+    // copy — so decoding_speed_tier >= 1 silently kept the default 15-context
+    // map instead of this 2-context one, never delivering the faster-decode
+    // trade the tier promises.
+    block_ctx_map->ctx_map.assign(std::begin(kSimpleCtxMap),
+                                  std::end(kSimpleCtxMap));
+    block_ctx_map->num_ctxs = 2;
+    block_ctx_map->num_dc_ctxs = 1;
     return;
   }
   if (cparams.speed_tier >= SpeedTier::kFalcon) {
