@@ -8,6 +8,7 @@
 #include <jxl/memory_manager.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -124,11 +125,16 @@ Status ReadHistogram(int precision_bits, std::vector<int32_t>* counts,
         {3, 10}, {4, 4},  {3, 7}, {4, 1}, {3, 6}, {3, 8}, {3, 9}, {4, 2},
     };
 
-    std::vector<int> logcounts(length);
+    // length = DecodeVarLenUint8() + 3 is bounded by 255 + 3 = 258, so these
+    // scratch buffers fit on the stack and avoid two heap allocations per
+    // histogram during decode setup. Zero-initialized to match the previous
+    // value-initialized std::vector (entries beyond `length` are never read).
+    JXL_DASSERT(length <= 258);
+    std::array<int, 258> logcounts{};
     int omit_log = -1;
     int omit_pos = -1;
     // This array remembers which symbols have an RLE length.
-    std::vector<int> same(length);
+    std::array<int, 258> same{};
     for (size_t i = 0; i < length; ++i) {
       input->Refill();  // for PeekFixedBits + Advance
       int idx = input->PeekFixedBits<7>();
@@ -262,8 +268,11 @@ Status DecodeANSCodes(JxlMemoryManager* memory_manager,
         }
       }
       result->degenerate_symbols[c] = degenerate_symbol;
+      // InitAliasTable takes its distribution by value; counts is dead after
+      // this call (re-declared next iteration) so move instead of copy.
       JXL_RETURN_IF_ERROR(
-          InitAliasTable(counts, ANS_LOG_TAB_SIZE, result->log_alpha_size,
+          InitAliasTable(std::move(counts), ANS_LOG_TAB_SIZE,
+                         result->log_alpha_size,
                          alias_tables + c * (1 << result->log_alpha_size)));
     }
   }
