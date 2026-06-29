@@ -226,18 +226,14 @@ class Separable5Impl {
     if (kSizeModN != 0) {
       const float* JXL_RESTRICT rows[5] = {row_t2, row_t1, row_m, row_b1,
                                            row_b2};
+      // Tail starts at x >= Lanes(d) > kRadius, so x-kRadius >= 0 always; only
+      // the final kRadius columns can read past xsize on the right.
+      const int64_t safe_end = static_cast<int64_t>(xsize) - kRadius;
+      for (; static_cast<int64_t>(x) < safe_end; ++x) {
+        row_out[x] = ScalarPixel<false>(rows, x, xsize, weights);
+      }
       for (; x < xsize; ++x) {
-        float mul = 0.0f;
-        for (int64_t dy = -kRadius; dy <= kRadius; ++dy) {
-          const float wy = weights->vert[std::abs(dy) * 4];
-          const float* clamped_row = rows[dy + 2];
-          for (int64_t dx = -kRadius; dx <= kRadius; ++dx) {
-            const float wx = weights->horz[std::abs(dx) * 4];
-            const int64_t clamped_x = Mirror(x + dx, xsize);
-            mul += clamped_row[clamped_x] * wx * wy;
-          }
-        }
-        row_out[x] = mul;
+        row_out[x] = ScalarPixel<true>(rows, x, xsize, weights);
       }
     }
   }
@@ -381,25 +377,18 @@ class Separable5Impl {
     // Scalar remainder: identical 25-term accumulation order to ConvolveRow.
     if (kSizeModN != 0) {
       const int64_t stride = in->PixelsPerRow();
+      const int64_t safe_end = xsize - kRadius;
       for (size_t y = y0; y < y1; ++y) {
         const float* const JXL_RESTRICT row_m = rect.ConstRow(*in, y);
         const float* const JXL_RESTRICT rows[5] = {
             row_m - 2 * stride, row_m - 1 * stride, row_m, row_m + 1 * stride,
             row_m + 2 * stride};
         float* const JXL_RESTRICT row_out = out->Row(y);
-        for (int64_t xx = x; xx < xsize; ++xx) {
-          float mul = 0.0f;
-          for (int64_t dy = -kRadius; dy <= kRadius; ++dy) {
-            const float wy = weights->vert[std::abs(dy) * 4];
-            const float* clamped_row = rows[dy + 2];
-            for (int64_t dx = -kRadius; dx <= kRadius; ++dx) {
-              const float wx = weights->horz[std::abs(dx) * 4];
-              const int64_t clamped_x = Mirror(xx + dx, xsize);
-              mul += clamped_row[clamped_x] * wx * wy;
-            }
-          }
-          row_out[xx] = mul;
-        }
+        int64_t xx = x;
+        for (; xx < safe_end; ++xx)
+          row_out[xx] = ScalarPixel<false>(rows, xx, xsize, weights);
+        for (; xx < xsize; ++xx)
+          row_out[xx] = ScalarPixel<true>(rows, xx, xsize, weights);
       }
     }
   }
@@ -518,6 +507,28 @@ class Separable5Impl {
     const V sum2 = Add(l2, r2);
     const V mul2 = MulAdd(sum2, wh2, mul1);
     return mul2;
+  }
+
+  // One output pixel via the reference 25-tap accumulation. Identical loop order
+  // to the original scalar tail (dy outer, dx inner, mul += row[x']*wx*wy), so
+  // output is byte-exact. kMirror=false drops the Mirror() call for interior
+  // columns where x+dx is already in [0, xsize): the index — hence the value —
+  // is identical.
+  template <bool kMirror>
+  static JXL_INLINE float ScalarPixel(const float* const JXL_RESTRICT rows[5],
+                                      const int64_t x, const int64_t xsize,
+                                      const WeightsSeparable5* weights) {
+    float mul = 0.0f;
+    for (int64_t dy = -kRadius; dy <= kRadius; ++dy) {
+      const float wy = weights->vert[std::abs(dy) * 4];
+      const float* JXL_RESTRICT clamped_row = rows[dy + 2];
+      for (int64_t dx = -kRadius; dx <= kRadius; ++dx) {
+        const float wx = weights->horz[std::abs(dx) * 4];
+        const int64_t cx = kMirror ? Mirror(x + dx, xsize) : (x + dx);
+        mul += clamped_row[cx] * wx * wy;
+      }
+    }
+    return mul;
   }
 
   const ImageF* in;
