@@ -1178,20 +1178,22 @@ Status DecodeGroup(const FrameHeader& frame_header,
     histo_selector_bits = CeilLog2Nonzero(dec_state->shared->num_histograms);
   }
 
+  // PrepareJpegGroupParams is invariant within a DecodeGroup call; compute once.
+  const JpegGroupParams* jpeg_params_ptr = nullptr;
+  JpegGroupParams jpeg_params;
+  if (jpeg_data) {
+    JXL_ASSIGN_OR_RETURN(
+        jpeg_params,
+        PrepareJpegGroupParams(frame_header, *dec_state, *jpeg_data));
+    jpeg_params_ptr = &jpeg_params;
+  }
+
   // A progressive redraw has no new entropy-coded passes. Coefficients were
   // retained by earlier no-draw or partial-draw calls, so bypass the entire
   // reader/histogram setup and render directly from that store.
   const bool render_from_stored_coefficients =
       draw == kDraw && num_passes == 0 && !dec_state->coefficients->IsEmpty();
   if (render_from_stored_coefficients) {
-    const JpegGroupParams* jpeg_params_ptr = nullptr;
-    JpegGroupParams jpeg_params;
-    if (jpeg_data) {
-      JXL_ASSIGN_OR_RETURN(
-          jpeg_params,
-          PrepareJpegGroupParams(frame_header, *dec_state, *jpeg_data));
-      jpeg_params_ptr = &jpeg_params;
-    }
     return HWY_DYNAMIC_DISPATCH(DecodeGroupFromStoredCoefficients)(
         frame_header, group_dec_cache, dec_state, thread, group_idx,
         render_pipeline_input, jpeg_data, jpeg_params_ptr);
@@ -1208,15 +1210,6 @@ Status DecodeGroup(const FrameHeader& frame_header,
   if (draw == kDontDraw) {
     JXL_RETURN_IF_ERROR(DecodeGroupNoDraw(&get_block, group_idx, dec_state));
   } else {
-    // Compute JPEG params once per frame (not per group); null when no JPEG.
-    const JpegGroupParams* jpeg_params_ptr = nullptr;
-    JpegGroupParams jpeg_params;
-    if (jpeg_data) {
-      JXL_ASSIGN_OR_RETURN(jpeg_params,
-                           PrepareJpegGroupParams(frame_header, *dec_state,
-                                                  *jpeg_data));
-      jpeg_params_ptr = &jpeg_params;
-    }
     JXL_RETURN_IF_ERROR(HWY_DYNAMIC_DISPATCH(DecodeGroupFromBitstream)(
         frame_header, &get_block, group_dec_cache, dec_state, thread, group_idx,
         render_pipeline_input, jpeg_data, jpeg_params_ptr));
