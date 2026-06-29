@@ -37,7 +37,6 @@ namespace HWY_NAMESPACE {
 
 // These templates are not found via ADL.
 using hwy::HWY_NAMESPACE::Add;
-using hwy::HWY_NAMESPACE::AndNot;
 using hwy::HWY_NAMESPACE::Eq;
 using hwy::HWY_NAMESPACE::GetLane;
 
@@ -56,40 +55,32 @@ int32_t NumNonZeroExceptLLF(const size_t cx, const size_t cy,
   // Add FF..FF for every zero coefficient, negate to get #zeros.
   auto neg_sum_zero = zero;
 
-  {
-    // Mask sufficient for one row of coefficients.
-    HWY_ALIGN const int32_t
-        llf_mask_lanes[AcStrategy::kMaxCoeffBlocks * (1 + kBlockDim)] = {
-            -1, -1, -1, -1};
-    // First cx=1,2,4 elements are FF..FF, others 0.
-    const int32_t* llf_mask_pos =
-        llf_mask_lanes + AcStrategy::kMaxCoeffBlocks - cx;
-
-    // Rows with LLF: mask out the LLF
-    for (size_t y = 0; y < cy; y++) {
-      for (size_t x = 0; x < cx * kBlockDim; x += Lanes(di)) {
-        const auto llf_mask = LoadU(di, llf_mask_pos + x);
-
-        // LLF counts as zero so we don't include it in nzeros.
-        const auto coef =
-            AndNot(llf_mask, Load(di, &block[y * cx * kBlockDim + x]));
-
-        neg_sum_zero = Add(neg_sum_zero, VecFromMask(di, Eq(coef, zero)));
-      }
-    }
+  // Count every coefficient with one uniform, mask-free SIMD pass, then
+  // subtract the LLF nonzeros below.  This is the algebraic identity
+  //   AC_nonzeros = all_nonzeros - LLF_nonzeros
+  // and is byte-exact with the previous masked count.  It drops the per-row
+  // mask LoadU + AndNot, flattens to a single contiguous loop (block is
+  // row-major, cx*kBlockDim wide, cy*kBlockDim tall), and is robust for every
+  // transform width — the old llf_mask_lanes only seeded -1 lanes for cx<=4.
+  const size_t total = cx * cy * kDCTBlockSize;  // multiple of Lanes(di)
+  for (size_t i = 0; i < total; i += Lanes(di)) {
+    const auto coef = Load(di, &block[i]);
+    neg_sum_zero = Add(neg_sum_zero, VecFromMask(di, Eq(coef, zero)));
   }
 
-  // Remaining rows: no mask
-  for (size_t y = cy; y < cy * kBlockDim; y++) {
-    for (size_t x = 0; x < cx * kBlockDim; x += Lanes(di)) {
-      const auto coef = Load(di, &block[y * cx * kBlockDim + x]);
-      neg_sum_zero = Add(neg_sum_zero, VecFromMask(di, Eq(coef, zero)));
+  // area - sum_zero, add because neg_sum_zero is already negated.
+  int32_t nzeros =
+      static_cast<int32_t>(total) + GetLane(SumOfLanes(di, neg_sum_zero));
+
+  // Subtract LLF nonzeros: the top-left cx*cy coefficients in natural layout
+  // (cx entries in each of the first cy rows; row stride cx*kBlockDim).
+  const size_t row_stride = cx * kBlockDim;
+  for (size_t y = 0; y < cy; y++) {
+    const int32_t* JXL_RESTRICT llf_row = block + y * row_stride;
+    for (size_t x = 0; x < cx; x++) {
+      nzeros -= static_cast<int32_t>(llf_row[x] != 0);
     }
   }
-
-  // We want area - sum_zero, add because neg_sum_zero is already negated.
-  const int32_t nzeros = static_cast<int32_t>(cx * cy * kDCTBlockSize) +
-                         GetLane(SumOfLanes(di, neg_sum_zero));
 
   // Stored prediction value is ceil(nzeros / covered_blocks), bounded by 63
   // (an AC block has at most kDCTBlockSize-1 nonzeros), so it fits in a byte.
@@ -115,32 +106,19 @@ int32_t NumNonZero8x8ExceptDC(const int32_t* JXL_RESTRICT block,
   // Add FF..FF for every zero coefficient, negate to get #zeros.
   auto neg_sum_zero = zero;
 
-  {
-    // First row has DC, so mask
-    const size_t y = 0;
-    HWY_ALIGN const int32_t dc_mask_lanes[kBlockDim] = {-1};
-
-    for (size_t x = 0; x < kBlockDim; x += Lanes(di)) {
-      const auto dc_mask = Load(di, dc_mask_lanes + x);
-
-      // DC counts as zero so we don't include it in nzeros.
-      const auto coef = AndNot(dc_mask, Load(di, &block[y * kBlockDim + x]));
-
-      neg_sum_zero = Add(neg_sum_zero, VecFromMask(di, Eq(coef, zero)));
-    }
-  }
-
-  // Remaining rows: no mask
-  for (size_t y = 1; y < kBlockDim; y++) {
+  // Count every coefficient uniformly — no DC mask, no first-row special case.
+  for (size_t y = 0; y < kBlockDim; y++) {
     for (size_t x = 0; x < kBlockDim; x += Lanes(di)) {
       const auto coef = Load(di, &block[y * kBlockDim + x]);
       neg_sum_zero = Add(neg_sum_zero, VecFromMask(di, Eq(coef, zero)));
     }
   }
 
-  // We want 64 - sum_zero, add because neg_sum_zero is already negated.
+  // 64 - #zeros counts all nonzeros incl. DC; subtract DC explicitly to get AC.
+  // Byte-exact with the old DC-masked count (AC_nz = all_nz - (DC!=0)).
   const int32_t nzeros = static_cast<int32_t>(kDCTBlockSize) +
-                         GetLane(SumOfLanes(di, neg_sum_zero));
+                         GetLane(SumOfLanes(di, neg_sum_zero)) -
+                         static_cast<int32_t>(block[0] != 0);
 
   // At most kDCTBlockSize-1 == 63 AC nonzeros in an 8x8 block, fits a byte.
   *nzeros_pos = static_cast<uint8_t>(nzeros);
