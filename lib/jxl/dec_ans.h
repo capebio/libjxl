@@ -374,7 +374,11 @@ class ANSSymbolReader {
   JXL_INLINE size_t
   ReadHybridUintInlined(size_t ctx, BitReader* JXL_RESTRICT br,
                         const std::vector<uint8_t>& context_map) {
-    return ReadHybridUintClustered<uses_lz77>(context_map[ctx], br);
+    // ReadHybridUintClustered is never inlined; routing through
+    // ReadHybridUintClusteredMaybeInlined inlines the common no-LZ77 path
+    // (the AC coefficient decode inner loop in dec_group.cc) while keeping the
+    // bulky LZ77 path out of line. Byte-exact: identical decode, inlining only.
+    return ReadHybridUintClusteredMaybeInlined<uses_lz77>(context_map[ctx], br);
   }
 
   // not inlined, for use in non-hot paths
