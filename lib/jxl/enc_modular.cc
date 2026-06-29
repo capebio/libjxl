@@ -557,6 +557,7 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
     }
   }
 
+  stream_images_.reserve(num_streams);
   for (size_t i = 0; i < num_streams; ++i) {
     stream_images_.emplace_back(memory_manager_);
   }
@@ -894,7 +895,14 @@ Status ModularFrameEncoder::ComputeEncodingData(
     int bits = eci.bit_depth.bits_per_sample;
     int exp_bits = eci.bit_depth.exponent_bits_per_sample;
     bool ec_fp = eci.bit_depth.floating_point_sample;
-    double factor = (ec_fp ? 1 : ((1u << eci.bit_depth.bits_per_sample) - 1));
+    // uint32 (or wider) integer extra channels are unsupported, mirroring the
+    // colour path's `uint32_t not supported` reject above. Guard before the
+    // shift: `1u << 32` is undefined behaviour and would otherwise yield a bogus
+    // conversion factor. Float extra channels (ec_fp) are unaffected.
+    if (!ec_fp && bits >= 32) {
+      return JXL_FAILURE("uint32_t extra channels not supported in enc_modular");
+    }
+    double factor = (ec_fp ? 1.0 : static_cast<double>((uint64_t{1} << bits) - 1));
     if (bits + (ec_fp ? 0 : 1) > max_bitdepth) {
       max_bitdepth = bits + (ec_fp ? 0 : 1);
     }
@@ -1039,6 +1047,7 @@ Status ModularFrameEncoder::ComputeEncodingData(
       bitdepth_correction = maxval / 255.f;
     }
     std::vector<float> quantizers;
+    quantizers.reserve(3 + extra_channels.size());
     for (size_t i = 0; i < 3; i++) {
       float dist = cparams_.butteraugli_distance;
       quantizers.push_back(quantizer * powf(dist, 1.2) * bitdepth_correction);
@@ -1083,6 +1092,12 @@ Status ModularFrameEncoder::ComputeEncodingData(
   }
 
   // Fill other groups.
+  // One stream per DC group, plus num_passes streams per AC group, plus the
+  // optional single-group Global stream; reserve once so the push_back loops
+  // below do not reallocate.
+  stream_params_.reserve(
+      patch_dim.num_dc_groups +
+      patch_dim.num_groups * enc_state->progressive_splitter.GetNumPasses() + 1);
   // DC
   for (size_t group_id = 0; group_id < patch_dim.num_dc_groups; group_id++) {
     const size_t rgx = group_id % patch_dim.xsize_dc_groups;
@@ -1125,20 +1140,36 @@ Status ModularFrameEncoder::ComputeEncodingData(
   }
   gi_channel_.resize(stream_images_.size());
 
-  const auto process_row = [&](const uint32_t i,
-                               size_t /* thread */) -> Status {
-    size_t stream = stream_params_[i].id.ID(frame_dim_);
-    if (stream != 0) {
-      stream_options_[stream] = stream_options_[0];
-    }
+  // Two phases. Phase 1 (parallel): every per-group stream (id != 0) copies its
+  // rectangle out of the immutable full image stream_images_[0]. Phase 2
+  // (serial): the single-group Global stream (id 0, present only when the whole
+  // frame is one group) runs its RCT/palette/WP search, which *mutates*
+  // stream_images_[0] and stream_options_[0]. Running that mutation inside the
+  // phase-1 fan-out raced the copies above and the concurrent
+  // `stream_options_[stream] = stream_options_[0]` reads — benign for output (the
+  // empty single-group per-group copies are discarded) but a real data race.
+  // Splitting is byte-exact and lets the global search use the thread pool;
+  // phase-1 group work passes nullptr to avoid nested-pool oversubscription.
+  const auto process_group = [&](const uint32_t i,
+                                 size_t /* thread */) -> Status {
+    const size_t stream = stream_params_[i].id.ID(frame_dim_);
+    if (stream == 0) return true;  // Global stream deferred to phase 2.
+    stream_options_[stream] = stream_options_[0];
     JXL_RETURN_IF_ERROR(PrepareStreamParams(
         stream_params_[i].rect, cparams_, stream_params_[i].minShift,
-        stream_params_[i].maxShift, stream_params_[i].id, do_color, groupwise));
+        stream_params_[i].maxShift, stream_params_[i].id, do_color, groupwise,
+        /*transform_pool=*/nullptr));
     return true;
   };
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, stream_params_.size(),
-                                ThreadPool::NoInit, process_row,
+                                ThreadPool::NoInit, process_group,
                                 "ChooseParams"));
+  for (const GroupParams& gp : stream_params_) {
+    if (gp.id.ID(frame_dim_) != 0) continue;
+    JXL_RETURN_IF_ERROR(PrepareStreamParams(gp.rect, cparams_, gp.minShift,
+                                            gp.maxShift, gp.id, do_color,
+                                            groupwise, /*transform_pool=*/pool));
+  }
   {
     // Clear out channels that have been copied to groups.
     Image& full_image = stream_images_[0];
@@ -1456,7 +1487,8 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
                                                 const CompressParams& cparams,
                                                 int minShift, int maxShift,
                                                 const ModularStreamId& stream,
-                                                bool do_color, bool groupwise) {
+                                                bool do_color, bool groupwise,
+                                                ThreadPool* transform_pool) {
   size_t stream_id = stream.ID(frame_dim_);
   if (stream_id == 0 && frame_dim_.num_groups != 1) {
     // If we have multiple groups, then the stream with ID 0 holds the full
@@ -1483,6 +1515,11 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
     // At most one group channel per remaining full-image channel; reserve once
     // instead of growing both vectors per push_back across every group/pass.
     const size_t max_group_channels = full_image.channel.size() - c;
+    // Clear before appending: on encoder reuse (ClearModularStreamData releases
+    // images and stream_params_ but not gi_channel_) this stream's mapping could
+    // still hold stale channel indices, and the loop below only push_back's. A
+    // no-op for the normal single-use path (resize() default-constructed it empty).
+    gi_channel_[stream_id].clear();
     gi_channel_[stream_id].reserve(max_group_channels);
     gi.channel.reserve(max_group_channels);
     for (; c < full_image.channel.size(); c++) {
@@ -1586,7 +1623,7 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
         std::array<Channel*, 3> out = {&gi.channel[gi.nb_meta_channels + 0],
                                        &gi.channel[gi.nb_meta_channels + 1],
                                        &gi.channel[gi.nb_meta_channels + 2]};
-        JXL_RETURN_IF_ERROR(FwdRct(in, out, rct_type, /* pool */ nullptr));
+        JXL_RETURN_IF_ERROR(FwdRct(in, out, rct_type, transform_pool));
         JXL_ASSIGN_OR_RETURN(float cost, EstimateCost(gi));
         if (cost < best_cost) {
           best_rct = rct_type;
@@ -1604,7 +1641,7 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
       Transform sg(TransformId::kRCT);
       sg.begin_c = gi.nb_meta_channels;
       sg.rct_type = best_rct;
-      do_transform(gi, sg, weighted::Header());
+      do_transform(gi, sg, weighted::Header(), transform_pool);
     }
   } else {
     // No need to try anything, just use the default options.
@@ -1848,24 +1885,33 @@ Status ModularFrameEncoder::AddACMetadata(const Rect& r, size_t group_index,
   }
   stream_options_[stream_id].histogram_params =
       stream_options_[0].histogram_params;
-  // YToX, YToB, ACS + QF, EPF
+  // YToX, YToB, ACS + QF, EPF. Build the image with zero channels and append
+  // each at its exact final size. The previous form created four full-resolution
+  // (r.xsize()*r.ysize()) planes via Image::Create(...,4), then immediately
+  // discarded three of them: channels 0/1 are color-tile resolution and channel
+  // 2 holds one entry per first-block — wasting three full-size allocations per
+  // AC-metadata group. Only channel 3 (EPF) is full resolution. Byte-exact: same
+  // channels, sizes, shifts and contents; channel 3 is given component==3 to
+  // match the old Image::Create(...,4) layout (channels 0..2 were reassigned to
+  // fresh Channel::Create's, which default component to -1).
   Image& image = stream_images_[stream_id];
   JXL_ASSIGN_OR_RETURN(
-      image, Image::Create(memory_manager, r.xsize(), r.ysize(), 8, 4));
+      image, Image::Create(memory_manager, r.xsize(), r.ysize(), 8, 0));
   static_assert(kColorTileDimInBlocks == 8, "Color tile size changed");
   Rect cr(r.x0() >> 3, r.y0() >> 3, (r.xsize() + 7) >> 3, (r.ysize() + 7) >> 3);
-  JXL_ASSIGN_OR_RETURN(
-      image.channel[0],
-      Channel::Create(memory_manager, cr.xsize(), cr.ysize(), 3, 3));
-  JXL_ASSIGN_OR_RETURN(
-      image.channel[1],
-      Channel::Create(memory_manager, cr.xsize(), cr.ysize(), 3, 3));
+  image.channel.reserve(4);
+  {
+    JXL_ASSIGN_OR_RETURN(
+        Channel ytox,
+        Channel::Create(memory_manager, cr.xsize(), cr.ysize(), 3, 3));
+    image.channel.emplace_back(std::move(ytox));
+    JXL_ASSIGN_OR_RETURN(
+        Channel ytob,
+        Channel::Create(memory_manager, cr.xsize(), cr.ysize(), 3, 3));
+    image.channel.emplace_back(std::move(ytob));
+  }
   // Channel 2 (ACS + QF) holds one entry per first-block, not one per block
-  // position. Count the first blocks up front and size the channel exactly,
-  // rather than allocating a full r.xsize()*r.ysize() plane and later shrinking
-  // its logical width — that backing store is oversized whenever the group uses
-  // any transform larger than 8x8. Byte-exact: only entries [0, num) are ever
-  // read, and they are written identically below.
+  // position. Count the first blocks up front and size the channel exactly.
   size_t num = 0;
   for (size_t y = 0; y < r.ysize(); y++) {
     AcStrategyRow row_acs = enc_state->shared.ac_strategy.ConstRow(r, y);
@@ -1873,8 +1919,15 @@ Status ModularFrameEncoder::AddACMetadata(const Rect& r, size_t group_index,
       num += row_acs[x].IsFirstBlock() ? 1 : 0;
     }
   }
-  JXL_ASSIGN_OR_RETURN(image.channel[2],
-                       Channel::Create(memory_manager, num, 2, 0, 0));
+  {
+    JXL_ASSIGN_OR_RETURN(Channel acs_qf,
+                         Channel::Create(memory_manager, num, 2, 0, 0));
+    image.channel.emplace_back(std::move(acs_qf));
+    JXL_ASSIGN_OR_RETURN(
+        Channel epf, Channel::Create(memory_manager, r.xsize(), r.ysize()));
+    image.channel.emplace_back(std::move(epf));
+    image.channel[3].component = 3;
+  }
   JXL_RETURN_IF_ERROR(ConvertPlaneAndClamp(cr, enc_state->shared.cmap.ytox_map,
                                            Rect(image.channel[0].plane),
                                            &image.channel[0].plane));

@@ -100,10 +100,13 @@ class ModularFrameEncoder {
   Status Init(const FrameHeader& frame_header,
               const CompressParams& cparams_orig, bool streaming_mode);
 
+  // `transform_pool` is used for the single-group Global stream's RCT/WP search
+  // (race-free phase 2 in ComputeEncodingData). Per-group preparation passes
+  // nullptr to avoid nested-pool oversubscription inside the parallel fan-out.
   Status PrepareStreamParams(const Rect& rect, const CompressParams& cparams,
                              int minShift, int maxShift,
                              const ModularStreamId& stream, bool do_color,
-                             bool groupwise);
+                             bool groupwise, ThreadPool* transform_pool = nullptr);
   // Frees a stream's source image planes (swap-with-empty). Used to release the
   // per-stream images as soon as ComputeTokens has tokenized them — the rest of
   // encoding (EncodeGlobalInfo + EncodeStream) needs only tokens_/headers_/code_.
