@@ -137,18 +137,25 @@ Status MergeTrees(const std::vector<Tree>& trees,
   return true;
 }
 
-void QuantizeChannel(Channel& ch, const int q) {
-  if (q == 1) return;
-  for (size_t y = 0; y < ch.plane.ysize(); y++) {
-    pixel_type* row = ch.plane.Row(y);
-    for (size_t x = 0; x < ch.plane.xsize(); x++) {
+// Rows are independent, so quantization parallelizes cleanly. Byte-exact: each
+// pixel's result depends only on itself and `q`. A null pool runs serially,
+// matching the previous behavior exactly.
+Status QuantizeChannel(Channel& ch, const int q, ThreadPool* pool = nullptr) {
+  if (q == 1) return true;
+  const size_t xsize = ch.plane.xsize();
+  const auto process_row = [&](const uint32_t y, size_t /* thread */) -> Status {
+    pixel_type* JXL_RESTRICT row = ch.plane.Row(y);
+    for (size_t x = 0; x < xsize; x++) {
       if (row[x] < 0) {
         row[x] = -((-row[x] + q / 2) / q) * q;
       } else {
         row[x] = ((row[x] + q / 2) / q) * q;
       }
     }
-  }
+    return true;
+  };
+  return RunOnPool(pool, 0, ch.plane.ysize(), ThreadPool::NoInit, process_row,
+                   "QuantizeChannel");
 }
 
 // convert binary32 float that corresponds to custom [bits]-bit float (with
@@ -234,23 +241,51 @@ Status float_to_int(const float* const row_in, pixel_type* const row_out,
   return true;
 }
 
-float EstimateWPCost(const Image& img, size_t i) {
+// Maps a weighted-predictor cost property to one of 34 histogram contexts. The
+// original inner loop counted, per pixel, how many of these 33 cutoffs are
+// >= the property — a monotone step function of the property. Precompute it once
+// into a [-500, 500] lookup table (clamped at the ends) so the 33 comparisons
+// drop out of the hot loop. Byte-identical context for every property value.
+constexpr int32_t kWPCostMinProperty = -500;
+constexpr int32_t kWPCostMaxProperty = 500;
+constexpr size_t kNumWPCostContexts = 34;  // 33 cutoffs + 1
+
+const std::array<uint8_t, 1001>& WPCostContextMap() {
+  static const std::array<uint8_t, 1001> kMap = [] {
+    const int32_t cutoffs[] = {-500, -392, -255, -191, -127, -95, -63, -47, -31,
+                               -23,  -15,  -11,  -7,   -4,   -3,  -1,  0,   1,
+                               3,    5,    7,    11,   15,   23,  31,  47,  63,
+                               95,   127,  191,  255,  392,  500};
+    std::array<uint8_t, 1001> m = {};
+    for (size_t k = 0; k < m.size(); ++k) {
+      const int32_t property = static_cast<int32_t>(k) + kWPCostMinProperty;
+      uint8_t ctx = 0;
+      for (const int32_t c : cutoffs) ctx += (c >= property) ? 1 : 0;
+      m[k] = ctx;
+    }
+    return m;
+  }();
+  return kMap;
+}
+
+JXL_INLINE size_t WPCostContext(const int32_t property) {
+  if (property <= kWPCostMinProperty) return kNumWPCostContexts - 1;  // all 33
+  if (property > kWPCostMaxProperty) return 0;
+  return WPCostContextMap()[property - kWPCostMinProperty];
+}
+
+float EstimateWPCost(const Image& img, size_t i,
+                     float upper_bound = std::numeric_limits<float>::max()) {
   size_t extra_bits = 0;
   float histo_cost = 0;
   HybridUintConfig config;
-  int32_t cutoffs[] = {-500, -392, -255, -191, -127, -95, -63, -47, -31,
-                       -23,  -15,  -11,  -7,   -4,   -3,  -1,  0,   1,
-                       3,    5,    7,    11,   15,   23,  31,  47,  63,
-                       95,   127,  191,  255,  392,  500};
-  constexpr size_t nc = sizeof(cutoffs) / sizeof(*cutoffs) + 1;
-  Histogram histo[nc] = {};
+  Histogram histo[kNumWPCostContexts] = {};
   weighted::Header wp_header;
   PredictorMode(i, &wp_header);
   for (const Channel& ch : img.channel) {
     const ptrdiff_t onerow = ch.plane.PixelsPerRow();
     weighted::State wp_state(wp_header, ch.w, ch.h);
     Properties properties(1);
-    bool unhealthy = false;
     for (size_t y = 0; y < ch.h; y++) {
       const pixel_type* JXL_RESTRICT r = ch.Row(y);
       for (size_t x = 0; x < ch.w; x++) {
@@ -264,12 +299,12 @@ float EstimateWPCost(const Image& img, size_t i) {
         pixel_type guess = wp_state.Predict</*compute_properties=*/true>(
             x, y, ch.w, top, left, topright, topleft, toptop, &properties,
             offset);
-        size_t ctx = 0;
-        for (int c : cutoffs) {
-          ctx += (c >= properties[0]) ? 1 : 0;
-        }
+        size_t ctx = WPCostContext(properties[0]);
         pixel_type res;
-        unhealthy |= SubOverflow(r[x], guess, res);
+        if (JXL_UNLIKELY(SubOverflow(r[x], guess, res))) {
+          // Force this predictor option to be rejected by the cost selector.
+          return std::numeric_limits<float>::max();
+        }
         uint32_t token;
         uint32_t nbits;
         uint32_t bits;
@@ -279,13 +314,16 @@ float EstimateWPCost(const Image& img, size_t i) {
         wp_state.UpdateErrors(r[x], x, y, ch.w);
       }
     }
-    if (unhealthy) {
-      // Force this predictor option to be rejected by the cost selector.
-      return std::numeric_limits<float>::max();
-    }
     for (auto& h : histo) {
       histo_cost += h.ShannonEntropy();
       h.Clear();
+    }
+    // Cost is monotone non-decreasing across channels, so a candidate that has
+    // already exceeded the incumbent best cannot win — stop scoring it. The
+    // selected mode always runs to completion (its bound is never tripped), so
+    // the chosen wp_mode is unchanged.
+    if (histo_cost + static_cast<float>(extra_bits) >= upper_bound) {
+      return upper_bound;
     }
   }
   return histo_cost + extra_bits;
@@ -794,16 +832,27 @@ Status ModularFrameEncoder::ComputeEncodingData(
         factor = enc_state->shared.matrices.InvDCQuant(c);
       if (c == 2 && cparams_.color_transform == ColorTransform::kXYB) {
         JXL_ENSURE(!fp);
-        for (size_t y = 0; y < ysize; ++y) {
-          const float* const JXL_RESTRICT row_in = color->PlaneRow(c, y);
+        // Match the Y/X and extra-channel paths: read through group_rect and run
+        // row-parallel. B-Y was the only colour plane that ignored group_rect
+        // (a latent crop bug for grouped/streaming input) and ran serially. Rows
+        // are independent, and gi.channel[0] (Y) is fully written by the earlier
+        // c iteration. Byte-exact for the full-frame path (group_rect at origin).
+        const auto process_row = [&](const int task,
+                                     const int thread) -> Status {
+          const size_t y = task;
+          const float* const JXL_RESTRICT row_in =
+              color->PlaneRow(c, y + group_rect.y0()) + group_rect.x0();
           pixel_type* const JXL_RESTRICT row_out = gi.channel[c_out].Row(y);
-          pixel_type* const JXL_RESTRICT row_Y = gi.channel[0].Row(y);
+          const pixel_type* const JXL_RESTRICT row_Y = gi.channel[0].Row(y);
           for (size_t x = 0; x < xsize; ++x) {
             // TODO(eustas): check if std::roundf is appropriate
             row_out[x] = row_in[x] * factor + 0.5f;
             row_out[x] -= row_Y[x];
           }
-        }
+          return true;
+        };
+        JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, ysize, ThreadPool::NoInit,
+                                      process_row, "xyb_b_minus_y"));
       } else {
         int bits = metadata.bit_depth.bits_per_sample;
         int exp_bits = metadata.bit_depth.exponent_bits_per_sample;
@@ -1028,7 +1077,7 @@ Status ModularFrameEncoder::ComputeEncodingData(
         }
       }
       if (q < 1) q = 1;
-      QuantizeChannel(gi.channel[i], q);
+      JXL_RETURN_IF_ERROR(QuantizeChannel(gi.channel[i], q, pool));
       quants_[i] = q;
     }
   }
@@ -1146,24 +1195,30 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
       }
     }
     // Merge group+channel settings that have the same channels and quantization
-    // factors, to avoid unnecessary nodes.
-    std::sort(multiplier_info.begin(), multiplier_info.end(),
-              [](ModularMultiplierInfo a, ModularMultiplierInfo b) {
-                return std::make_tuple(a.range, a.multiplier) <
-                       std::make_tuple(b.range, b.multiplier);
-              });
-    size_t new_num = 1;
-    for (size_t i = 1; i < multiplier_info.size(); i++) {
-      ModularMultiplierInfo& prev = multiplier_info[new_num - 1];
-      ModularMultiplierInfo& cur = multiplier_info[i];
-      if (prev.range[0] == cur.range[0] && prev.multiplier == cur.multiplier &&
-          prev.range[1][1] == cur.range[1][0]) {
-        prev.range[1][1] = cur.range[1][1];
-      } else {
-        multiplier_info[new_num++] = multiplier_info[i];
+    // factors, to avoid unnecessary nodes. Guard against an empty list: the
+    // `new_num = 1` / `resize(new_num)` compaction would otherwise materialize a
+    // bogus default-constructed ModularMultiplierInfo when no eligible channel
+    // contributed (quants_ non-empty but every stream skipped).
+    if (!multiplier_info.empty()) {
+      std::sort(multiplier_info.begin(), multiplier_info.end(),
+                [](const ModularMultiplierInfo& a,
+                   const ModularMultiplierInfo& b) {
+                  return std::make_tuple(a.range, a.multiplier) <
+                         std::make_tuple(b.range, b.multiplier);
+                });
+      size_t new_num = 1;
+      for (size_t i = 1; i < multiplier_info.size(); i++) {
+        ModularMultiplierInfo& prev = multiplier_info[new_num - 1];
+        ModularMultiplierInfo& cur = multiplier_info[i];
+        if (prev.range[0] == cur.range[0] && prev.multiplier == cur.multiplier &&
+            prev.range[1][1] == cur.range[1][0]) {
+          prev.range[1][1] = cur.range[1][1];
+        } else {
+          multiplier_info[new_num++] = multiplier_info[i];
+        }
       }
+      multiplier_info.resize(new_num);
     }
-    multiplier_info.resize(new_num);
   }
 
   if (!cparams_.custom_fixed_tree.empty()) {
@@ -1221,6 +1276,12 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
                                   ThreadPool::NoInit, process_chunk,
                                   "LearnTrees"));
     tree_.clear();
+    // MergeTrees concatenates every learned tree plus one decision node per
+    // internal split; reserve the exact final node count so the recursion does
+    // not repeatedly grow tree_.
+    size_t total_tree_nodes = 0;
+    for (const Tree& t : trees) total_tree_nodes += t.size();
+    tree_.reserve(total_tree_nodes + (trees.empty() ? 0 : trees.size() - 1));
     JXL_RETURN_IF_ERROR(
         MergeTrees(trees, useful_splits, 0, useful_splits.size() - 1, &tree_));
   } else {
@@ -1398,6 +1459,11 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
         if (fc.w > frame_dim_.group_dim || fc.h > frame_dim_.group_dim) break;
       }
     }
+    // At most one group channel per remaining full-image channel; reserve once
+    // instead of growing both vectors per push_back across every group/pass.
+    const size_t max_group_channels = full_image.channel.size() - c;
+    gi_channel_[stream_id].reserve(max_group_channels);
+    gi.channel.reserve(max_group_channels);
     for (; c < full_image.channel.size(); c++) {
       Channel& fc = full_image.channel[c];
       int shift = std::min(fc.hshift, fc.vshift);
@@ -1533,7 +1599,7 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
     float best_cost = std::numeric_limits<float>::max();
     stream_options_[stream_id].wp_mode = 0;
     for (size_t i = 0; i < nb_wp_modes; i++) {
-      float cost = EstimateWPCost(gi, i);
+      float cost = EstimateWPCost(gi, i, best_cost);
       if (cost < best_cost) {
         best_cost = cost;
         stream_options_[stream_id].wp_mode = i;
@@ -1773,16 +1839,28 @@ Status ModularFrameEncoder::AddACMetadata(const Rect& r, size_t group_index,
   JXL_ASSIGN_OR_RETURN(
       image.channel[1],
       Channel::Create(memory_manager, cr.xsize(), cr.ysize(), 3, 3));
-  JXL_ASSIGN_OR_RETURN(
-      image.channel[2],
-      Channel::Create(memory_manager, r.xsize() * r.ysize(), 2, 0, 0));
+  // Channel 2 (ACS + QF) holds one entry per first-block, not one per block
+  // position. Count the first blocks up front and size the channel exactly,
+  // rather than allocating a full r.xsize()*r.ysize() plane and later shrinking
+  // its logical width — that backing store is oversized whenever the group uses
+  // any transform larger than 8x8. Byte-exact: only entries [0, num) are ever
+  // read, and they are written identically below.
+  size_t num = 0;
+  for (size_t y = 0; y < r.ysize(); y++) {
+    AcStrategyRow row_acs = enc_state->shared.ac_strategy.ConstRow(r, y);
+    for (size_t x = 0; x < r.xsize(); x++) {
+      num += row_acs[x].IsFirstBlock() ? 1 : 0;
+    }
+  }
+  JXL_ASSIGN_OR_RETURN(image.channel[2],
+                       Channel::Create(memory_manager, num, 2, 0, 0));
   JXL_RETURN_IF_ERROR(ConvertPlaneAndClamp(cr, enc_state->shared.cmap.ytox_map,
                                            Rect(image.channel[0].plane),
                                            &image.channel[0].plane));
   JXL_RETURN_IF_ERROR(ConvertPlaneAndClamp(cr, enc_state->shared.cmap.ytob_map,
                                            Rect(image.channel[1].plane),
                                            &image.channel[1].plane));
-  size_t num = 0;
+  size_t pos = 0;
   for (size_t y = 0; y < r.ysize(); y++) {
     AcStrategyRow row_acs = enc_state->shared.ac_strategy.ConstRow(r, y);
     const int32_t* row_qf = r.ConstRow(enc_state->shared.raw_quant_field, y);
@@ -1793,12 +1871,12 @@ Status ModularFrameEncoder::AddACMetadata(const Rect& r, size_t group_index,
     for (size_t x = 0; x < r.xsize(); x++) {
       row_out_epf[x] = row_epf[x];
       if (!row_acs[x].IsFirstBlock()) continue;
-      out_acs[num] = row_acs[x].RawStrategy();
-      out_qf[num] = row_qf[x] - 1;
-      num++;
+      out_acs[pos] = row_acs[x].RawStrategy();
+      out_qf[pos] = row_qf[x] - 1;
+      pos++;
     }
   }
-  image.channel[2].w = num;
+  JXL_ENSURE(pos == num);
   ac_metadata_size[group_index] = num;
   return true;
 }

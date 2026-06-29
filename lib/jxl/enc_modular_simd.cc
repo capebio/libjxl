@@ -11,6 +11,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/compiler_specific.h"
@@ -152,7 +153,16 @@ StatusOr<float> EstimateCost(const Image& img) {
   // size_t accumulator periodically so the running per-lane sum stays small.
   auto extra_bits_lanes = Zero(du);
   uint32_t vectors_since_flush = 0;
-  constexpr uint32_t kExtraBitsFlushPeriod = 1u << 12;
+  // Each lane adds at most ~32 extra bits per vector (token nbits <= 31), and the
+  // final SumOfLanes folds all `Lanes(du)` lanes into one uint32 accumulator.
+  // Flush before `Lanes * period * kMaxExtraBitsPerLane` can wrap 2^32 — derived
+  // from the actual lane count instead of the old fixed 4096, which forced a
+  // SumOfLanes reduction every 4096 vectors on large/high-entropy rows. Byte-exact:
+  // the running total is identical, only the flush cadence changes.
+  constexpr uint32_t kMaxExtraBitsPerLane = 32;
+  const uint32_t kExtraBitsFlushPeriod = static_cast<uint32_t>(
+      std::numeric_limits<uint32_t>::max() /
+      (kMaxExtraBitsPerLane * Lanes(du)));
   const auto FlushExtraBits = [&] {
     extra_bits += static_cast<size_t>(GetLane(SumOfLanes(du, extra_bits_lanes)));
     extra_bits_lanes = Zero(du);
