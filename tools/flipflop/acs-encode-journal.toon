@@ -1,0 +1,86 @@
+=== flipflop 2026-06-29T03:54:31Z acs-encode-prune ===
+schema: flipflop/v1
+ts: "2026-06-29T03:54:31Z"
+name: acs-encode-prune
+description: "cjxl full encode e7 d1: enc_ac_strategy OLD vs scratch+prune NEW (byte-exact)"
+first_paint_of_day: true
+env:
+  commit: 6cda6c21
+  host: DESKTOP-UKOTMMU
+  cpu: Intel(R) Core(TM) i7-10850H CPU @ 2.70GHz
+  cores: 12
+  node: v24.14.0
+  gc_exposed: true
+  os: win32-x64
+config:
+  variants: "old-main,new-scratch-prune"
+  baseline: old-main
+  timing_mode: sync
+  input_source: corpus()
+  rounds: default
+  min_sample_ms: 2
+  sampler_ms: 500
+summary[6]{input,variant,role,median_warm_ms,median_all_ms,min_ms,stdev_ms,saved_pct,quality,quality_ok,trust}:
+  torture,old-main,primary,323.445,330.916,311.038,30.76,0,n/a,true,high
+  torture,new-scratch-prune,primary,324.389,331.659,295.983,35.389,-0.3,n/a,true,low
+  hdr_room,old-main,primary,218.109,217.862,199.82,24.022,0,n/a,true,low
+  hdr_room,new-scratch-prune,primary,205.7,205.166,194.852,5.562,5.7,n/a,true,high
+  splines,old-main,primary,491.752,505.447,459.381,174.645,0,n/a,true,low
+  splines,new-scratch-prune,primary,478.515,496.341,436.244,172.98,2.7,n/a,true,low
+flips[48]{input,round,variant,ms,rss_mb,delta_rss_mb,delta_heap_mb,delta_wasm_mb,temp_c,freq_ratio,first_paint}:
+  torture,0,old-main,487.822,65.6,0.1,0.1,n/a,n/a,n/a,true
+  torture,0,new-scratch-prune,418.681,65.8,0.1,0.1,n/a,n/a,n/a,true
+  torture,1,new-scratch-prune,354.315,65.9,0.1,0.2,n/a,n/a,n/a,false
+  torture,1,old-main,314.033,66.1,0.1,0.2,n/a,n/a,n/a,false
+  torture,2,old-main,311.038,66.2,0.1,0.2,n/a,n/a,n/a,false
+  torture,2,new-scratch-prune,403.026,66.1,0,0.2,n/a,n/a,n/a,false
+  torture,3,new-scratch-prune,338.928,66.1,0.3,0.2,n/a,n/a,n/a,false
+  torture,3,old-main,396.667,66.1,0.3,0.2,n/a,n/a,n/a,false
+  torture,4,old-main,357.365,66.2,0.1,0.2,n/a,n/a,n/a,false
+  torture,4,new-scratch-prune,324.389,66.2,0,0.1,n/a,n/a,n/a,false
+  torture,5,new-scratch-prune,295.983,66.1,0.2,0.1,n/a,n/a,n/a,false
+  torture,5,old-main,338.388,66.2,0,0.1,n/a,n/a,n/a,false
+  torture,6,old-main,323.445,66.2,0,0.1,n/a,n/a,n/a,false
+  torture,6,new-scratch-prune,310.539,66.2,0,0.1,n/a,n/a,n/a,false
+  torture,7,new-scratch-prune,318.712,66.2,0,0.1,n/a,n/a,n/a,false
+  torture,7,old-main,319.244,66.1,-0.1,0.1,n/a,n/a,n/a,false
+  hdr_room,0,old-main,199.82,65.3,-2.5,0.1,n/a,n/a,n/a,true
+  hdr_room,0,new-scratch-prune,194.852,65.1,0.2,0.1,n/a,n/a,n/a,true
+  hdr_room,1,new-scratch-prune,205.7,65.1,0,0.1,n/a,n/a,n/a,false
+  hdr_room,1,old-main,215.173,65.2,0.1,0.1,n/a,n/a,n/a,false
+  hdr_room,2,old-main,203.549,65.2,0,0.1,n/a,n/a,n/a,false
+  hdr_room,2,new-scratch-prune,201.601,65.2,0,0.1,n/a,n/a,n/a,false
+  hdr_room,3,new-scratch-prune,209.24,65.2,0,0.1,n/a,n/a,n/a,false
+  hdr_room,3,old-main,218.109,65.2,0,0.1,n/a,n/a,n/a,false
+  hdr_room,4,old-main,217.614,65.2,0,0.1,n/a,n/a,n/a,false
+  hdr_room,4,new-scratch-prune,211.18,65.2,0,0.1,n/a,n/a,n/a,false
+  hdr_room,5,new-scratch-prune,204.632,65.2,0,0.1,n/a,n/a,n/a,false
+  hdr_room,5,old-main,225.18,65.2,0,0.1,n/a,n/a,n/a,false
+  hdr_room,6,old-main,262.938,65.2,0,0.1,n/a,n/a,n/a,false
+  hdr_room,6,new-scratch-prune,199.874,65.2,0,0.1,n/a,n/a,n/a,false
+  hdr_room,7,new-scratch-prune,215.72,65.2,0,0.1,n/a,n/a,n/a,false
+  hdr_room,7,old-main,263.792,65.3,0.1,0.1,n/a,n/a,n/a,false
+  splines,0,old-main,803.619,67.3,-3.6,0.1,n/a,n/a,n/a,true
+  splines,0,new-scratch-prune,943.391,67.3,0,0.1,n/a,n/a,n/a,true
+  splines,1,new-scratch-prune,924.526,67.3,0,0.1,n/a,n/a,n/a,false
+  splines,1,old-main,949.194,67.3,0,0.1,n/a,n/a,n/a,false
+  splines,2,old-main,617.705,67.3,0,0.1,n/a,n/a,n/a,false
+  splines,2,new-scratch-prune,514.168,67.3,0,0.1,n/a,n/a,n/a,false
+  splines,3,new-scratch-prune,547.021,67.3,0,0.1,n/a,n/a,n/a,false
+  splines,3,old-main,484.664,67.3,0,0.1,n/a,n/a,n/a,false
+  splines,4,old-main,491.752,67.3,0,0.1,n/a,n/a,n/a,false
+  splines,4,new-scratch-prune,478.515,67.1,-0.2,0.1,n/a,n/a,n/a,false
+  splines,5,new-scratch-prune,444.078,67.2,0,0.1,n/a,n/a,n/a,false
+  splines,5,old-main,459.381,67.2,0,0.1,n/a,n/a,n/a,false
+  splines,6,old-main,519.141,67.2,0,0.1,n/a,n/a,n/a,false
+  splines,6,new-scratch-prune,436.244,67.4,0.2,0.2,n/a,n/a,n/a,false
+  splines,7,new-scratch-prune,454.786,67.4,0,0.1,n/a,n/a,n/a,false
+  splines,7,old-main,476.598,67.4,0,0.1,n/a,n/a,n/a,false
+thermal:
+  temp_c_start: n/a
+  temp_c_end: n/a
+  temp_c_max: n/a
+  freq_ratio_min: n/a
+  throttled: unknown
+  variance_flag: true
+verdict: "new-scratch-prune 2.7% faster vs old-main (geomean median_warm); thermal unknown; trust:low"
