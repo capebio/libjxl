@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -94,11 +95,12 @@ class Separable5Impl {
         case 1:
           RunRows<1>();
           break;
-        case 2:
-          RunRows<2>();
-          break;
         default:
-          RunRows<3>();
+          // kSizeModN >= kRadius all behave identically: the last-vector path is
+          // guarded by `kSizeModN < kRadius`, so only the scalar tail differs and
+          // it is driven by the runtime `xsize`, not the template value. Collapse
+          // them to a single RunRows<2> to avoid a redundant specialization.
+          RunRows<2>();
           break;
       }
       return true;
@@ -270,14 +272,152 @@ class Separable5Impl {
     }
   }
 
+  // Number of output rows a single pool task convolves as one vertical band.
+  // A band reuses horizontal convolutions across its rows via a rolling ring
+  // (see RingColumn), so it computes `band + 4` horizontal convolutions per
+  // column instead of `5 * band`. Larger bands amortize the 4-row halo better
+  // but expose fewer parallel tasks; 8 balances reuse against parallelism.
+  static constexpr size_t kRowsPerBand = 8;
+
+  // Picks the horizontal convolution variant for a column region at compile
+  // time. kRegion: 0 = first (left border), 1 = interior, 2 = last full vector.
+  // The branches fold away because kRegion is a template constant.
+  template <size_t kSizeModN, int kRegion>
+  static JXL_MAYBE_INLINE V HorzPick(const float* const JXL_RESTRICT row,
+                                     const int64_t x, const int64_t xsize,
+                                     const V wh0, const V wh1, const V wh2,
+                                     const I ml1, const I ml2) {
+    if (kRegion == 0) {
+      return HorzConvolveFirst(row, x, xsize, wh0, wh1, wh2);
+    }
+    if (kRegion == 2) {
+      return HorzConvolveLast<kSizeModN>(row, x, xsize, wh0, wh1, wh2, ml1, ml2);
+    }
+    (void)ml1;
+    (void)ml2;
+    (void)xsize;
+    return HorzConvolve(row + x, wh0, wh1, wh2);
+  }
+
+  // Convolves a single SIMD column for every output row in [y0, y1) using a
+  // rolling ring of the five horizontal convolutions. Each step rotates the ring
+  // and computes exactly one new horizontal convolution (the incoming bottom
+  // row), reusing the other four. The per-pixel vertical accumulation is the
+  // identical FMA sequence used by ConvolveRow, so the output is byte-exact.
+  template <size_t kSizeModN, int kRegion>
+  JXL_MAYBE_INLINE void RingColumn(const size_t y0, const size_t y1,
+                                   const int64_t x, const V wh0, const V wh1,
+                                   const V wh2, const V wv0, const V wv1,
+                                   const V wv2, const I ml1, const I ml2) const {
+    const D d;
+    const int64_t stride = in->PixelsPerRow();
+    const int64_t xsize = rect.xsize();
+    const float* const JXL_RESTRICT base = rect.ConstRow(*in, y0);
+    const float* JXL_RESTRICT r_in = base + 2 * stride;
+
+    V h0 = HorzPick<kSizeModN, kRegion>(base - 2 * stride, x, xsize, wh0, wh1,
+                                        wh2, ml1, ml2);
+    V h1 = HorzPick<kSizeModN, kRegion>(base - 1 * stride, x, xsize, wh0, wh1,
+                                        wh2, ml1, ml2);
+    V h2 = HorzPick<kSizeModN, kRegion>(base, x, xsize, wh0, wh1, wh2, ml1, ml2);
+    V h3 = HorzPick<kSizeModN, kRegion>(base + 1 * stride, x, xsize, wh0, wh1,
+                                        wh2, ml1, ml2);
+    V h4 = HorzPick<kSizeModN, kRegion>(r_in, x, xsize, wh0, wh1, wh2, ml1, ml2);
+
+    for (size_t y = y0;; ++y) {
+      const V conv0 = Mul(h2, wv0);
+      const V conv1 = MulAdd(Add(h1, h3), wv1, conv0);
+      const V conv2 = MulAdd(Add(h0, h4), wv2, conv1);
+      Store(conv2, d, out->Row(y) + x);
+      if (y + 1 == y1) break;
+      r_in += stride;
+      h0 = h1;
+      h1 = h2;
+      h2 = h3;
+      h3 = h4;
+      h4 = HorzPick<kSizeModN, kRegion>(r_in, x, xsize, wh0, wh1, wh2, ml1, ml2);
+    }
+  }
+
+  // Convolves a contiguous band of interior output rows [y0, y1). Walks columns
+  // left-to-right (first / interior / last vector, then scalar tail), running a
+  // vertical rolling ring down the band for each SIMD column.
+  template <size_t kSizeModN>
+  JXL_INLINE void ConvolveInteriorBand(const size_t y0, const size_t y1) {
+    const D d;
+    const int64_t N = Lanes(d);
+    const int64_t xsize = rect.xsize();
+
+    const V wh0 = LoadDup128(d, weights->horz + 0 * 4);
+    const V wh1 = LoadDup128(d, weights->horz + 1 * 4);
+    const V wh2 = LoadDup128(d, weights->horz + 2 * 4);
+    const V wv0 = LoadDup128(d, weights->vert + 0 * 4);
+    const V wv1 = LoadDup128(d, weights->vert + 1 * 4);
+    const V wv2 = LoadDup128(d, weights->vert + 2 * 4);
+    const I ml1 = MirrorLanes<1>();
+    const I ml2 = MirrorLanes<2>();
+
+    int64_t x = 0;
+
+    // First vector(s): mirrored left border.
+    for (; x < kRadius; x += N) {
+      RingColumn<kSizeModN, 0>(y0, y1, x, wh0, wh1, wh2, wv0, wv1, wv2, ml1,
+                               ml2);
+    }
+
+    // Interior vectors: no padding needed.
+    for (; x + N + kRadius <= xsize; x += N) {
+      RingColumn<kSizeModN, 1>(y0, y1, x, wh0, wh1, wh2, wv0, wv1, wv2, ml1,
+                               ml2);
+    }
+
+    // Last full vector (mirrored right border), if it is not already covered.
+    if (kSizeModN < kRadius) {
+      RingColumn<kSizeModN, 2>(y0, y1, x, wh0, wh1, wh2, wv0, wv1, wv2, ml1,
+                               ml2);
+      x += N;
+    }
+
+    // Scalar remainder: identical 25-term accumulation order to ConvolveRow.
+    if (kSizeModN != 0) {
+      const int64_t stride = in->PixelsPerRow();
+      for (size_t y = y0; y < y1; ++y) {
+        const float* const JXL_RESTRICT row_m = rect.ConstRow(*in, y);
+        const float* const JXL_RESTRICT rows[5] = {
+            row_m - 2 * stride, row_m - 1 * stride, row_m, row_m + 1 * stride,
+            row_m + 2 * stride};
+        float* const JXL_RESTRICT row_out = out->Row(y);
+        for (int64_t xx = x; xx < xsize; ++xx) {
+          float mul = 0.0f;
+          for (int64_t dy = -kRadius; dy <= kRadius; ++dy) {
+            const float wy = weights->vert[std::abs(dy) * 4];
+            const float* clamped_row = rows[dy + 2];
+            for (int64_t dx = -kRadius; dx <= kRadius; ++dx) {
+              const float wx = weights->horz[std::abs(dx) * 4];
+              const int64_t clamped_x = Mirror(xx + dx, xsize);
+              mul += clamped_row[clamped_x] * wx * wy;
+            }
+          }
+          row_out[xx] = mul;
+        }
+      }
+    }
+  }
+
   template <size_t kSizeModN>
   JXL_INLINE void RunInteriorRows(const size_t ybegin, const size_t yend) {
-    const auto process_row = [&](const uint32_t y, size_t /*thread*/) HWY_ATTR {
-      ConvolveRow<kSizeModN, false>(y);
+    const size_t count = yend - ybegin;
+    const size_t num_bands = (count + kRowsPerBand - 1) / kRowsPerBand;
+    const auto process_band = [&](const uint32_t band,
+                                  size_t /*thread*/) HWY_ATTR {
+      const size_t b0 = ybegin + static_cast<size_t>(band) * kRowsPerBand;
+      const size_t b1 = std::min(b0 + kRowsPerBand, yend);
+      ConvolveInteriorBand<kSizeModN>(b0, b1);
       return true;
     };
-    Status status = RunOnPool(pool, ybegin, yend, ThreadPool::NoInit,
-                              process_row, "Convolve");
+    Status status =
+        RunOnPool(pool, 0, static_cast<uint32_t>(num_bands), ThreadPool::NoInit,
+                  process_band, "ConvolveBands");
     JXL_DASSERT(status);
     (void)status;
   }
