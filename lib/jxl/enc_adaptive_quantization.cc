@@ -329,10 +329,10 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
   }
   const float mul = scale * dampen;
   const float add = (1.0f - dampen) * base_level;
+  const HWY_CAPPED(float, kBlockDim) df;
   for (size_t iy = rect_out.y0(); iy < rect_out.y1(); iy++) {
     const size_t y = iy * 8;
     float* const JXL_RESTRICT row_out = out->Row(iy);
-    const HWY_CAPPED(float, kBlockDim) df;
     for (size_t ix = rect_out.x0(); ix < rect_out.x1(); ix++) {
       size_t x = ix * 8;
       auto mask_val = ComputeMask(df, Set(df, row_out[ix]));
@@ -351,9 +351,13 @@ template <typename D, typename V>
 V MaskingSqrt(const D d, V v) {
   static const float kLogOffset = 27.505837037000106f;
   static const float kMul = 211.66567973503678f;
-  const auto mul_v = Set(d, kMul * 1e8);
+  // The inner Sqrt(kMul * 1e8) is loop-invariant; precompute it once. std::sqrt
+  // and Highway's Sqrt are both IEEE correctly-rounded for float, so the
+  // precomputed constant is bit-identical to the per-call Sqrt(Set(d, ...)).
+  static const float kSqrtMul = std::sqrt(static_cast<float>(kMul * 1e8));
+  const auto sqrt_mul_v = Set(d, kSqrtMul);
   const auto offset_v = Set(d, kLogOffset);
-  return Mul(Set(d, 0.25f), Sqrt(MulAdd(v, Sqrt(mul_v), offset_v)));
+  return Mul(Set(d, 0.25f), Sqrt(MulAdd(v, sqrt_mul_v, offset_v)));
 }
 
 float MaskingSqrt(const float v) {
@@ -383,6 +387,35 @@ inline void StoreMin4(const float v, float& min0, float& min1, float& min2,
   }
 }
 
+// Rank-four-of-nine erosion of a single 3x3 neighbourhood: weighted sum of the
+// four smallest of the nine samples. The selection network and accumulation
+// order are bit-for-bit identical to the original inline FuzzyErosion body
+// (init {center,left,right,top_left}, sort-4, then StoreMin4 of
+// {top,top_right,bottom_left,bottom,bottom_right}).
+inline float FuzzyErosionRank4(const float center, const float left,
+                               const float right, const float top_left,
+                               const float top, const float top_right,
+                               const float bottom_left, const float bottom,
+                               const float bottom_right, const float k0,
+                               const float k1, const float k2, const float k3) {
+  float min0 = center;
+  float min1 = left;
+  float min2 = right;
+  float min3 = top_left;
+  if (min0 > min1) std::swap(min0, min1);
+  if (min0 > min2) std::swap(min0, min2);
+  if (min0 > min3) std::swap(min0, min3);
+  if (min1 > min2) std::swap(min1, min2);
+  if (min1 > min3) std::swap(min1, min3);
+  if (min2 > min3) std::swap(min2, min3);
+  StoreMin4(top, min0, min1, min2, min3);
+  StoreMin4(top_right, min0, min1, min2, min3);
+  StoreMin4(bottom_left, min0, min1, min2, min3);
+  StoreMin4(bottom, min0, min1, min2, min3);
+  StoreMin4(bottom_right, min0, min1, min2, min3);
+  return k0 * min0 + k1 * min1 + k2 * min2 + k3 * min3;
+}
+
 // Look for smooth areas near the area of degradation.
 // If the areas are generally smooth, don't do masking.
 // Output is downsampled 2x.
@@ -410,39 +443,45 @@ Status FuzzyErosion(const float butteraugli_target, const Rect& from_rect,
   for (size_t ii = 0; ii < 4; ++ii) {
     kMul[ii] *= kTotal / norm_sum;
   }
-  for (size_t fy = 0; fy < from_rect.ysize(); ++fy) {
-    size_t y = fy + from_rect.y0();
-    size_t ym1 = y >= kStep ? y - kStep : y;
-    size_t yp1 = y + kStep < ysize ? y + kStep : y;
-    const float* rowt = from.Row(ym1);
-    const float* row = from.Row(y);
-    const float* rowb = from.Row(yp1);
-    float* row_out = to_rect.Row(to, fy / 2);
-    for (size_t fx = 0; fx < from_rect.xsize(); ++fx) {
-      size_t x = fx + from_rect.x0();
-      size_t xm1 = x >= kStep ? x - kStep : x;
-      size_t xp1 = x + kStep < xsize ? x + kStep : x;
-      float min[4] = { row[x], row[xm1], row[xp1], rowt[xm1] };
-      // Sort the first four values.
-      if (min[0] > min[1]) std::swap(min[0], min[1]);
-      if (min[0] > min[2]) std::swap(min[0], min[2]);
-      if (min[0] > min[3]) std::swap(min[0], min[3]);
-      if (min[1] > min[2]) std::swap(min[1], min[2]);
-      if (min[1] > min[3]) std::swap(min[1], min[3]);
-      if (min[2] > min[3]) std::swap(min[2], min[3]);
-      // The remaining five values of a 3x3 neighbourhood.
-      StoreMin4(rowt[x], min[0], min[1], min[2], min[3]);
-      StoreMin4(rowt[xp1], min[0], min[1], min[2], min[3]);
-      StoreMin4(rowb[xm1], min[0], min[1], min[2], min[3]);
-      StoreMin4(rowb[x], min[0], min[1], min[2], min[3]);
-      StoreMin4(rowb[xp1], min[0], min[1], min[2], min[3]);
-
-      float v = kMul[0] * min[0] + kMul[1] * min[1] + kMul[2] * min[2] + kMul[3] * min[3];
-      if (fx % 2 == 0 && fy % 2 == 0) {
-        row_out[fx / 2] = v;
-      } else {
-        row_out[fx / 2] += v;
-      }
+  // Each downsampled output cell (ox, oy) is the sum of four overlapping 3x3
+  // rank-four erosions whose centres form a 2x2 source block; their union is a
+  // single 4x4 source window. Staging those rows/columns once collapses the
+  // redundant neighbourhood loads and the read-modify-write of `to` of the
+  // original full-resolution scan. Sample mapping, per-edge clamping, the
+  // rank-four selection, and the ((a+b)+c)+d accumulation order are preserved
+  // exactly, so the result is bit-for-bit identical.
+  for (size_t oy = 0; oy < to_rect.ysize(); ++oy) {
+    const size_t ya = from_rect.y0() + 2 * oy;
+    const size_t ym1 = ya >= kStep ? ya - kStep : ya;
+    const size_t y1 = ya + kStep < ysize ? ya + kStep : ya;   // ya + 1, clamped
+    const size_t y2 = y1 + kStep < ysize ? y1 + kStep : y1;   // ya + 2, clamped
+    const float* const JXL_RESTRICT row_m1 = from.Row(ym1);
+    const float* const JXL_RESTRICT row0 = from.Row(ya);
+    const float* const JXL_RESTRICT row1 = from.Row(y1);
+    const float* const JXL_RESTRICT row2 = from.Row(y2);
+    float* const JXL_RESTRICT row_out = to_rect.Row(to, oy);
+    for (size_t ox = 0; ox < to_rect.xsize(); ++ox) {
+      const size_t xa = from_rect.x0() + 2 * ox;
+      const size_t xm1 = xa >= kStep ? xa - kStep : xa;
+      const size_t x1 = xa + kStep < xsize ? xa + kStep : xa;  // xa + 1, clamped
+      const size_t x2 = x1 + kStep < xsize ? x1 + kStep : x1;  // xa + 2, clamped
+      // a: centre (xa, ya); rows {top:row_m1, mid:row0, bot:row1}.
+      const float va = FuzzyErosionRank4(
+          row0[xa], row0[xm1], row0[x1], row_m1[xm1], row_m1[xa], row_m1[x1],
+          row1[xm1], row1[xa], row1[x1], kMul[0], kMul[1], kMul[2], kMul[3]);
+      // b: centre (xa+1, ya); rows {top:row_m1, mid:row0, bot:row1}.
+      const float vb = FuzzyErosionRank4(
+          row0[x1], row0[xa], row0[x2], row_m1[xa], row_m1[x1], row_m1[x2],
+          row1[xa], row1[x1], row1[x2], kMul[0], kMul[1], kMul[2], kMul[3]);
+      // c: centre (xa, ya+1); rows {top:row0, mid:row1, bot:row2}.
+      const float vc = FuzzyErosionRank4(
+          row1[xa], row1[xm1], row1[x1], row0[xm1], row0[xa], row0[x1],
+          row2[xm1], row2[xa], row2[x1], kMul[0], kMul[1], kMul[2], kMul[3]);
+      // d: centre (xa+1, ya+1); rows {top:row0, mid:row1, bot:row2}.
+      const float vd = FuzzyErosionRank4(
+          row1[x1], row1[xa], row1[x2], row0[xa], row0[x1], row0[x2],
+          row2[xa], row2[x1], row2[x2], kMul[0], kMul[1], kMul[2], kMul[3]);
+      row_out[ox] = ((va + vb) + vc) + vd;
     }
   }
   return true;
@@ -453,6 +492,7 @@ struct AdaptiveQuantizationImpl {
     JXL_ASSIGN_OR_RETURN(
         diff_buffer,
         ImageF::Create(memory_manager, kEncTileDim + 8, num_threads));
+    pre_erosion.reserve(num_threads);
     for (size_t i = pre_erosion.size(); i < num_threads; i++) {
       JXL_ASSIGN_OR_RETURN(
           ImageF tmp,
@@ -789,30 +829,48 @@ StatusOr<ImageF> TileDistMap(const ImageF& distmap, int tile_size, int margin,
                                 tile_size * tile_x + this_tile_xsize + margin);
       float dist_norm = 0.0;
       double pixels = 0;
-      for (int y = y_begin; y < y_end; ++y) {
-        float ymul = 1.0;
-        constexpr float kBorderMul = 0.98f;
-        constexpr float kCornerMul = 0.7f;
-        if (margin != 0 && (y == y_begin || y == y_end - 1)) {
-          ymul = kBorderMul;
-        }
-        const float* const JXL_RESTRICT row = distmap.Row(y);
-        for (int x = x_begin; x < x_end; ++x) {
-          float xmul = ymul;
-          if (margin != 0 && (x == x_begin || x == x_end - 1)) {
-            if (xmul == 1.0) {
-              xmul = kBorderMul;
-            } else {
-              xmul = kCornerMul;
-            }
+      if (margin == 0) {
+        // The only caller passes margin == 0: no border/corner weighting, so
+        // every pixel contributes weight 1. dist_norm becomes a plain sum and
+        // the pixel count is exact. Bit-identical to the general path below.
+        pixels = static_cast<double>(x_end - x_begin) * (y_end - y_begin);
+        for (int y = y_begin; y < y_end; ++y) {
+          const float* const JXL_RESTRICT row = distmap.Row(y);
+          for (int x = x_begin; x < x_end; ++x) {
+            float v = row[x];
+            v *= v;
+            v *= v;
+            v *= v;
+            v *= v;
+            dist_norm += v;
           }
-          float v = row[x];
-          v *= v;
-          v *= v;
-          v *= v;
-          v *= v;
-          dist_norm += xmul * v;
-          pixels += xmul;
+        }
+      } else {
+        for (int y = y_begin; y < y_end; ++y) {
+          float ymul = 1.0;
+          constexpr float kBorderMul = 0.98f;
+          constexpr float kCornerMul = 0.7f;
+          if (y == y_begin || y == y_end - 1) {
+            ymul = kBorderMul;
+          }
+          const float* const JXL_RESTRICT row = distmap.Row(y);
+          for (int x = x_begin; x < x_end; ++x) {
+            float xmul = ymul;
+            if (x == x_begin || x == x_end - 1) {
+              if (xmul == 1.0) {
+                xmul = kBorderMul;
+              } else {
+                xmul = kCornerMul;
+              }
+            }
+            float v = row[x];
+            v *= v;
+            v *= v;
+            v *= v;
+            v *= v;
+            dist_norm += xmul * v;
+            pixels += xmul;
+          }
         }
       }
       if (pixels == 0) pixels = 1;
@@ -997,6 +1055,14 @@ Status FindBestQuantization(const FrameHeader& frame_header,
     JXL_ASSIGN_OR_RETURN(
         ImageBundle dec_linear,
         RoundtripImage(frame_header, opsin, enc_state, cms, pool));
+    // RoundtripImage above materialises the final encoder coefficients for this
+    // quant field. On the final iteration the Butteraugli comparison and tile
+    // distance map below feed only the (skipped) quant-field update and debug
+    // heatmaps, so in release builds they are pure waste — skip them.
+    if (i == iters && !JXL_DEBUG_ADAPTIVE_QUANTIZATION) {
+      if (aux_out != nullptr) ++aux_out->num_butteraugli_iters;
+      break;
+    }
     float score;
     ImageF diffmap;
     JXL_RETURN_IF_ERROR(comparator.CompareWith(dec_linear, &diffmap, &score));
@@ -1063,6 +1129,10 @@ Status FindBestQuantization(const FrameHeader& frame_header,
         cur_pow = 0;
       }
     }
+    // Loop-invariant within this iteration's update (the quantizer is only
+    // re-set at the top of the next iteration); hoist out of the pixel loops.
+    const float inv_global_scale = quantizer.InvGlobalScale();
+    const float quant_scale = quantizer.Scale();
     if (cur_pow == 0.0) {
       for (size_t y = 0; y < quant_field.ysize(); ++y) {
         const float* const JXL_RESTRICT row_dist = tile_distmap.Row(y);
@@ -1073,11 +1143,11 @@ Status FindBestQuantization(const FrameHeader& frame_header,
             float old = row_q[x];
             row_q[x] *= diff;
             int qf_old =
-                static_cast<int>(std::lround(old * quantizer.InvGlobalScale()));
-            int qf_new = static_cast<int>(
-                std::lround(row_q[x] * quantizer.InvGlobalScale()));
+                static_cast<int>(std::lround(old * inv_global_scale));
+            int qf_new =
+                static_cast<int>(std::lround(row_q[x] * inv_global_scale));
             if (qf_old == qf_new) {
-              row_q[x] = old + quantizer.Scale();
+              row_q[x] = old + quant_scale;
             }
           }
           if (row_q[x] > qf_higher) row_q[x] = qf_higher;
@@ -1096,11 +1166,11 @@ Status FindBestQuantization(const FrameHeader& frame_header,
             float old = row_q[x];
             row_q[x] *= diff;
             int qf_old =
-                static_cast<int>(std::lround(old * quantizer.InvGlobalScale()));
-            int qf_new = static_cast<int>(
-                std::lround(row_q[x] * quantizer.InvGlobalScale()));
+                static_cast<int>(std::lround(old * inv_global_scale));
+            int qf_new =
+                static_cast<int>(std::lround(row_q[x] * inv_global_scale));
             if (qf_old == qf_new) {
-              row_q[x] = old + quantizer.Scale();
+              row_q[x] = old + quant_scale;
             }
           }
           if (row_q[x] > qf_higher) row_q[x] = qf_higher;
@@ -1149,23 +1219,30 @@ Status FindBestQuantizationMaxError(const FrameHeader& frame_header,
       JXL_RETURN_IF_ERROR(DumpXybImage(cparams, ("dec" + ToString(i)).c_str(),
                                        *decoded.color()));
     }
+    // Tracks whether any block's quant field actually changed this iteration.
+    // If nothing changed the next roundtrip would be identical, so we have
+    // reached a fixed point and can stop early.
+    bool any_change = false;
     for (size_t by = 0; by < enc_state->shared.frame_dim.ysize_blocks; by++) {
       AcStrategyRow ac_strategy_row =
           enc_state->shared.ac_strategy.ConstRow(by);
       for (size_t bx = 0; bx < enc_state->shared.frame_dim.xsize_blocks; bx++) {
         AcStrategy acs = ac_strategy_row[bx];
         if (!acs.IsFirstBlock()) continue;
+        // Clip the scan to the decoded image once instead of per-pixel.
+        const size_t y_lo = by * kBlockDim;
+        const size_t y_hi = std::min<size_t>(
+            decoded.ysize(), (by + acs.covered_blocks_y()) * kBlockDim);
+        const size_t x_lo = bx * kBlockDim;
+        const size_t x_hi = std::min<size_t>(
+            decoded.xsize(), (bx + acs.covered_blocks_x()) * kBlockDim);
         float max_error = 0;
         for (size_t c = 0; c < 3; c++) {
-          for (size_t y = by * kBlockDim;
-               y < (by + acs.covered_blocks_y()) * kBlockDim; y++) {
-            if (y >= decoded.ysize()) continue;
+          for (size_t y = y_lo; y < y_hi; y++) {
             const float* JXL_RESTRICT in_row = opsin.ConstPlaneRow(c, y);
             const float* JXL_RESTRICT dec_row =
                 decoded.color()->ConstPlaneRow(c, y);
-            for (size_t x = bx * kBlockDim;
-                 x < (bx + acs.covered_blocks_x()) * kBlockDim; x++) {
-              if (x >= decoded.xsize()) continue;
+            for (size_t x = x_lo; x < x_hi; x++) {
               max_error = std::max(
                   std::abs(in_row[x] - dec_row[x]) * inv_max_err[c], max_error);
             }
@@ -1179,6 +1256,9 @@ Status FindBestQuantizationMaxError(const FrameHeader& frame_header,
         const float qf_mul = (max_error < 0.5f)   ? max_error * 2.0f
                              : (max_error > 1.0f) ? max_error
                                                   : 1.0f;
+        // Multiplying by exactly 1.0f is a no-op; skip it (and note no change).
+        if (qf_mul == 1.0f) continue;
+        any_change = true;
         for (size_t qy = by; qy < by + acs.covered_blocks_y(); qy++) {
           float* JXL_RESTRICT quant_field_row = quant_field.Row(qy);
           for (size_t qx = bx; qx < bx + acs.covered_blocks_x(); qx++) {
@@ -1187,6 +1267,7 @@ Status FindBestQuantizationMaxError(const FrameHeader& frame_header,
         }
       }
     }
+    if (!any_change) break;
   }
   JXL_RETURN_IF_ERROR(
       quantizer.SetQuantField(initial_quant_dc, quant_field, &raw_quant_field));
@@ -1224,18 +1305,29 @@ Status AdjustQuantField(const AcStrategyImage& ac_strategy, const Rect& rect,
       if (!acs.IsFirstBlock()) continue;
       JXL_ENSURE(x + acs.covered_blocks_x() <= quant_field->xsize());
       JXL_ENSURE(y + acs.covered_blocks_y() <= quant_field->ysize());
+      const size_t covered = acs.covered_blocks_y() * acs.covered_blocks_x();
+      // Ordinary 8x8 (1x1 block) strategies would copy the single value back
+      // onto itself: a no-op. Skip them.
+      if (covered == 1) continue;
       float max = quant_row[x];
-      float mean = 0.0;
-      for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
-        for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
-          mean += quant_row[x + ix + iy * stride];
-          max = std::max(quant_row[x + ix + iy * stride], max);
+      if (covered >= 4) {
+        // mean is only consumed when covered >= 4; only compute it then.
+        float mean = 0.0;
+        for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
+          for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
+            mean += quant_row[x + ix + iy * stride];
+            max = std::max(quant_row[x + ix + iy * stride], max);
+          }
         }
-      }
-      mean /= acs.covered_blocks_y() * acs.covered_blocks_x();
-      if (acs.covered_blocks_y() * acs.covered_blocks_x() >= 4) {
+        mean /= covered;
         max *= mean_max_mixer;
         max += (1.0f - mean_max_mixer) * mean;
+      } else {
+        for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
+          for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
+            max = std::max(quant_row[x + ix + iy * stride], max);
+          }
+        }
       }
       for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
         for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
