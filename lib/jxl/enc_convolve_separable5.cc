@@ -111,9 +111,20 @@ class Separable5Impl {
           // them to a single RunRows<2> to avoid a redundant specialization.
           return RunRows<2>();
       }
-    } else {
-      return SlowSeparable5(*in, rect, *weights, pool, out, Rect(*out));
     }
+
+#if HWY_TARGET != HWY_SCALAR
+    // Width-cliff: the row is exactly one vector (N) or one vector + 1 pixel
+    // (N+1), which the >= min_width path cannot handle. No caller in this repo
+    // hits this; it is general-library coverage. Matches SlowSeparable5 within
+    // the same tolerance the wider SIMD path meets.
+    const size_t N = Lanes(Simd());
+    if (rect.xsize() == N || rect.xsize() == N + 1) {
+      JXL_ENSURE(SameSize(rect, *out));
+      return rect.xsize() == N ? RunNarrow<0>() : RunNarrow<1>();
+    }
+#endif
+    return SlowSeparable5(*in, rect, *weights, pool, out, Rect(*out));
   }
 
   template <size_t kSizeModN, bool kBorder>
@@ -528,6 +539,63 @@ class Separable5Impl {
     return true;
   }
 
+  // xsize in {N, N+1} (kSizeModN in {0,1}): the whole width is a single SIMD
+  // vector. Vertical mirroring per output row via ComputeRowPointers (covers
+  // interior, borders, and tiny height), with horizontal-conv dedup. For N+1
+  // the final pixel uses the scalar 25-tap tail. Matches SlowSeparable5 within
+  // the same tolerance the wider SIMD path meets. Non-scalar only.
+  template <size_t kSizeModN>
+  JXL_INLINE Status RunNarrow() {
+    const D d;
+    const int64_t xsize = rect.xsize();
+    const V wh0 = LoadDup128(d, weights->horz + 0 * 4);
+    const V wh1 = LoadDup128(d, weights->horz + 1 * 4);
+    const V wh2 = LoadDup128(d, weights->horz + 2 * 4);
+    const V wv0 = LoadDup128(d, weights->vert + 0 * 4);
+    const V wv1 = LoadDup128(d, weights->vert + 1 * 4);
+    const V wv2 = LoadDup128(d, weights->vert + 2 * 4);
+    const I ml1 = MirrorLanes<1>();
+    const I ml2 = MirrorLanes<2>();
+    for (size_t y = 0; y < rect.ysize(); ++y) {
+      const float* JXL_RESTRICT rows[5];
+      ComputeRowPointers(y, rows);
+      const V h2 = HorzConvolveOnlyVector<kSizeModN>(rows[2], 0, xsize, wh0, wh1,
+                                                     wh2, ml1, ml2);
+      const V h1 = (rows[1] == rows[2])
+                       ? h2
+                       : HorzConvolveOnlyVector<kSizeModN>(rows[1], 0, xsize,
+                                                           wh0, wh1, wh2, ml1,
+                                                           ml2);
+      const V h3 = (rows[3] == rows[2])   ? h2
+                   : (rows[3] == rows[1]) ? h1
+                                          : HorzConvolveOnlyVector<kSizeModN>(
+                                                rows[3], 0, xsize, wh0, wh1, wh2,
+                                                ml1, ml2);
+      const V h0 = (rows[0] == rows[2])   ? h2
+                   : (rows[0] == rows[1]) ? h1
+                   : (rows[0] == rows[3]) ? h3
+                                          : HorzConvolveOnlyVector<kSizeModN>(
+                                                rows[0], 0, xsize, wh0, wh1, wh2,
+                                                ml1, ml2);
+      const V h4 = (rows[4] == rows[2])   ? h2
+                   : (rows[4] == rows[1]) ? h1
+                   : (rows[4] == rows[3]) ? h3
+                   : (rows[4] == rows[0]) ? h0
+                                          : HorzConvolveOnlyVector<kSizeModN>(
+                                                rows[4], 0, xsize, wh0, wh1, wh2,
+                                                ml1, ml2);
+      const V conv0 = Mul(h2, wv0);
+      const V conv1 = MulAdd(Add(h1, h3), wv1, conv0);
+      const V conv2 = MulAdd(Add(h0, h4), wv2, conv1);
+      Store(conv2, d, out->Row(y));
+      if (kSizeModN == 1) {  // xsize == N+1: final pixel via scalar 25-tap
+        out->Row(y)[xsize - 1] =
+            ScalarPixel<true>(rows, xsize - 1, xsize, weights);
+      }
+    }
+    return true;
+  }
+
   // Returns IndicesFromVec(d, indices) such that TableLookupLanes on the
   // rightmost unaligned vector (rightmost sample in its most-significant lane)
   // returns the mirrored values, with the mirror outside the last valid sample.
@@ -602,6 +670,35 @@ class Separable5Impl {
     const V mul1 = MulAdd(sum1, wh1, mul0);
     const V sum2 = Add(l2, r2);
     const V mul2 = MulAdd(sum2, wh2, mul1);
+    return mul2;
+  }
+
+  // The whole row fits in one vector (xsize == N or N+1). Mirror the LEFT edge
+  // via Neighbors and the RIGHT edge exactly as HorzConvolveLast<kSizeModN>
+  // does: kSizeModN==0 (xsize==N) mirrors within c; ==1 (xsize==N+1) takes the
+  // right-neighbour vector from LoadU(row + 1). Non-scalar only.
+  template <size_t kSizeModN>
+  static JXL_MAYBE_INLINE V HorzConvolveOnlyVector(
+      const float* const JXL_RESTRICT row, const int64_t x, const int64_t xsize,
+      const V wh0, const V wh1, const V wh2, const I ml1, const I ml2) {
+    const D d;
+    const V c = LoadU(d, row + x);
+    const V mul0 = Mul(c, wh0);
+    const V l1 = Neighbors::FirstL1(c);
+    const V l2 = Neighbors::FirstL2(c);
+    const size_t N = Lanes(d);
+    V r1;
+    V r2;
+    if (kSizeModN == 0) {  // xsize == N
+      r1 = TableLookupLanes(c, ml1);
+      r2 = TableLookupLanes(c, ml2);
+    } else {  // xsize == N + 1
+      const V last = LoadU(d, row + xsize - N);  // == row + 1
+      r1 = last;
+      r2 = TableLookupLanes(last, ml1);
+    }
+    const V mul1 = MulAdd(Add(l1, r1), wh1, mul0);
+    const V mul2 = MulAdd(Add(l2, r2), wh2, mul1);
     return mul2;
   }
 
