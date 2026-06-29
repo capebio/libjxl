@@ -359,15 +359,22 @@ bool MultiBlockTransformCrossesVerticalBoundary(
   return false;
 }
 
-void EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
+// Returns true if `entropy` holds the exact final score; false if the candidate
+// was pruned early, in which case `entropy` holds an admissible lower bound
+// (>= prune_threshold). A pruned result must never be cached as if exact.
+bool EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
                      size_t y, const ACSConfig& config,
                      const float* JXL_RESTRICT cmap_factors, float* block,
                      float* full_scratch_space, float& entropy,
                      double prune_threshold = 1e30) {
   entropy = 0.0f;
   float* mem = full_scratch_space;
-  float* scratch_space = full_scratch_space + AcStrategy::kMaxCoeffArea;
+  float* scratch_space =
+      full_scratch_space + AcStrategyHeuristics::kMaxSearchCoeffArea;
   const size_t size = (1 << acs.log2_covered_blocks()) * kDCTBlockSize;
+  // The search never exceeds DCT64X64, so `size` (and the channel/mem regions
+  // sized from kMaxSearchCoeffArea) always fit. Guard it in debug builds.
+  JXL_DASSERT(size <= AcStrategyHeuristics::kMaxSearchCoeffArea);
 
   // Lazy-B: transform Y (c=1) and X (c=0) upfront; defer B (c=2) until both
   // survive per-channel rate pruning below.
@@ -468,14 +475,44 @@ void EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
         const float lb_rate = lb * entropy_mul;
         if (static_cast<double>(lb_rate) >= prune_threshold) {
           entropy = lb_rate;
-          return;
+          return false;
         }
       }
     }
 
-    // When there is no 1x1 masking field, every iteration of the loop below is
-    // out of bounds and contributes nothing: `loss` stays exactly Zero. Skip
-    // the inverse transform and the whole masking walk in that case.
+    // Rate accounting first, *before* the inverse transform + masking walk, so
+    // that a candidate already losing on rate alone never pays for
+    // reconstruction. The accumulated rate is a lower bound on the final score
+    // (information loss is non-negative).
+    entropy += config.cost_delta * GetLane(SumOfLanes(df, entropy_v));
+    size_t num_nzeros = GetLane(SumOfLanes(df, nzeros_v));
+    // Add #bit of num_nonzeros, as an estimate of the cost for encoding the
+    // number of non-zeros of the block.
+    size_t nbits = CeilLog2Nonzero(num_nzeros + 1) + 1;
+    // Also add #bit of #bit of num_nonzeros, to estimate the ANS cost, with a
+    // bias.
+    entropy += config.zeros_mul * (CeilLog2Nonzero(nbits + 17) + nbits);
+    float w = 1.0f;
+    if (c == 0 && num_blocks >= 2) {
+      // It is X channel (red-green) and we often see ringing
+      // in the large blocks. Let's punish that more here.
+      w = 1.0 + std::min(3.0, num_blocks / 8.0);
+      entropy *= w;
+    }
+    // Per-channel rate prune (now also covers c==2, before B's masking walk and
+    // the final loss_scalar). Admissible: remaining contributions are
+    // non-negative, so the accumulated rate lower-bounds the final score.
+    const float rate_c = entropy * entropy_mul;
+    if (static_cast<double>(rate_c) >= prune_threshold) {
+      entropy = rate_c;
+      return false;
+    }
+
+    // Information-loss term: inverse-transform the quantization residual and
+    // accumulate masked ringing. When there is no 1x1 masking field, every
+    // iteration below is out of bounds and contributes nothing (`loss` stays
+    // exactly Zero), so skip the inverse transform and the whole walk. Done
+    // after the rate prune so losing candidates never pay for reconstruction.
     if (config.mask1x1_xsize != 0) {
       float masku_lut[3] = {
           12.0,
@@ -516,32 +553,14 @@ void EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
           pow(1.03, 8.0),
       };
       lossc = Mul(Set(df8, kChannelMul[c]), lossc);
-      loss = Add(loss, lossc);
-    }
-    entropy += config.cost_delta * GetLane(SumOfLanes(df, entropy_v));
-    size_t num_nzeros = GetLane(SumOfLanes(df, nzeros_v));
-    // Add #bit of num_nonzeros, as an estimate of the cost for encoding the
-    // number of non-zeros of the block.
-    size_t nbits = CeilLog2Nonzero(num_nzeros + 1) + 1;
-    // Also add #bit of #bit of num_nonzeros, to estimate the ANS cost, with a
-    // bias.
-    entropy += config.zeros_mul * (CeilLog2Nonzero(nbits + 17) + nbits);
-    if (c == 0 && num_blocks >= 2) {
-      // It is X channel (red-green) and we often see ringing
-      // in the large blocks. Let's punish that more here.
-      float w = 1.0 + std::min(3.0, num_blocks / 8.0);
-      entropy *= w;
-      loss = Mul(loss, Set(df8, w));
-    }
-    // Per-channel rate prune: accumulated rate for channels 0..c already
-    // exceeds the incumbent → skip remaining channels (including lazy-B
-    // transform). Admissible: all remaining contributions are non-negative.
-    if (c < 2) {
-      const float rate_c = entropy * entropy_mul;
-      if (static_cast<double>(rate_c) >= prune_threshold) {
-        entropy = rate_c;
-        return;
+      // Apply the c==0 X-channel ringing penalty `w` to this channel's loss,
+      // exactly as it scaled `entropy` above. Bit-identical to the previous
+      // `loss = Mul(loss, w)`: at c==0 the accumulator held only this channel's
+      // contribution, and float multiply is commutative.
+      if (c == 0 && num_blocks >= 2) {
+        lossc = Mul(lossc, Set(df8, w));
       }
+      loss = Add(loss, lossc);
     }
   }
   // EXPERIMENTAL (#6b): eighth root as three chained sqrts instead of a
@@ -561,6 +580,7 @@ void EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
 #endif
   entropy *= entropy_mul;
   entropy += config.info_loss_multiplier * loss_scalar;
+  return true;
 }
 
 // Exact-result memo for large-transform entropy estimates within ONE 64x64
@@ -606,12 +626,17 @@ static int EntropyCacheSlot(AcStrategyType t) {
 }
 
 // cx, cy are LOCAL 8x8-block coordinates within the 64x64 rect (0..7).
-void EstimateEntropyCached(EntropyCache* JXL_RESTRICT cache,
+// Returns true if `entropy` is the exact final score (cached or freshly
+// computed), false if the candidate was pruned against `prune_threshold` and
+// `entropy` is only a lower bound. Only exact results are stored in the cache;
+// a pruned lower bound is valid solely for this caller's incumbent.
+bool EstimateEntropyCached(EntropyCache* JXL_RESTRICT cache,
                            const AcStrategy& acs, float entropy_mul, size_t cx,
                            size_t cy, size_t x, size_t y,
                            const ACSConfig& config,
                            const float* JXL_RESTRICT cmap_factors, float* block,
-                           float* scratch_space, float& entropy) {
+                           float* scratch_space, float& entropy,
+                           double prune_threshold = 1e30) {
   const int slot = EntropyCacheSlot(acs.Strategy());
   const size_t pos = cy * 8 + cx;
   if (slot >= 0) {
@@ -619,16 +644,18 @@ void EstimateEntropyCached(EntropyCache* JXL_RESTRICT cache,
     if ((cache->valid[slot] & bit) != 0 &&
         cache->mul_key[slot][pos] == entropy_mul) {
       entropy = cache->value[slot][pos];
-      return;
+      return true;  // exact cached value
     }
   }
-  EstimateEntropy(acs, entropy_mul, x, y, config, cmap_factors, block,
-                  scratch_space, entropy);
-  if (slot >= 0) {
+  const bool exact = EstimateEntropy(acs, entropy_mul, x, y, config,
+                                     cmap_factors, block, scratch_space, entropy,
+                                     prune_threshold);
+  if (exact && slot >= 0) {
     cache->valid[slot] |= (uint64_t{1} << pos);
     cache->value[slot][pos] = entropy;
     cache->mul_key[slot][pos] = entropy_mul;
   }
+  return exact;
 }
 
 Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
@@ -754,9 +781,16 @@ Status TryMergeAcs(AcStrategyType acs_raw, size_t bx, size_t by, size_t cx,
     }
   }
   float entropy_candidate;
-  EstimateEntropyCached(cache, acs, entropy_mul, cx, cy, (bx + cx) * 8,
-                        (by + cy) * 8, config, cmap_factors, block,
-                        scratch_space, entropy_candidate);
+  // Pass the incumbent as a prune bound: if the candidate's rate lower bound
+  // already reaches entropy_current it cannot win, so EstimateEntropyCached can
+  // skip the inverse transform + masking. A pruned result is >= the bound, so
+  // the existing comparison below rejects it identically (byte-exact).
+  if (!EstimateEntropyCached(cache, acs, entropy_mul, cx, cy, (bx + cx) * 8,
+                             (by + cy) * 8, config, cmap_factors, block,
+                             scratch_space, entropy_candidate,
+                             entropy_current)) {
+    return true;  // pruned: lower bound already >= incumbent
+  }
   if (entropy_candidate >= entropy_current) return true;
   // Accept the candidate.
   for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
@@ -870,41 +904,40 @@ Status FindBestFirstLevelDivisionForSquare(
   float entropy_KXJ_top = std::numeric_limits<float>::max();
   float entropy_KXJ_bottom = std::numeric_limits<float>::max();
   float entropy_JXJ = std::numeric_limits<float>::max();
+  // Each split candidate only wins if it beats the corresponding sum of the
+  // already-chosen 8x8 estimates, so that sum is an admissible prune bound: a
+  // candidate whose rate lower bound already reaches it cannot be selected, and
+  // std::min(pruned_lb, sum) == sum == std::min(exact, sum) when exact >= sum,
+  // so costJxN/costNxJ stay byte-identical.
   if (allow_JXK) {
     if (row0[bx + cx + 0].Strategy() != acs_rawJXK) {
       EstimateEntropyCached(cache, acsJXK, entropy_mul_JXK, cx + 0, cy + 0,
                             (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
-                            cmap_factors, block, scratch_space,
-                            entropy_JXK_left);
+                            cmap_factors, block, scratch_space, entropy_JXK_left,
+                            entropy[0][0] + entropy[1][0]);
     }
     if (row0[bx + cx + blocks_half].Strategy() != acs_rawJXK) {
       EstimateEntropyCached(cache, acsJXK, entropy_mul_JXK, cx + blocks_half,
                             cy + 0, (bx + cx + blocks_half) * 8,
                             (by + cy + 0) * 8, config, cmap_factors, block,
-                            scratch_space, entropy_JXK_right);
+                            scratch_space, entropy_JXK_right,
+                            entropy[0][1] + entropy[1][1]);
     }
   }
   if (allow_KXJ) {
     if (row0[bx + cx].Strategy() != acs_rawKXJ) {
       EstimateEntropyCached(cache, acsKXJ, entropy_mul_JXK, cx + 0, cy + 0,
                             (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
-                            cmap_factors, block, scratch_space,
-                            entropy_KXJ_top);
+                            cmap_factors, block, scratch_space, entropy_KXJ_top,
+                            entropy[0][0] + entropy[0][1]);
     }
     if (row1[bx + cx].Strategy() != acs_rawKXJ) {
       EstimateEntropyCached(cache, acsKXJ, entropy_mul_JXK, cx + 0,
                             cy + blocks_half, (bx + cx + 0) * 8,
                             (by + cy + blocks_half) * 8, config, cmap_factors,
-                            block, scratch_space, entropy_KXJ_bottom);
+                            block, scratch_space, entropy_KXJ_bottom,
+                            entropy[1][0] + entropy[1][1]);
     }
-  }
-  if (allow_square_transform) {
-    // We control the exploration of the square transform separately so that
-    // we can turn it off at high decoding speeds for 32x32, but still allow
-    // exploring 16x32 and 32x16.
-    EstimateEntropyCached(cache, acsJXJ, entropy_mul_JXJ, cx + 0, cy + 0,
-                          (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
-                          cmap_factors, block, scratch_space, entropy_JXJ);
   }
 
   // Test if this block should have JXK or KXJ transforms,
@@ -913,6 +946,17 @@ Status FindBestFirstLevelDivisionForSquare(
                   std::min(entropy_JXK_right, entropy[0][1] + entropy[1][1]);
   float costNxJ = std::min(entropy_KXJ_top, entropy[0][0] + entropy[0][1]) +
                   std::min(entropy_KXJ_bottom, entropy[1][0] + entropy[1][1]);
+  if (allow_square_transform) {
+    // We control the exploration of the square transform separately so that
+    // we can turn it off at high decoding speeds for 32x32, but still allow
+    // exploring 16x32 and 32x16. The square is selected below only if it beats
+    // both costJxN and costNxJ, so min(costJxN, costNxJ) is an admissible prune
+    // bound. Evaluated after the splits so that bound is available.
+    EstimateEntropyCached(cache, acsJXJ, entropy_mul_JXJ, cx + 0, cy + 0,
+                          (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
+                          cmap_factors, block, scratch_space, entropy_JXJ,
+                          std::min(costJxN, costNxJ));
+  }
   if (entropy_JXJ < costJxN && entropy_JXJ < costNxJ) {
     JXL_RETURN_IF_ERROR(ac_strategy->Set(bx + cx, by + cy, acs_rawJXJ));
     SetEntropyForTransform(cx, cy, acs_rawJXJ, entropy_JXJ, entropy_estimate);
@@ -959,7 +1003,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   // integral transforms cross these boundaries leads to
   // additional complications.
   const float butteraugli_target = cparams.butteraugli_distance;
-  float* JXL_RESTRICT scratch_space = block + 3 * AcStrategy::kMaxCoeffArea;
+  float* JXL_RESTRICT scratch_space =
+      block + 3 * AcStrategyHeuristics::kMaxSearchCoeffArea;
   size_t bx = rect.x0();
   size_t by = rect.y0();
   JXL_ENSURE(rect.xsize() <= 8);
@@ -1027,7 +1072,12 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   // two DCT16x32s). It might be better to make them more independent,
   // e.g. by not applying the multiplier when storing the new entropy
   // estimates in TryMergeToACSCandidate().
-  const MergeTry kTransformsForMerge[9] = {
+  // NB: size is left unspecified on purpose. A fixed `[9]` previously left 3
+  // trailing value-initialized {DCT, prio 0, ...} phantom entries that, at
+  // decoding_speed_tier 0, were not filtered by the tier check and ran a full
+  // no-op merge pass each (priority 0 collides with the initial priority plane,
+  // so TryMergeAcs early-returns). Sizing to the initializer count removes them.
+  const MergeTry kTransformsForMerge[] = {
       {AcStrategyType::DCT16X8, 2, 4, 5, entropy_mul16X8},
       {AcStrategyType::DCT8X16, 2, 4, 5, entropy_mul16X8},
       // FindBestFirstLevelDivisionForSquare looks for DCT16X16 and its
@@ -1258,8 +1308,10 @@ Status AcStrategyHeuristics::PrepareForThreads(std::size_t num_threads) {
     return true;
   }
   const size_t dct_scratch_size =
-      3 * (MaxVectorSize() / sizeof(float)) * AcStrategy::kMaxBlockDim;
-  mem_per_thread = 6 * AcStrategy::kMaxCoeffArea + dct_scratch_size;
+      3 * (MaxVectorSize() / sizeof(float)) *
+      AcStrategyHeuristics::kMaxSearchBlockDim;
+  mem_per_thread =
+      6 * AcStrategyHeuristics::kMaxSearchCoeffArea + dct_scratch_size;
   size_t mem_bytes = num_threads * mem_per_thread * sizeof(float);
   JXL_ASSIGN_OR_RETURN(mem, AlignedMemory::Create(memory_manager, mem_bytes));
   return true;

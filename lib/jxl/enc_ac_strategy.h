@@ -63,6 +63,17 @@ struct ACSConfig {
 };
 
 struct AcStrategyHeuristics {
+  // The ACS search only ever evaluates transforms up to DCT64X64 (64x64
+  // pixels / 8x8 covered blocks). The format-wide AcStrategy::kMaxCoeffArea and
+  // kMaxBlockDim are sized for the largest *legal* transform (256x256), which
+  // this encoder heuristic never selects, so sizing the per-thread scratch arena
+  // from them over-allocates ~16x. These encoder-local bounds size the scratch
+  // to the actual search envelope. (Decoder/format paths keep the 256x256
+  // maxima.) The 64x64 floor still satisfies the transform kernels' absolute
+  // scratch requirement of 4 * kMaxBlocks * kMaxBlocks = 4096 floats.
+  static constexpr size_t kMaxSearchBlockDim = 64;
+  static constexpr size_t kMaxSearchCoeffArea =
+      kMaxSearchBlockDim * kMaxSearchBlockDim;
   explicit AcStrategyHeuristics(JxlMemoryManager* memory_manager,
                                 const CompressParams& cparams)
       : memory_manager(memory_manager),
