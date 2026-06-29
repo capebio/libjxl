@@ -76,12 +76,46 @@ geomean: encode 1.0570x  decode 1.0188x   (>1 = NEW faster)
 
 - **Byte-exact: PROVEN** — every encoded `.jxl` is bit-identical OLD vs NEW
   (FNV content hash + size match, all 8 corpus images).
-- **Encode: ~+5.7% geomean** (per-file noisy on this contended dev box: −5% to
-  +17%). The win comes from the `EstimateWPCost` lookup + monotone early-out and
-  the SIMD flush-cadence change; both are on the encode-selection hot path.
-- **Decode: noise** (~+1.9% geomean). These are encoder-only changes; the decode
-  delta is measurement noise, as expected.
-- Corpus is lossy VarDCT (d1.0), so it exercises E1/E2/E3/E5/E6/E9 + the AC-meta
-  path; it does NOT exercise the XYB-modular path (E7 group_rect) or the lossless
-  channel-palette path.
+- **Encode/decode timing: noise** (this run `1.057x` enc; a cleaner 5-round rerun
+  with Tier-2 gave `1.019x`; lossless e9 gave `0.968x`). See the Timing summary
+  below — across runs the ratio straddles 1.0, i.e. neutral within noise. These
+  are encoder-only work-reduction changes, not wall-clock-visible at these efforts.
+### Lossless modular pass (effort 9, 3-image subset) — exercises E1 + E9
+
+The lossy VarDCT corpus above does **not** run the modular selection hot paths
+(`EstimateWPCost` needs effort ≥ Kitten; `EstimateCost`'s RCT search needs
+lossless modular). A second A/B with `MODE=lossless EFFORT=9` exercises them:
+
+```
+file                          MP   encOLD   encNEW      x    bytes  byte-exact
+P1110226 windows.jpg         7.7  42823.6  44973.3 0.952x  4051402  YES
+PXL_20260527_180319603       9.9  60395.2  62070.6 0.973x 11467745  YES
+small_file.jpg               0.1    527.7    539.3 0.978x    58476  YES
+*** BYTE-EXACT: all 3 files produce IDENTICAL encoded bytes (OLD == NEW). ***
+```
+
+- **Byte-exact: PROVEN for E1 + E9** — `EstimateWPCost`'s lookup table + monotone
+  early-out selects the identical `wp_mode`, and `EstimateCost`'s flush change is
+  exact, even under effort-9 (5 WP modes, 19 RCT trials, channel palettes).
+
+### Timing summary (honest)
+
+Three interleaved runs: lossy ×2 = `1.057x` / `1.019x`, lossless e9 = `0.968x`.
+These **straddle 1.0 → neutral within measurement noise** on this single-thread,
+contended dev box (lossless used only 2 rounds of 40–60 s encodes; large variance).
+The optimized routines (`EstimateWPCost`, the SIMD flush, the AC-meta pre-count)
+are **minor fractions of total encode time**, so no wall-clock speedup is expected
+or claimed. The defensible win is **work reduction** — 33 per-pixel comparisons →
+1 table load; far fewer `SumOfLanes` reductions; exact-sized AC-meta allocation;
+source-image release (lower peak RSS) — delivered with **zero byte change and no
+measurable regression beyond noise**.
+
+### Coverage map
+
+| Path | Exercised by |
+|------|--------------|
+| E3 AddACMetadata, E5/E6 (VarDCT substreams), Tier-2 release | lossy VarDCT corpus (8/8 byte-exact) |
+| E1 EstimateWPCost, E9 EstimateCost/RCT | lossless e9 subset (3/3 byte-exact) |
+| E2 QuantizeChannel | lossy-MODULAR only — not in either corpus (byte-exact by construction: per-pixel result depends only on itself + q) |
+| E7 XYB B−Y group_rect | XYB-modular only — not in either corpus (byte-exact by construction for full-frame; crop-fix needs libjxl's own streaming tests) |
 
