@@ -108,50 +108,12 @@ class Separable5Impl {
   template <size_t kSizeModN, bool kBorder>
   JXL_NOINLINE void ConvolveRow(const uint32_t y) {
     const D d;
-    const int64_t stride = in->PixelsPerRow();
-    const int64_t neg_stride = -stride;  // allows LEA addressing.
     const size_t xsize = rect.xsize();
-    const float* const JXL_RESTRICT row_m = rect.ConstRow(*in, y);
     float* const JXL_RESTRICT row_out = out->Row(y);
-    const float* JXL_RESTRICT row_t2 = row_m + 2 * neg_stride;
-    const float* JXL_RESTRICT row_t1 = row_m + 1 * neg_stride;
-    const float* JXL_RESTRICT row_b1 = row_m + 1 * stride;
-    const float* JXL_RESTRICT row_b2 = row_m + 2 * stride;
-
-    if (kBorder) {
-      size_t img_y = rect.y0() + y;
-      if (in->ysize() <= 2 * kRadius) {  // Very special: double reflections
-        static constexpr size_t kBorderLut[4 * 8] = {
-            0, 0, 0, 0, 0, 0xBAD, 0xBAD, 0xBAD,  // 1 row
-            1, 0, 0, 1, 1, 0,     0xBAD, 0xBAD,  // 2 rows
-            1, 0, 0, 1, 2, 2,     1,     0xBAD,  // 3 rows
-            1, 0, 0, 1, 2, 3,     3,     2,      // 4 rows
-        };
-        JXL_DASSERT(in->ysize() <= 4);
-        size_t o = in->ysize() * 8 - 6 + img_y;
-        row_t2 = in->ConstRow(kBorderLut[o - 2]) + rect.x0();
-        row_t1 = in->ConstRow(kBorderLut[o - 1]) + rect.x0();
-        row_b1 = in->ConstRow(kBorderLut[o + 1]) + rect.x0();
-        row_b2 = in->ConstRow(kBorderLut[o + 2]) + rect.x0();
-      } else if (img_y < kRadius) {
-        if (img_y == 0) {
-          row_t1 = row_m;
-          row_t2 = row_b1;
-        } else {
-          JXL_DASSERT(img_y == 1);
-          row_t2 = row_t1;
-        }
-      } else {
-        JXL_DASSERT(img_y + kRadius >= in->ysize());
-        if (img_y + 1 == in->ysize()) {
-          row_b1 = row_m;
-          row_b2 = row_t1;
-        } else {
-          JXL_DASSERT(img_y + 2 == in->ysize());
-          row_b2 = row_b1;
-        }
-      }
-    }
+    // ConvolveRow only handles border rows; reflection is unconditional.
+    const float* JXL_RESTRICT rows[5];
+    ComputeRowPointers(y, rows);
+    (void)kBorder;
 
     const V wh0 = LoadDup128(d, weights->horz + 0 * 4);
     const V wh1 = LoadDup128(d, weights->horz + 1 * 4);
@@ -164,64 +126,34 @@ class Separable5Impl {
 
     size_t x = 0;
 
-    // More than one iteration for scalars.
+    // First vector(s): mirrored left border (more than one for scalars).
     for (; x < kRadius; x += Lanes(d)) {
-      const V conv0 =
-          Mul(HorzConvolveFirst(row_m, x, xsize, wh0, wh1, wh2), wv0);
-
-      const V conv1t = HorzConvolveFirst(row_t1, x, xsize, wh0, wh1, wh2);
-      const V conv1b = HorzConvolveFirst(row_b1, x, xsize, wh0, wh1, wh2);
-      const V conv1 = MulAdd(Add(conv1t, conv1b), wv1, conv0);
-
-      const V conv2t = HorzConvolveFirst(row_t2, x, xsize, wh0, wh1, wh2);
-      const V conv2b = HorzConvolveFirst(row_b2, x, xsize, wh0, wh1, wh2);
-      const V conv2 = MulAdd(Add(conv2t, conv2b), wv2, conv1);
-      Store(conv2, d, row_out + x);
+      Store(BorderColumn<kSizeModN, 0>(rows, x, xsize, wh0, wh1, wh2, wv0, wv1,
+                                       wv2, ml1, ml2),
+            d, row_out + x);
     }
 
-    // Main loop: load inputs without padding
+    // Main loop: load inputs without padding.
     for (; x + Lanes(d) + kRadius <= xsize; x += Lanes(d)) {
-      const V conv0 = Mul(HorzConvolve(row_m + x, wh0, wh1, wh2), wv0);
-
-      const V conv1t = HorzConvolve(row_t1 + x, wh0, wh1, wh2);
-      const V conv1b = HorzConvolve(row_b1 + x, wh0, wh1, wh2);
-      const V conv1 = MulAdd(Add(conv1t, conv1b), wv1, conv0);
-
-      const V conv2t = HorzConvolve(row_t2 + x, wh0, wh1, wh2);
-      const V conv2b = HorzConvolve(row_b2 + x, wh0, wh1, wh2);
-      const V conv2 = MulAdd(Add(conv2t, conv2b), wv2, conv1);
-      Store(conv2, d, row_out + x);
+      Store(BorderColumn<kSizeModN, 1>(rows, x, xsize, wh0, wh1, wh2, wv0, wv1,
+                                       wv2, ml1, ml2),
+            d, row_out + x);
     }
 
-    // Last full vector to write (the above loop handled mod >= kRadius)
+    // Last full vector to write (the above loop handled mod >= kRadius).
 #if HWY_TARGET == HWY_SCALAR
     while (x < xsize) {
 #else
     if (kSizeModN < kRadius) {
 #endif
-      const V conv0 = Mul(
-          HorzConvolveLast<kSizeModN>(row_m, x, xsize, wh0, wh1, wh2, ml1, ml2),
-          wv0);
-
-      const V conv1t = HorzConvolveLast<kSizeModN>(row_t1, x, xsize, wh0, wh1,
-                                                   wh2, ml1, ml2);
-      const V conv1b = HorzConvolveLast<kSizeModN>(row_b1, x, xsize, wh0, wh1,
-                                                   wh2, ml1, ml2);
-      const V conv1 = MulAdd(Add(conv1t, conv1b), wv1, conv0);
-
-      const V conv2t = HorzConvolveLast<kSizeModN>(row_t2, x, xsize, wh0, wh1,
-                                                   wh2, ml1, ml2);
-      const V conv2b = HorzConvolveLast<kSizeModN>(row_b2, x, xsize, wh0, wh1,
-                                                   wh2, ml1, ml2);
-      const V conv2 = MulAdd(Add(conv2t, conv2b), wv2, conv1);
-      Store(conv2, d, row_out + x);
+      Store(BorderColumn<kSizeModN, 2>(rows, x, xsize, wh0, wh1, wh2, wv0, wv1,
+                                       wv2, ml1, ml2),
+            d, row_out + x);
       x += Lanes(d);
     }
 
     // If mod = 0, the above vector was the last.
     if (kSizeModN != 0) {
-      const float* JXL_RESTRICT rows[5] = {row_t2, row_t1, row_m, row_b1,
-                                           row_b2};
       // Tail starts at x >= Lanes(d) > kRadius, so x-kRadius >= 0 always; only
       // the final kRadius columns can read past xsize on the right.
       const int64_t safe_end = static_cast<int64_t>(xsize) - kRadius;
@@ -293,6 +225,95 @@ class Separable5Impl {
     (void)ml2;
     (void)xsize;
     return HorzConvolve(row + x, wh0, wh1, wh2);
+  }
+
+  // Fills rows[] = {t2, t1, m, b1, b2} for output row y, applying image-bound
+  // vertical mirroring (incl. the tiny-height <=4 double-reflection LUT). For
+  // interior rows the defaults (+/- stride) are kept.
+  JXL_INLINE void ComputeRowPointers(const size_t y,
+                                     const float* JXL_RESTRICT rows[5]) const {
+    const int64_t stride = in->PixelsPerRow();
+    const float* const JXL_RESTRICT row_m = rect.ConstRow(*in, y);
+    const float* row_t2 = row_m - 2 * stride;
+    const float* row_t1 = row_m - 1 * stride;
+    const float* row_b1 = row_m + 1 * stride;
+    const float* row_b2 = row_m + 2 * stride;
+    const size_t img_y = rect.y0() + y;
+    if (in->ysize() <= 2 * kRadius) {  // Very special: double reflections
+      static constexpr size_t kBorderLut[4 * 8] = {
+          0, 0, 0, 0, 0, 0xBAD, 0xBAD, 0xBAD,  // 1 row
+          1, 0, 0, 1, 1, 0,     0xBAD, 0xBAD,  // 2 rows
+          1, 0, 0, 1, 2, 2,     1,     0xBAD,  // 3 rows
+          1, 0, 0, 1, 2, 3,     3,     2,      // 4 rows
+      };
+      JXL_DASSERT(in->ysize() <= 4);
+      const size_t o = in->ysize() * 8 - 6 + img_y;
+      row_t2 = in->ConstRow(kBorderLut[o - 2]) + rect.x0();
+      row_t1 = in->ConstRow(kBorderLut[o - 1]) + rect.x0();
+      row_b1 = in->ConstRow(kBorderLut[o + 1]) + rect.x0();
+      row_b2 = in->ConstRow(kBorderLut[o + 2]) + rect.x0();
+    } else if (img_y < kRadius) {
+      if (img_y == 0) {
+        row_t1 = row_m;
+        row_t2 = row_b1;
+      } else {
+        JXL_DASSERT(img_y == 1);
+        row_t2 = row_t1;
+      }
+    } else if (img_y + kRadius >= in->ysize()) {
+      if (img_y + 1 == in->ysize()) {
+        row_b1 = row_m;
+        row_b2 = row_t1;
+      } else {
+        JXL_DASSERT(img_y + 2 == in->ysize());
+        row_b2 = row_b1;
+      }
+    }
+    rows[0] = row_t2;
+    rows[1] = row_t1;
+    rows[2] = row_m;
+    rows[3] = row_b1;
+    rows[4] = row_b2;
+  }
+
+  // One output SIMD column with horizontal-convolution dedup: reflected source
+  // rows frequently alias (e.g. row_t1 == row_m at the top edge), so each
+  // distinct row is convolved once and reused. The vertical combine is the
+  // identical FMA sequence ConvolveRow used, so output is byte-exact.
+  template <size_t kSizeModN, int kRegion>
+  JXL_MAYBE_INLINE V BorderColumn(const float* const JXL_RESTRICT rows[5],
+                                  const int64_t x, const int64_t xsize,
+                                  const V wh0, const V wh1, const V wh2,
+                                  const V wv0, const V wv1, const V wv2,
+                                  const I ml1, const I ml2) const {
+    const V h2 = HorzPick<kSizeModN, kRegion>(rows[2], x, xsize, wh0, wh1, wh2,
+                                              ml1, ml2);
+    const V h1 = (rows[1] == rows[2])
+                     ? h2
+                     : HorzPick<kSizeModN, kRegion>(rows[1], x, xsize, wh0, wh1,
+                                                    wh2, ml1, ml2);
+    const V h3 = (rows[3] == rows[2])   ? h2
+                 : (rows[3] == rows[1]) ? h1
+                                        : HorzPick<kSizeModN, kRegion>(
+                                              rows[3], x, xsize, wh0, wh1, wh2,
+                                              ml1, ml2);
+    const V h0 = (rows[0] == rows[2])   ? h2
+                 : (rows[0] == rows[1]) ? h1
+                 : (rows[0] == rows[3]) ? h3
+                                        : HorzPick<kSizeModN, kRegion>(
+                                              rows[0], x, xsize, wh0, wh1, wh2,
+                                              ml1, ml2);
+    const V h4 = (rows[4] == rows[2])   ? h2
+                 : (rows[4] == rows[1]) ? h1
+                 : (rows[4] == rows[3]) ? h3
+                 : (rows[4] == rows[0]) ? h0
+                                        : HorzPick<kSizeModN, kRegion>(
+                                              rows[4], x, xsize, wh0, wh1, wh2,
+                                              ml1, ml2);
+    const V conv0 = Mul(h2, wv0);
+    const V conv1 = MulAdd(Add(h1, h3), wv1, conv0);
+    const V conv2 = MulAdd(Add(h0, h4), wv2, conv1);
+    return conv2;
   }
 
   // Convolves a single SIMD column for every output row in [y0, y1) using a
