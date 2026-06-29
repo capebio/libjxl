@@ -263,33 +263,84 @@ void DequantDC(const Rect& r, Image3F* dc, ImageB* quant_dc, const Image& in,
     JXL_DASSERT(r.ysize() == 0 ||
                 (r.ysize() - 1) >> chroma_subsampling.VShift(2) <
                     in.channel[2].plane.ysize());
-    for (size_t y = 0; y < r.ysize(); y++) {
-      uint8_t* qdc_row_val = r.Row(quant_dc, y);
-      const int32_t* quant_row_x =
-          in.channel[1].plane.Row(y >> chroma_subsampling.VShift(0));
-      const int32_t* quant_row_y =
-          in.channel[0].plane.Row(y >> chroma_subsampling.VShift(1));
-      const int32_t* quant_row_b =
-          in.channel[2].plane.Row(y >> chroma_subsampling.VShift(2));
-      for (size_t x = 0; x < r.xsize(); x++) {
+    // Threshold-channel -> modular-storage map: thresholds[0]=X=channel[1],
+    // thresholds[1]=Y=channel[0], thresholds[2]=B=channel[2]. Final packing is
+    // bucket = (bucket_x*(|tb|+1) + bucket_b)*(|ty|+1) + bucket_y. The two
+    // specialized loops below are byte-identical to the generic form: hoisting
+    // the bases/pointers, branchless accumulation (`+= v > t` == `if (v>t) ++`),
+    // and native-resolution chroma reuse do not change any computed value.
+    const int* JXL_RESTRICT tx = bctx.dc_thresholds[0].data();
+    const int* JXL_RESTRICT ty = bctx.dc_thresholds[1].data();
+    const int* JXL_RESTRICT tb = bctx.dc_thresholds[2].data();
+    const size_t nx = bctx.dc_thresholds[0].size();
+    const size_t ny = bctx.dc_thresholds[1].size();
+    const size_t nb = bctx.dc_thresholds[2].size();
+    const size_t base_b = nb + 1;
+    const size_t base_y = ny + 1;
+    if (chroma_subsampling.Is444()) {
+      // (#5) 4:4:4: no per-pixel HShift, hoisted bases, branchless buckets.
+      for (size_t y = 0; y < r.ysize(); y++) {
+        uint8_t* JXL_RESTRICT qdc_row_val = r.Row(quant_dc, y);
+        const int32_t* JXL_RESTRICT quant_row_x = in.channel[1].plane.Row(y);
+        const int32_t* JXL_RESTRICT quant_row_y = in.channel[0].plane.Row(y);
+        const int32_t* JXL_RESTRICT quant_row_b = in.channel[2].plane.Row(y);
+        for (size_t x = 0; x < r.xsize(); x++) {
+          const int32_t vx = quant_row_x[x];
+          const int32_t vy = quant_row_y[x];
+          const int32_t vb = quant_row_b[x];
+          int bucket_x = 0;
+          int bucket_y = 0;
+          int bucket_b = 0;
+          for (size_t i = 0; i < nx; i++) bucket_x += vx > tx[i];
+          for (size_t i = 0; i < ny; i++) bucket_y += vy > ty[i];
+          for (size_t i = 0; i < nb; i++) bucket_b += vb > tb[i];
+          qdc_row_val[x] = static_cast<uint8_t>(
+              (bucket_x * base_b + bucket_b) * base_y + bucket_y);
+        }
+      }
+    } else {
+      // (#6) Subsampled: classify each native chroma sample once and reuse it
+      // across the luma columns it covers (x>>HShift is monotone in x). No
+      // allocation; vertical reuse is left on the table to keep it scratch-free.
+      const size_t hsx = chroma_subsampling.HShift(0);
+      const size_t hsy = chroma_subsampling.HShift(1);
+      const size_t hsb = chroma_subsampling.HShift(2);
+      const size_t vsx = chroma_subsampling.VShift(0);
+      const size_t vsy = chroma_subsampling.VShift(1);
+      const size_t vsb = chroma_subsampling.VShift(2);
+      for (size_t y = 0; y < r.ysize(); y++) {
+        uint8_t* JXL_RESTRICT qdc_row_val = r.Row(quant_dc, y);
+        const int32_t* JXL_RESTRICT quant_row_x =
+            in.channel[1].plane.Row(y >> vsx);
+        const int32_t* JXL_RESTRICT quant_row_y =
+            in.channel[0].plane.Row(y >> vsy);
+        const int32_t* JXL_RESTRICT quant_row_b =
+            in.channel[2].plane.Row(y >> vsb);
+        size_t cached_xc = ~static_cast<size_t>(0);
+        size_t cached_bc = ~static_cast<size_t>(0);
         int bucket_x = 0;
-        int bucket_y = 0;
         int bucket_b = 0;
-        for (int t : bctx.dc_thresholds[0]) {
-          if (quant_row_x[x >> chroma_subsampling.HShift(0)] > t) bucket_x++;
+        for (size_t x = 0; x < r.xsize(); x++) {
+          const size_t xc = x >> hsx;
+          if (xc != cached_xc) {
+            const int32_t vx = quant_row_x[xc];
+            bucket_x = 0;
+            for (size_t i = 0; i < nx; i++) bucket_x += vx > tx[i];
+            cached_xc = xc;
+          }
+          const size_t bc = x >> hsb;
+          if (bc != cached_bc) {
+            const int32_t vb = quant_row_b[bc];
+            bucket_b = 0;
+            for (size_t i = 0; i < nb; i++) bucket_b += vb > tb[i];
+            cached_bc = bc;
+          }
+          const int32_t vy = quant_row_y[x >> hsy];
+          int bucket_y = 0;
+          for (size_t i = 0; i < ny; i++) bucket_y += vy > ty[i];
+          qdc_row_val[x] = static_cast<uint8_t>(
+              (bucket_x * base_b + bucket_b) * base_y + bucket_y);
         }
-        for (int t : bctx.dc_thresholds[1]) {
-          if (quant_row_y[x >> chroma_subsampling.HShift(1)] > t) bucket_y++;
-        }
-        for (int t : bctx.dc_thresholds[2]) {
-          if (quant_row_b[x >> chroma_subsampling.HShift(2)] > t) bucket_b++;
-        }
-        int bucket = bucket_x;
-        bucket *= bctx.dc_thresholds[2].size() + 1;
-        bucket += bucket_b;
-        bucket *= bctx.dc_thresholds[1].size() + 1;
-        bucket += bucket_y;
-        qdc_row_val[x] = bucket;
       }
     }
   }
