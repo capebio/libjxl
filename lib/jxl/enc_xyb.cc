@@ -211,6 +211,82 @@ Status SRGBToXYBAndLinear(const float* JXL_RESTRICT premul_absorb,
   return true;
 }
 
+// Fused copy + XYB for linear-sRGB input: writes the original linear-sRGB
+// pixels into `linear` and the XYB result back into `image`, reading each
+// source row only once. Byte-exact with the two-pass
+// CopyImageTo(*image, linear) + LinearSRGBToXYB(image) it replaces (the
+// per-pixel LinearRGBToXYB math is identical; only redundant traffic is cut).
+Status LinearSRGBToXYBAndCopy(const float* JXL_RESTRICT premul_absorb,
+                              ThreadPool* pool, Image3F* JXL_RESTRICT image,
+                              Image3F* JXL_RESTRICT linear) {
+  const size_t xsize = image->xsize();
+
+  const HWY_FULL(float) d;
+  const auto process_row = [&](const uint32_t task,
+                               size_t /*thread*/) -> Status {
+    const size_t y = static_cast<size_t>(task);
+    float* JXL_RESTRICT row0 = image->PlaneRow(0, y);
+    float* JXL_RESTRICT row1 = image->PlaneRow(1, y);
+    float* JXL_RESTRICT row2 = image->PlaneRow(2, y);
+    float* JXL_RESTRICT lin0 = linear->PlaneRow(0, y);
+    float* JXL_RESTRICT lin1 = linear->PlaneRow(1, y);
+    float* JXL_RESTRICT lin2 = linear->PlaneRow(2, y);
+
+    for (size_t x = 0; x < xsize; x += Lanes(d)) {
+      const auto in_r = Load(d, row0 + x);
+      const auto in_g = Load(d, row1 + x);
+      const auto in_b = Load(d, row2 + x);
+
+      Store(in_r, d, lin0 + x);
+      Store(in_g, d, lin1 + x);
+      Store(in_b, d, lin2 + x);
+
+      LinearRGBToXYB(in_r, in_g, in_b, premul_absorb, row0 + x, row1 + x,
+                     row2 + x);
+    }
+    return true;
+  };
+  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, static_cast<uint32_t>(image->ysize()),
+                                ThreadPool::NoInit, process_row,
+                                "LinearToXYBAndCopy"));
+  return true;
+}
+
+// Out-of-place XYB for linear-sRGB input: reads `src` (left unchanged) and
+// writes the XYB result into `dst`. Byte-exact with the two-pass
+// CopyImageTo(src, *dst) + LinearSRGBToXYB(dst) it replaces; only the
+// intermediate copy is removed.
+Status LinearSRGBToXYBFrom(const float* JXL_RESTRICT premul_absorb,
+                           ThreadPool* pool, const Image3F& src,
+                           Image3F* JXL_RESTRICT dst) {
+  const size_t xsize = src.xsize();
+
+  const HWY_FULL(float) d;
+  const auto process_row = [&](const uint32_t task,
+                               size_t /*thread*/) -> Status {
+    const size_t y = static_cast<size_t>(task);
+    const float* JXL_RESTRICT src0 = src.ConstPlaneRow(0, y);
+    const float* JXL_RESTRICT src1 = src.ConstPlaneRow(1, y);
+    const float* JXL_RESTRICT src2 = src.ConstPlaneRow(2, y);
+    float* JXL_RESTRICT dst0 = dst->PlaneRow(0, y);
+    float* JXL_RESTRICT dst1 = dst->PlaneRow(1, y);
+    float* JXL_RESTRICT dst2 = dst->PlaneRow(2, y);
+
+    for (size_t x = 0; x < xsize; x += Lanes(d)) {
+      const auto in_r = Load(d, src0 + x);
+      const auto in_g = Load(d, src1 + x);
+      const auto in_b = Load(d, src2 + x);
+      LinearRGBToXYB(in_r, in_g, in_b, premul_absorb, dst0 + x, dst1 + x,
+                     dst2 + x);
+    }
+    return true;
+  };
+  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, static_cast<uint32_t>(src.ysize()),
+                                ThreadPool::NoInit, process_row,
+                                "LinearToXYBFrom"));
+  return true;
+}
+
 void ComputePremulAbsorb(float intensity_target, float* premul_absorb) {
   const HWY_FULL(float) d;
   const size_t N = Lanes(d);
@@ -258,9 +334,12 @@ Status ToXYB(const ColorEncoding& c_current, float intensity_target,
     // This only happens if kitten or slower, moving ImageBundle might be
     // possible but the encoder is much slower than this copy.
     if (want_linear) {
-      JXL_RETURN_IF_ERROR(CopyImageTo(*image, linear));
+      // Fused single-pass copy + XYB (was CopyImageTo + LinearSRGBToXYB).
+      JXL_RETURN_IF_ERROR(
+          LinearSRGBToXYBAndCopy(premul_absorb, pool, image, linear));
+    } else {
+      JXL_RETURN_IF_ERROR(LinearSRGBToXYB(premul_absorb, pool, image));
     }
-    JXL_RETURN_IF_ERROR(LinearSRGBToXYB(premul_absorb, pool, image));
     return true;
   }
 
@@ -281,9 +360,13 @@ Status ToXYB(const ColorEncoding& c_current, float intensity_target,
       c_current, intensity_target, *image, black, Rect(*image), c_linear_srgb,
       cms, pool, want_linear ? linear : image));
   if (want_linear) {
-    JXL_RETURN_IF_ERROR(CopyImageTo(*linear, image));
+    // Convert linear sRGB -> XYB out-of-place into `image`, leaving `linear`
+    // intact (was CopyImageTo(*linear, image) + in-place LinearSRGBToXYB).
+    JXL_RETURN_IF_ERROR(
+        LinearSRGBToXYBFrom(premul_absorb, pool, *linear, image));
+  } else {
+    JXL_RETURN_IF_ERROR(LinearSRGBToXYB(premul_absorb, pool, image));
   }
-  JXL_RETURN_IF_ERROR(LinearSRGBToXYB(premul_absorb, pool, image));
   return true;
 }
 
