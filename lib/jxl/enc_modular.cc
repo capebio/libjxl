@@ -1329,13 +1329,23 @@ Status ModularFrameEncoder::ComputeTokens(ThreadPool* pool) {
   stream_headers_.resize(num_streams);
   tokens_.resize(num_streams);
   image_widths_.resize(num_streams);
+  stream_has_data_.assign(num_streams, 0);
   const auto process_stream = [&](const uint32_t stream_id,
                                   size_t /* thread */) -> Status {
     tokens_[stream_id].clear();
+    // ModularCompress is called for every stream (including empty ones) exactly
+    // as before, so tokens_/headers_/widths_ are byte-identical. Record the
+    // post-compress emptiness (what EncodeStream used to probe directly) before
+    // releasing the source planes.
     JXL_RETURN_IF_ERROR(
         ModularCompress(stream_images_[stream_id], stream_options_[stream_id],
                         stream_id, tree_, stream_headers_[stream_id],
                         tokens_[stream_id], &image_widths_[stream_id]));
+    stream_has_data_[stream_id] =
+        stream_images_[stream_id].channel.empty() ? 0 : 1;
+    // The source planes are dead for the rest of encoding; free them now so they
+    // do not sit resident through EncodeGlobalInfo + the EncodeStream loop.
+    ReleaseImage(stream_id);
     return true;
   };
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_streams, ThreadPool::NoInit,
@@ -1390,11 +1400,19 @@ Status ModularFrameEncoder::EncodeStream(BitWriter* writer, AuxOut* aux_out,
                                          LayerType layer,
                                          const ModularStreamId& stream) {
   size_t stream_id = stream.ID(frame_dim_);
-  if (stream_images_[stream_id].channel.empty()) {
+  // Once ComputeTokens has run it frees the source images, so consult the
+  // recorded emptiness flag. On the generic-compress path (no tokens) the source
+  // image is still live, so probe it directly as before.
+  const bool computed_tokens = !tokens_.empty();
+  const bool has_data =
+      computed_tokens
+          ? (stream_id < stream_has_data_.size() && stream_has_data_[stream_id])
+          : !stream_images_[stream_id].channel.empty();
+  if (!has_data) {
     JXL_DEBUG_V(10, "Modular stream %" PRIuS " is empty.", stream_id);
     return true;  // Image with no channels, header never gets decoded.
   }
-  if (tokens_.empty()) {
+  if (!computed_tokens) {
     JXL_RETURN_IF_ERROR(ModularGenericCompress(
         stream_images_[stream_id], stream_options_[stream_id], *writer, aux_out,
         layer, stream_id));
@@ -1407,10 +1425,13 @@ Status ModularFrameEncoder::EncodeStream(BitWriter* writer, AuxOut* aux_out,
   return true;
 }
 
-void ModularFrameEncoder::ClearStreamData(const ModularStreamId& stream) {
-  size_t stream_id = stream.ID(frame_dim_);
+void ModularFrameEncoder::ReleaseImage(size_t stream_id) {
   Image empty_image(stream_images_[stream_id].memory_manager());
   std::swap(stream_images_[stream_id], empty_image);
+}
+
+void ModularFrameEncoder::ClearStreamData(const ModularStreamId& stream) {
+  ReleaseImage(stream.ID(frame_dim_));
 }
 
 void ModularFrameEncoder::ClearModularStreamData() {

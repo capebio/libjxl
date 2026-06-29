@@ -104,8 +104,15 @@ class ModularFrameEncoder {
                              int minShift, int maxShift,
                              const ModularStreamId& stream, bool do_color,
                              bool groupwise);
+  // Frees a stream's source image planes (swap-with-empty). Used to release the
+  // per-stream images as soon as ComputeTokens has tokenized them — the rest of
+  // encoding (EncodeGlobalInfo + EncodeStream) needs only tokens_/headers_/code_.
+  void ReleaseImage(size_t stream_id);
   JxlMemoryManager* memory_manager_;
   std::vector<Image> stream_images_;
+  // After ComputeTokens frees stream_images_, EncodeStream can no longer probe
+  // channel.empty(); this records, per stream, whether it had any data.
+  std::vector<uint8_t> stream_has_data_;
   std::vector<ModularOptions> stream_options_;
   std::vector<uint32_t> quants_;
 
