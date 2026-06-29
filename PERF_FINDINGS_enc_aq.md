@@ -85,9 +85,23 @@ small_file.jpg (0.07MP)                        17814      17814     0.0538  0.05
 
 Effort 3 exercises the **hot path** (InitialQuantField → ComputeTile →
 FuzzyErosion / PerBlockModulations / MaskingSqrt = changes A–D), i.e. the path
-that runs on every encode. The slow-path changes (E–J, Kitten/Tortoise +
-max_error) are additionally byte-exact by construction and were spot-checked at
-effort 9. [timing in the A/B is noise — OLD and NEW ran concurrently under CPU
+that runs on every encode.
+
+**Slow path (effort 9 / Tortoise).** Re-ran the A/B at effort 9, which drives the
+`FindBestQuantization` Butteraugli loop (≈44 s/encode on the 7.68 MP file —
+confirming the loop is actually entered, so changes E, F, G, J execute):
+
+```
+file (e9)               old_bytes  new_bytes  old_bt  new_bt
+P1110226 windows.jpg    846727     846727     0.0473  0.0473
+small_file.jpg          15519      15519      0.0743  0.0743
+=> byte-identical + identical Butteraugli
+```
+
+(max_error mode, changes H/I, is not reachable through this harness but is
+byte-exact by construction and compiled clean.)
+
+[Timing in the A/B itself is noise — OLD and NEW ran concurrently under CPU
 contention and across debug/release profiles; perf evidence is the FuzzyErosion
 microbench above.]
 
