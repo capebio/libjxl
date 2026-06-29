@@ -88,6 +88,17 @@ class Separable5Impl {
     if (rect.xsize() >= min_width) {
       JXL_ENSURE(SameSize(rect, *out));
 
+      if (in->ysize() <= 2 * kRadius) {  // tiny height: cross-row-reuse kernel
+        switch (rect.xsize() % Lanes(Simd())) {
+          case 0:
+            return RunTinyHeight<0>();
+          case 1:
+            return RunTinyHeight<1>();
+          default:
+            return RunTinyHeight<2>();
+        }
+      }
+
       switch (rect.xsize() % Lanes(Simd())) {
         case 0:
           return RunRows<0>();
@@ -427,6 +438,94 @@ class Separable5Impl {
     };
     return RunOnPool(pool, 0, static_cast<uint32_t>(num_bands),
                      ThreadPool::NoInit, process_band, "ConvolveBands");
+  }
+
+  // Convolves one SIMD column for every output row when in->ysize() <= 4. Each
+  // of the (<=4) distinct source rows is convolved once into hrow[], then every
+  // output row is formed from the kBorderLut index mapping + the identical
+  // vertical FMA combine. Full cross-row reuse vs ConvolveRow's per-row recompute.
+  template <size_t kSizeModN, int kRegion>
+  JXL_MAYBE_INLINE void TinyColumn(const size_t ysz, const int64_t x,
+                                   const int64_t xsize, const size_t* lut,
+                                   const V wh0, const V wh1, const V wh2,
+                                   const V wv0, const V wv1, const V wv2,
+                                   const I ml1, const I ml2) const {
+    const D d;
+    V hrow[2 * kRadius];  // ysz <= 2*kRadius == 4
+    for (size_t j = 0; j < ysz; ++j) {
+      hrow[j] = HorzPick<kSizeModN, kRegion>(in->ConstRow(j) + rect.x0(), x,
+                                             xsize, wh0, wh1, wh2, ml1, ml2);
+    }
+    for (size_t y = 0; y < rect.ysize(); ++y) {
+      const size_t img_y = rect.y0() + y;
+      const size_t o = ysz * 8 - 6 + img_y;
+      const V h0 = hrow[lut[o - 2]];
+      const V h1 = hrow[lut[o - 1]];
+      const V h2 = hrow[img_y];
+      const V h3 = hrow[lut[o + 1]];
+      const V h4 = hrow[lut[o + 2]];
+      const V conv0 = Mul(h2, wv0);
+      const V conv1 = MulAdd(Add(h1, h3), wv1, conv0);
+      const V conv2 = MulAdd(Add(h0, h4), wv2, conv1);
+      Store(conv2, d, out->Row(y) + x);
+    }
+  }
+
+  // Tiny-height fast path (in->ysize() <= 2*kRadius). Byte-exact vs ConvolveRow.
+  template <size_t kSizeModN>
+  JXL_INLINE Status RunTinyHeight() {
+    const D d;
+    const int64_t xsize = rect.xsize();
+    const size_t ysz = in->ysize();
+    static constexpr size_t kBorderLut[4 * 8] = {
+        0, 0, 0, 0, 0, 0xBAD, 0xBAD, 0xBAD,  // 1 row
+        1, 0, 0, 1, 1, 0,     0xBAD, 0xBAD,  // 2 rows
+        1, 0, 0, 1, 2, 2,     1,     0xBAD,  // 3 rows
+        1, 0, 0, 1, 2, 3,     3,     2,      // 4 rows
+    };
+    JXL_DASSERT(ysz <= 4);
+    const V wh0 = LoadDup128(d, weights->horz + 0 * 4);
+    const V wh1 = LoadDup128(d, weights->horz + 1 * 4);
+    const V wh2 = LoadDup128(d, weights->horz + 2 * 4);
+    const V wv0 = LoadDup128(d, weights->vert + 0 * 4);
+    const V wv1 = LoadDup128(d, weights->vert + 1 * 4);
+    const V wv2 = LoadDup128(d, weights->vert + 2 * 4);
+    const I ml1 = MirrorLanes<1>();
+    const I ml2 = MirrorLanes<2>();
+
+    int64_t x = 0;
+    for (; x < kRadius; x += Lanes(d)) {
+      TinyColumn<kSizeModN, 0>(ysz, x, xsize, kBorderLut, wh0, wh1, wh2, wv0,
+                               wv1, wv2, ml1, ml2);
+    }
+    for (; x + Lanes(d) + kRadius <= xsize; x += Lanes(d)) {
+      TinyColumn<kSizeModN, 1>(ysz, x, xsize, kBorderLut, wh0, wh1, wh2, wv0,
+                               wv1, wv2, ml1, ml2);
+    }
+#if HWY_TARGET == HWY_SCALAR
+    while (x < xsize) {
+#else
+    if (kSizeModN < kRadius) {
+#endif
+      TinyColumn<kSizeModN, 2>(ysz, x, xsize, kBorderLut, wh0, wh1, wh2, wv0,
+                               wv1, wv2, ml1, ml2);
+      x += Lanes(d);
+    }
+
+    if (kSizeModN != 0) {
+      const int64_t safe_end = xsize - kRadius;
+      for (size_t y = 0; y < rect.ysize(); ++y) {
+        const float* JXL_RESTRICT rows[5];
+        ComputeRowPointers(y, rows);
+        float* const JXL_RESTRICT row_out = out->Row(y);
+        int64_t xx = x;
+        for (; xx < safe_end; ++xx)
+          row_out[xx] = ScalarPixel<false>(rows, xx, xsize, weights);
+        for (; xx < xsize; ++xx)
+          row_out[xx] = ScalarPixel<true>(rows, xx, xsize, weights);
+      }
+    }
+    return true;
   }
 
   // Returns IndicesFromVec(d, indices) such that TableLookupLanes on the
