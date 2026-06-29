@@ -158,11 +158,7 @@ Status UndoOrientation(jxl::Orientation undo_orientation, const Plane<T>& image,
     const auto process_row = [&](const uint32_t task,
                                  size_t /*thread*/) -> Status {
       const int64_t y = task;
-      const T* JXL_RESTRICT row_in = image.Row(y);
-      T* JXL_RESTRICT row_out = out.Row(ysize - y - 1);
-      for (size_t x = 0; x < xsize; ++x) {
-        row_out[x] = row_in[x];
-      }
+      memcpy(out.Row(ysize - y - 1), image.Row(y), xsize * sizeof(T));
       return true;
     };
     JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, static_cast<uint32_t>(ysize),
@@ -308,9 +304,13 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
     return true;
   };
 
+  // For vertical flip we avoid allocating full temporary planes by remapping
+  // the source row index inline: source row = ysize-1-output_row.
+  const bool flip_vertical = (undo_orientation == Orientation::kFlipVertical);
+
   // Channels used to store the transformed original channels if needed.
   ImageF temp_channels[kConvertMaxChannels];
-  if (undo_orientation != Orientation::kIdentity) {
+  if (undo_orientation != Orientation::kIdentity && !flip_vertical) {
     for (size_t c = 0; c < num_channels; ++c) {
       if (channels[c]) {
         JXL_RETURN_IF_ERROR(UndoOrientation(undo_orientation, *channels[c],
@@ -366,9 +366,10 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
       const auto process_row = [&](const uint32_t task,
                                    const size_t thread) -> Status {
         const int64_t y = task;
+        const int64_t src_y = flip_vertical ? (int64_t)(ysize - 1) - y : y;
         const float* JXL_RESTRICT row_in[kConvertMaxChannels];
         for (size_t c = 0; c < num_channels; c++) {
-          row_in[c] = channels[c] ? channels[c]->Row(y) : ones.Row(0);
+          row_in[c] = channels[c] ? channels[c]->Row(src_y) : ones.Row(0);
         }
         hwy::float16_t* JXL_RESTRICT row_f16[kConvertMaxChannels];
         for (size_t c = 0; c < num_channels; c++) {
@@ -413,6 +414,7 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
       const auto process_row = [&](const uint32_t task,
                                    const size_t thread) -> Status {
         const int64_t y = task;
+        const int64_t src_y = flip_vertical ? (int64_t)(ysize - 1) - y : y;
         uint8_t* row_out =
             out_callback.IsPresent()
                 ? row_out_callback[thread].data()
@@ -420,7 +422,7 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
         Span<uint8_t> out_span(row_out, row_size);
         const float* JXL_RESTRICT row_in[kConvertMaxChannels];
         for (size_t c = 0; c < num_channels; c++) {
-          row_in[c] = channels[c] ? channels[c]->Row(y) : ones.Row(0);
+          row_in[c] = channels[c] ? channels[c]->Row(src_y) : ones.Row(0);
         }
         if (little_endian) {
           StoreFloatRow<StoreLEFloat>(row_in, num_channels, xsize, out_span);
@@ -452,6 +454,7 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
     const auto process_row = [&](const uint32_t task,
                                  const size_t thread) -> Status {
       const int64_t y = task;
+      const int64_t src_y = flip_vertical ? (int64_t)(ysize - 1) - y : y;
       uint8_t* row_out =
           out_callback.IsPresent()
               ? row_out_callback[thread].data()
@@ -459,7 +462,7 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
       Span<uint8_t> out_span(row_out, row_size);
       const float* JXL_RESTRICT row_in[kConvertMaxChannels];
       for (size_t c = 0; c < num_channels; c++) {
-        row_in[c] = channels[c] ? channels[c]->Row(y) : ones.Row(0);
+        row_in[c] = channels[c] ? channels[c]->Row(src_y) : ones.Row(0);
       }
       uint32_t* JXL_RESTRICT row_u32[kConvertMaxChannels];
       for (size_t c = 0; c < num_channels; c++) {
