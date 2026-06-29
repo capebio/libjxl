@@ -1596,6 +1596,10 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
     bool need_to_restore = (nb_rcts_to_try > 1);
     std::vector<Channel> orig;
     orig.reserve(3);
+    // One workspace shared by the baseline + up to 18 RCT-trial EstimateCost
+    // calls below (all on `gi`, identical dimensions): keeps the aligned row
+    // buffer and per-context histograms alive instead of reallocating per call.
+    EstimateCostWorkspace cost_ws;
     // These should be 19 actually different transforms; the remaining ones
     // are equivalent to one of these (note that the first two are do-nothing
     // and YCoCg) modulo channel reordering (which only matters in the case of
@@ -1608,7 +1612,7 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
       nb_rcts_to_try--;
       // no-op rct_type; use as baseline cost
       if (rct_type == 0) {
-        JXL_ASSIGN_OR_RETURN(best_cost, EstimateCost(gi));
+        JXL_ASSIGN_OR_RETURN(best_cost, EstimateCost(gi, cost_ws));
         for (size_t c = 0; c < 3; ++c) {
           Channel& genuine = gi.channel[gi.nb_meta_channels + c];
           JXL_ASSIGN_OR_RETURN(
@@ -1624,7 +1628,7 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
                                        &gi.channel[gi.nb_meta_channels + 1],
                                        &gi.channel[gi.nb_meta_channels + 2]};
         JXL_RETURN_IF_ERROR(FwdRct(in, out, rct_type, transform_pool));
-        JXL_ASSIGN_OR_RETURN(float cost, EstimateCost(gi));
+        JXL_ASSIGN_OR_RETURN(float cost, EstimateCost(gi, cost_ws));
         if (cost < best_cost) {
           best_rct = rct_type;
           best_cost = cost;

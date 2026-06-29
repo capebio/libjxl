@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/compiler_specific.h"
@@ -59,7 +60,7 @@ using hwy::HWY_NAMESPACE::Sub;
 using hwy::HWY_NAMESPACE::Xor;
 using hwy::HWY_NAMESPACE::Zero;
 
-StatusOr<float> EstimateCost(const Image& img) {
+StatusOr<float> EstimateCost(const Image& img, EstimateCostWorkspace& ws) {
   size_t histo_cost = 0;
   float histo_cost_frac = 0.0f;
   size_t extra_bits = 0;
@@ -71,7 +72,11 @@ StatusOr<float> EstimateCost(const Image& img) {
   // One context per cutoff (17). Matches estimate_cost_detail::kLastCtx + 1 and
   // the SIMD ContextMap; the old "+ 1" produced an unused 18th histogram.
   constexpr size_t nc = sizeof(cutoffs) / sizeof(*cutoffs);
-  Histogram histo[nc] = {};
+  // Reuse the workspace histograms (counts vectors retain capacity across calls);
+  // cleared here so each call starts from empty exactly as a fresh array would.
+  std::vector<Histogram>& histo = ws.histo;
+  histo.resize(nc);
+  for (auto& h : histo) h.Clear();
   for (const Channel& ch : img.channel) {
     const ptrdiff_t onerow = ch.plane.PixelsPerRow();
     for (size_t y = 0; y < ch.h; y++) {
@@ -138,15 +143,22 @@ StatusOr<float> EstimateCost(const Image& img) {
   max_w = RoundUpTo(max_w, Lanes(du));
   max_w = std::max(max_w, 2 * Lanes(du));
 
-  JXL_ASSIGN_OR_RETURN(
-      AlignedMemory buffer,
-      AlignedMemory::Create(memory_manager, max_w * 2 * sizeof(uint32_t)));
-  uint32_t* max_diff_row = buffer.address<uint32_t>();
+  // Reuse the workspace row buffer; grow only when a wider image needs more.
+  const size_t buffer_bytes = max_w * 2 * sizeof(uint32_t);
+  if (ws.buffer_bytes < buffer_bytes) {
+    JXL_ASSIGN_OR_RETURN(
+        ws.buffer, AlignedMemory::Create(memory_manager, buffer_bytes));
+    ws.buffer_bytes = buffer_bytes;
+  }
+  uint32_t* max_diff_row = ws.buffer.address<uint32_t>();
   uint32_t* token_row = max_diff_row + max_w;
-  int32_t* primer = buffer.address<int32_t>();
+  int32_t* primer = ws.buffer.address<int32_t>();
   int32_t* top_primer = primer + max_w;
 
-  Histogram histo[estimate_cost_detail::kLastCtx + 1] = {};
+  // Reuse the workspace histograms (see scalar path); cleared before use.
+  std::vector<Histogram>& histo = ws.histo;
+  histo.resize(estimate_cost_detail::kLastCtx + 1);
+  for (auto& h : histo) h.Clear();
   // extra_bits_lanes is a uint32 vector; each lane accumulates per-vector
   // extra-bit counts. On large/high-entropy inputs a lane can wrap before the
   // final SumOfLanes, undercounting by whole multiples of 2^32. Flush into the
@@ -326,8 +338,14 @@ namespace jxl {
 
 HWY_EXPORT(EstimateCost);
 
+StatusOr<float> EstimateCost(const Image& img,
+                            EstimateCostWorkspace& workspace) {
+  return HWY_DYNAMIC_DISPATCH(EstimateCost)(img, workspace);
+}
+
 StatusOr<float> EstimateCost(const Image& img) {
-  return HWY_DYNAMIC_DISPATCH(EstimateCost)(img);
+  EstimateCostWorkspace workspace;
+  return EstimateCost(img, workspace);
 }
 
 namespace estimate_cost_detail {
