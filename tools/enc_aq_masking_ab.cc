@@ -30,6 +30,8 @@
 namespace hn = hwy::HWY_NAMESPACE;
 using namespace hwy::HWY_NAMESPACE;  // NOLINT — match libjxl call style
 
+using D = hn::ScalableTag<float>;  // == libjxl HWY_FULL(float)
+
 // --- constants (from enc_adaptive_quantization.cc) --------------------------
 static constexpr float kInvLog2e = 0.6931471805599453f;  // ln(2)
 static const float kSGmul = 226.77216153508914f;
