@@ -45,6 +45,9 @@ using hwy::HWY_NAMESPACE::Clamp;
 using hwy::HWY_NAMESPACE::Mul;
 using hwy::HWY_NAMESPACE::NearestInt;
 using hwy::HWY_NAMESPACE::OrderedDemote2To;
+using hwy::HWY_NAMESPACE::StoreInterleaved2;
+using hwy::HWY_NAMESPACE::StoreInterleaved3;
+using hwy::HWY_NAMESPACE::StoreInterleaved4;
 
 // TODO(jon): check if this can be replaced by a FloatToU16 function
 void FloatToU32(const float* in, uint32_t* out, size_t num, float mul,
@@ -134,6 +137,77 @@ void FloatToU8(const float* in, uint8_t* out, size_t num) {
   for (; x < num; ++x) {
     const float v = std::min(std::max(in[x], 0.0f), 1.0f);
     out[x] = static_cast<uint8_t>(v * 255.0f + 0.5f);
+  }
+}
+
+// Fused: convert planar float channels [0,1] → interleaved uint8 output in one
+// pass without an intermediate buffer.  Handles 1–4 channels; uses Highway
+// StoreInterleaved2/3/4 for SIMD-efficient interleaving.
+// rows_in[c] must not be null; callers must substitute a ones row for implicit
+// alpha channels before calling.
+void FloatToInterleavedU8(const float* JXL_RESTRICT const* rows_in,
+                           size_t num_channels, size_t num,
+                           uint8_t* JXL_RESTRICT out) {
+  const HWY_FULL(float) df;
+  const hwy::HWY_NAMESPACE::Rebind<int32_t, decltype(df)> di32;
+  const hwy::HWY_NAMESPACE::Repartition<int16_t, decltype(df)> di16;
+  const hwy::HWY_NAMESPACE::Repartition<uint8_t, decltype(df)> du8;
+
+  const size_t N_f = Lanes(df);
+  const size_t N_u8 = Lanes(du8);  // = 4 * N_f
+
+  const auto zero_f = Zero(df);
+  const auto one_f = Set(df, 1.0f);
+  const auto scale = Set(df, 255.0f);
+
+  // Convert 4*N_f consecutive floats from a single channel row to N_u8 uint8s.
+  auto to_u8 = [&](const float* JXL_RESTRICT row, size_t x) {
+    return OrderedDemote2To(
+        du8,
+        OrderedDemote2To(
+            di16,
+            NearestInt(Mul(Clamp(Load(df, row + x + 0 * N_f), zero_f, one_f),
+                           scale)),
+            NearestInt(Mul(Clamp(Load(df, row + x + 1 * N_f), zero_f, one_f),
+                           scale))),
+        OrderedDemote2To(
+            di16,
+            NearestInt(Mul(Clamp(Load(df, row + x + 2 * N_f), zero_f, one_f),
+                           scale)),
+            NearestInt(Mul(Clamp(Load(df, row + x + 3 * N_f), zero_f, one_f),
+                           scale))));
+  };
+
+  size_t x = 0;
+  if (num_channels == 4) {
+    for (; x + N_u8 <= num; x += N_u8) {
+      StoreInterleaved4(to_u8(rows_in[0], x), to_u8(rows_in[1], x),
+                        to_u8(rows_in[2], x), to_u8(rows_in[3], x), du8,
+                        out + x * 4);
+    }
+  } else if (num_channels == 3) {
+    for (; x + N_u8 <= num; x += N_u8) {
+      StoreInterleaved3(to_u8(rows_in[0], x), to_u8(rows_in[1], x),
+                        to_u8(rows_in[2], x), du8, out + x * 3);
+    }
+  } else if (num_channels == 2) {
+    for (; x + N_u8 <= num; x += N_u8) {
+      StoreInterleaved2(to_u8(rows_in[0], x), to_u8(rows_in[1], x), du8,
+                        out + x * 2);
+    }
+  } else {
+    // 1-channel: plain store.
+    for (; x + N_u8 <= num; x += N_u8) {
+      Store(to_u8(rows_in[0], x), du8, out + x);
+    }
+  }
+
+  // Scalar tail: at most N_u8-1 remaining pixels.
+  for (; x < num; ++x) {
+    for (size_t c = 0; c < num_channels; ++c) {
+      const float v = std::min(std::max(rows_in[c][x], 0.0f), 1.0f);
+      out[x * num_channels + c] = static_cast<uint8_t>(v * 255.0f + 0.5f);
+    }
   }
 }
 
@@ -275,6 +349,7 @@ Status UndoOrientation(jxl::Orientation undo_orientation, const Plane<T>& image,
 HWY_EXPORT(FloatToU32);
 HWY_EXPORT(FloatToF16);
 HWY_EXPORT(FloatToU8);
+HWY_EXPORT(FloatToInterleavedU8);
 
 namespace {
 
@@ -501,12 +576,8 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
       return JXL_FAILURE("float other than 16-bit and 32-bit not supported");
     }
   } else if (bits_per_sample <= 8) {
-    // 8-bit path: float→uint8 directly, 4× smaller cache than uint32.
-    Plane<uint8_t> u8_cache;
+    // 8-bit path: fused float→interleaved uint8, no intermediate cache.
     const auto init_cache = [&](size_t num_threads) -> Status {
-      JXL_ASSIGN_OR_RETURN(u8_cache,
-                           Plane<uint8_t>::Create(memory_manager, xsize,
-                                                  num_channels * num_threads));
       JXL_RETURN_IF_ERROR(InitOutCallback(num_threads));
       return true;
     };
@@ -518,25 +589,19 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
           out_callback.IsPresent()
               ? row_out_callback[thread].data()
               : &(reinterpret_cast<uint8_t*>(out_image))[stride * y];
-      Span<uint8_t> out_span(row_out, row_size);
       const float* JXL_RESTRICT row_in[kConvertMaxChannels];
       for (size_t c = 0; c < num_channels; c++) {
         row_in[c] = channels[c] ? channels[c]->Row(src_y) : ones.Row(0);
       }
-      uint8_t* JXL_RESTRICT row_u8[kConvertMaxChannels];
-      for (size_t c = 0; c < num_channels; c++) {
-        row_u8[c] = u8_cache.Row(c + thread * num_channels);
-        msan::PoisonMemory(row_u8[c], xsize * sizeof(row_u8[c][0]));
-        HWY_DYNAMIC_DISPATCH(FloatToU8)(row_in[c], row_u8[c], xsize);
-      }
-      StoreU8Row(row_u8, num_channels, xsize, out_span);
+      HWY_DYNAMIC_DISPATCH(FloatToInterleavedU8)
+      (row_in, num_channels, xsize, row_out);
       if (out_callback.IsPresent()) {
         out_callback.run(out_run_opaque.get(), thread, 0, y, xsize, row_out);
       }
       return true;
     };
     JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, static_cast<uint32_t>(ysize),
-                                  init_cache, process_row, "ConvertU8"));
+                                  init_cache, process_row, "ConvertU8Fused"));
   } else {
     // 9-16 bit path: float→uint32, then narrow+interleave to output bytes.
     float mul = (1ull << bits_per_sample) - 1;
