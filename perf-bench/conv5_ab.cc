@@ -386,6 +386,149 @@ static void NewRun(const Plane& in, Plane& out, const Weights& w, int64_t band) 
   for (int64_t y = ie; y < in.ysize; ++y) OldConvolveRow<kSizeModN, true>(in, out, w, y);
 }
 
+// ============ XTILE: tall band + narrow x-tile + scratch ring ============
+// Bulk interior columns (region 1) processed as ONE tall band over the full
+// interior height, tiled in x. A 5-row scratch ring of horizontal convolutions
+// is slid down the band, so each interior horizontal convolution is computed
+// exactly once (4-row halo per tile, vs the register ring's `band+4` per
+// `band`-row band => 1.5x at band=8). Resident set = 5 * tileW floats (L1),
+// independent of band height, so it does not thrash like a tall register-ring
+// band. Edge columns (region 0 left-mirror, region 2 right-mirror) and the
+// scalar tail keep the proven register ring / 2D loop. Vertical FMA order is
+// identical to RingColumn, horizontals via the same HorzConvolve => byte-exact.
+
+static void HorzFillTileInterior(const float* JXL_RESTRICT srow, int64_t tx0,
+                                 int64_t tx1, int64_t N, const V wh0, const V wh1,
+                                 const V wh2, float* JXL_RESTRICT dst) {
+  const D d;
+  int64_t j = 0;
+  for (int64_t x = tx0; x < tx1; x += N, j += N) {
+    // scratch buffer alignment is not guaranteed to the vector width -> StoreU.
+    hn::StoreU(HorzConvolve(srow + x, wh0, wh1, wh2), d, dst + j);
+  }
+}
+
+template <size_t kSizeModN>
+static void ConvolveInteriorXTile(const Plane& in, Plane& out, const Weights& w,
+                                  int64_t ib, int64_t ie, int64_t tile_vecs) {
+  const D d;
+  const int64_t N = hn::Lanes(d);
+  const int64_t xsize = in.xsize;
+  const int64_t stride = in.stride;
+  const V wh0 = hn::LoadDup128(d, w.horz + 0 * 4);
+  const V wh1 = hn::LoadDup128(d, w.horz + 1 * 4);
+  const V wh2 = hn::LoadDup128(d, w.horz + 2 * 4);
+  const V wv0 = hn::LoadDup128(d, w.vert + 0 * 4);
+  const V wv1 = hn::LoadDup128(d, w.vert + 1 * 4);
+  const V wv2 = hn::LoadDup128(d, w.vert + 2 * 4);
+  const I ml1 = MirrorLanes<1>();
+  const I ml2 = MirrorLanes<2>();
+
+  // Region 0 (left mirror): x in [0, kRadius). Register ring, full height.
+  int64_t x = 0;
+  for (; x < kRadius; x += N)
+    RingColumn<kSizeModN, 0>(in, out, ib, ie, x, wh0, wh1, wh2, wv0, wv1, wv2,
+                             ml1, ml2);
+
+  // Region 1 (interior bulk): x in [x, x1e), x-tiled scratch ring.
+  int64_t x1e = x;
+  while (x1e + N + kRadius <= xsize) x1e += N;
+  int64_t tileW = tile_vecs * N;
+  static std::vector<float> scratch;  // single-threaded harness; per-thread real
+  for (int64_t tx0 = x; tx0 < x1e; tx0 += tileW) {
+    const int64_t tx1 = std::min(tx0 + tileW, x1e);
+    const int64_t W = tx1 - tx0;
+    if ((int64_t)scratch.size() < 5 * W) scratch.assign(5 * W, 0.0f);
+    float* slot[5];
+    for (int k = 0; k < 5; ++k) slot[k] = scratch.data() + k * W;
+    // Initial ring: H(ib-2 .. ib+2).
+    for (int k = 0; k < 5; ++k)
+      HorzFillTileInterior(in.ConstRow(ib - 2 + k), tx0, tx1, N, wh0, wh1, wh2,
+                           slot[k]);
+    int64_t next_row = ib + 3;
+    for (int64_t y = ib;; ++y) {
+      float* JXL_RESTRICT orow = out.Row(y);
+      const float* JXL_RESTRICT h0 = slot[0];
+      const float* JXL_RESTRICT h1 = slot[1];
+      const float* JXL_RESTRICT h2 = slot[2];
+      const float* JXL_RESTRICT h3 = slot[3];
+      const float* JXL_RESTRICT h4 = slot[4];
+      for (int64_t j = 0; j < W; j += N) {
+        const V c0 = hn::Mul(hn::LoadU(d, h2 + j), wv0);
+        const V c1 = hn::MulAdd(hn::Add(hn::LoadU(d, h1 + j), hn::LoadU(d, h3 + j)),
+                                wv1, c0);
+        const V c2 = hn::MulAdd(hn::Add(hn::LoadU(d, h0 + j), hn::LoadU(d, h4 + j)),
+                                wv2, c1);
+        hn::Store(c2, d, orow + tx0 + j);
+      }
+      if (y + 1 == ie) break;
+      float* t = slot[0];
+      slot[0] = slot[1];
+      slot[1] = slot[2];
+      slot[2] = slot[3];
+      slot[3] = slot[4];
+      slot[4] = t;
+      HorzFillTileInterior(in.ConstRow(next_row), tx0, tx1, N, wh0, wh1, wh2,
+                           slot[4]);
+      ++next_row;
+    }
+  }
+  x = x1e;
+
+  // Region 2 (right mirror): last full vector. Register ring, full height.
+  if (kSizeModN < kRadius) {
+    RingColumn<kSizeModN, 2>(in, out, ib, ie, x, wh0, wh1, wh2, wv0, wv1, wv2,
+                             ml1, ml2);
+    x += N;
+  }
+
+  // Scalar tail: identical 2D accumulation order to RingColumn path.
+  if (kSizeModN != 0) {
+    for (int64_t y = ib; y < ie; ++y) {
+      const float* JXL_RESTRICT row_m = in.ConstRow(y);
+      const float* JXL_RESTRICT rows[5] = {row_m - 2 * stride, row_m - 1 * stride,
+                                           row_m, row_m + 1 * stride,
+                                           row_m + 2 * stride};
+      float* JXL_RESTRICT row_out = out.Row(y);
+      for (int64_t xx = x; xx < xsize; ++xx) {
+        float mul = 0.0f;
+        for (int64_t dy = -kRadius; dy <= kRadius; ++dy) {
+          const float wy = w.vert[std::abs(dy) * 4];
+          const float* clamped_row = rows[dy + 2];
+          for (int64_t dx = -kRadius; dx <= kRadius; ++dx) {
+            const float wx = w.horz[std::abs(dx) * 4];
+            const int64_t clamped_x = Mirror(xx + dx, xsize);
+            mul += clamped_row[clamped_x] * wx * wy;
+          }
+        }
+        row_out[xx] = mul;
+      }
+    }
+  }
+}
+
+template <size_t kSizeModN>
+static void NewRunXTile(const Plane& in, Plane& out, const Weights& w,
+                        int64_t tile_vecs) {
+  int64_t ib = 0, ie = in.ysize;
+  while (ib < ie && ib < kRadius) ib++;
+  while (ib < ie && ie + kRadius > in.ysize) ie--;
+  for (int64_t y = 0; y < ib; ++y) OldConvolveRow<kSizeModN, true>(in, out, w, y);
+  if (ie > ib) ConvolveInteriorXTile<kSizeModN>(in, out, w, ib, ie, tile_vecs);
+  for (int64_t y = ie; y < in.ysize; ++y)
+    OldConvolveRow<kSizeModN, true>(in, out, w, y);
+}
+
+static void DispatchXTile(const Plane& in, Plane& out, const Weights& w,
+                          int64_t tv) {
+  const int64_t N = hn::Lanes(D());
+  switch (in.xsize % N) {
+    case 0: NewRunXTile<0>(in, out, w, tv); break;
+    case 1: NewRunXTile<1>(in, out, w, tv); break;
+    default: NewRunXTile<2>(in, out, w, tv); break;
+  }
+}
+
 static void DispatchOld(const Plane& in, Plane& out, const Weights& w) {
   const int64_t N = hn::Lanes(D());
   switch (in.xsize % N) {
@@ -465,14 +608,25 @@ int main(int argc, char** argv) {
       DispatchNew(in, on, w, band);
       uint64_t hNew = FnvPlane(on);
       if (hNew != hOld) {
-        printf("  MISMATCH xs=%lld ys=%lld band=%lld  old=%016llx new=%016llx\n",
+        printf("  MISMATCH ring xs=%lld ys=%lld band=%lld  old=%016llx new=%016llx\n",
                (long long)c.xs, (long long)c.ys, (long long)band,
                (unsigned long long)hOld, (unsigned long long)hNew);
         fails++;
       }
     }
+    for (int64_t tv : {1, 2, 4, 8, 16, 32}) {
+      Plane on(c.xs, c.ys);
+      DispatchXTile(in, on, w, tv);
+      uint64_t hNew = FnvPlane(on);
+      if (hNew != hOld) {
+        printf("  MISMATCH xtile xs=%lld ys=%lld tv=%lld  old=%016llx new=%016llx\n",
+               (long long)c.xs, (long long)c.ys, (long long)tv,
+               (unsigned long long)hOld, (unsigned long long)hNew);
+        fails++;
+      }
+    }
   }
-  printf("byte-exact check: %s (%d mismatches over %zu cfgs x 5 bands)\n",
+  printf("byte-exact check: %s (%d mismatches over %zu cfgs x [5 bands + 6 tiles])\n",
          fails == 0 ? "PASS" : "FAIL", fails, cfgs.size());
 
   // Headline: interleaved A/B (OLD vs NEW band=8) with start rotation so
@@ -521,6 +675,54 @@ int main(int argc, char** argv) {
       std::sort(s.begin(), s.end());
       double med = s[s.size() / 2];
       printf("    NEW band=%-3lld %.3f ms  saved %+.1f%%\n", (long long)band, med, 100.0 * (mo - med) / mo);
+    }
+  }
+
+  // Headline #2: RING(band=8, current shipped) vs XTILE, interleaved with start
+  // rotation. This is the decision: does the scratch x-tile beat the register
+  // ring? Reports XTILE saving over RING (the live baseline).
+  const int64_t kXTileVecs = 16;
+  for (auto& t : tcfgs) {
+    Plane in(t.xs, t.ys);
+    FillInput(in, 999u);
+    Plane out(t.xs, t.ys);
+    DispatchNew(in, out, w, kBand);          // warm
+    DispatchXTile(in, out, w, kXTileVecs);
+    std::vector<double> sRing, sTile;
+    for (int r = 0; r < t.reps; ++r) {
+      if (r & 1) {
+        { double a = NowMs(); DispatchNew(in, out, w, kBand); sRing.push_back(NowMs() - a); }
+        { double a = NowMs(); DispatchXTile(in, out, w, kXTileVecs); sTile.push_back(NowMs() - a); }
+      } else {
+        { double a = NowMs(); DispatchXTile(in, out, w, kXTileVecs); sTile.push_back(NowMs() - a); }
+        { double a = NowMs(); DispatchNew(in, out, w, kBand); sRing.push_back(NowMs() - a); }
+      }
+    }
+    std::sort(sRing.begin(), sRing.end());
+    std::sort(sTile.begin(), sTile.end());
+    double mr = sRing[sRing.size() / 2], mt = sTile[sTile.size() / 2];
+    printf("size %lldx%lld [interleaved]: RING(band=8) %.3f ms  XTILE(tv=16) %.3f ms  saved %+.1f%%\n",
+           (long long)t.xs, (long long)t.ys, mr, mt, 100.0 * (mr - mt) / mr);
+  }
+
+  // XTILE tile-width scan (sequential medians) vs RING(band=8) baseline.
+  std::vector<int64_t> tvs = {4, 8, 16, 32, 64};
+  for (auto& t : tcfgs) {
+    Plane in(t.xs, t.ys);
+    FillInput(in, 999u);
+    Plane out(t.xs, t.ys);
+    DispatchNew(in, out, w, kBand);
+    std::vector<double> sr;
+    for (int r = 0; r < t.reps; ++r) { double a = NowMs(); DispatchNew(in, out, w, kBand); sr.push_back(NowMs() - a); }
+    std::sort(sr.begin(), sr.end());
+    double mr = sr[sr.size() / 2];
+    printf("size %lldx%lld scan: RING(band=8) %.3f ms\n", (long long)t.xs, (long long)t.ys, mr);
+    for (int64_t tv : tvs) {
+      std::vector<double> s;
+      for (int r = 0; r < t.reps; ++r) { double a = NowMs(); DispatchXTile(in, out, w, tv); s.push_back(NowMs() - a); }
+      std::sort(s.begin(), s.end());
+      double med = s[s.size() / 2];
+      printf("    XTILE tv=%-3lld %.3f ms  saved %+.1f%%\n", (long long)tv, med, 100.0 * (mr - med) / mr);
     }
   }
   return fails == 0 ? 0 : 1;

@@ -66,3 +66,57 @@ streams thrash cache at large band). Hence the default of 8.
 - Real TU `lib/jxl/enc_convolve_separable5.cc` passes `clang++ -fsyntax-only`
   for all enabled Highway targets (foreach_target).
 - Callers: `butteraugli.cc` (Blur) and `enc_detect_dots.cc`.
+
+---
+
+# §x-tile — REJECTED follow-up (tall band + narrow x-tile scratch ring)
+
+Branch: `perf/enc-conv5-xtile-jun29-v7k` (off submodule main `10783f7e`).
+
+## Hypothesis
+The register ring recomputes a 4-row halo per `band` (`(B+4)/B = 1.5×`
+horizontal work at B=8) because taller register bands thrash cache
+(`(H+4)×xsize` resident). A **scratch ring** — full-interior-height band,
+processed in narrow x-tiles, holding 5 rows of horizontal convolutions in an
+L1 scratch buffer and sliding down — would cut halo recompute to ~1.0× while
+keeping only `5×tileW` resident (L1), decoupling halo amortization from cache
+pressure. Predicted ~15–20% on top of the ring.
+
+## Implementation
+3rd harness variant (`DispatchXTile`): region-0 (left mirror) and region-2
+(right mirror) edge columns keep the proven register `RingColumn`; the bulk
+interior columns (region 1) use the scratch x-tile; scalar tail unchanged.
+Vertical FMA order and `HorzConvolve` are identical to the ring → **byte-exact
+by construction** (float scratch store/load is bit-preserving).
+
+## Result — byte-exact PASS, but a clear SPEED REGRESSION
+
+Byte-exact: **PASS**, 0 mismatches over 12 cfgs × 6 tile widths, AVX2 + WASM
+(also re-verifies the shipped ring vs OLD on both targets).
+
+RING(band=8) vs XTILE, interleaved median:
+
+| size  | AVX2 | WASM |
+|-------|-----:|-----:|
+| 512²  | −7%  | −11% |
+| 1024² | −97% | −67% |
+| 2048² | −84% | −85% |
+
+Tile-width sweep: XTILE only beats the ring at tiny 512² with very wide tiles
+(`tv=64`: +15% AVX2, +26% WASM, i.e. whole image in cache). At the real
+≥1024² sizes it is **2–3× slower at every tile width**.
+
+## Why it loses
+The scratch ring replaces the register ring's zero-traffic vertical reuse with
+**1 store + 5 loads of horizontals per output vector**. The work it saves (the
+4-row halo recompute) lives in registers/L1 and is cheap; the scratch
+round-trips it adds are not. The register ring does not spill on AVX2 or WASM
+(it already delivers +39–49% over OLD), so it is the ceiling — exactly the case
+where scratch tiling, the "register-pressure fallback", has nothing to recover.
+
+## Verdict
+**No production change.** The shipped register rolling ring (`kRowsPerBand=8`)
+is optimal for these callers. This branch carries only the extended harness and
+this note as the negative-result record; `enc_convolve_separable5.cc` is
+untouched (== submodule main). Logged in superproject
+`docs/1 rejected optimizations.md` §CONV5-2.
