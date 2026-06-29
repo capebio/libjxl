@@ -579,74 +579,98 @@ struct AdaptiveQuantizationImpl {
                                                      (y_end - y_start) / 4));
 
     static const float limit = 0.2f;
-    for (size_t y = y_start; y < y_end; ++y) {
-      size_t y2 = y + 1 < ysize ? y + 1 : y;
-      size_t y1 = y > 0 ? y - 1 : y;
+    const auto match_gamma_offset_v = Set(df, match_gamma_offset);
+    const auto quarter = Set(df, 0.25f);
+    const auto limit_v = Set(df, limit);
 
-      const float* row_in = xyb.ConstPlaneRow(1, y);
-      const float* row_in1 = xyb.ConstPlaneRow(1, y1);
-      const float* row_in2 = xyb.ConstPlaneRow(1, y2);
+    // Masking-difference of one pixel (scalar path, used at the image edges).
+    auto scalar_diff = [&](const float* r, const float* r1, const float* r2,
+                           size_t x) -> float {
+      const size_t x2 = x + 1 < xsize ? x + 1 : x;
+      const size_t x1 = x > 0 ? x - 1 : x;
+      const float base = 0.25f * (r2[x] + r1[x] + r[x1] + r[x2]);
+      const float gammac = RatioOfDerivativesOfCubicRootToSimpleGamma(
+          r[x] + match_gamma_offset);
+      float diff = gammac * (r[x] - base);
+      diff *= diff;
+      if (diff >= limit) {
+        diff = limit;
+      }
+      return MaskingSqrt(diff);
+    };
+    // Masking-difference of a vector of pixels (SIMD interior path).
+    auto simd_diff = [&](const float* r, const float* r1, const float* r2,
+                         size_t x) {
+      const auto in = LoadU(df, r + x);
+      const auto in_r = LoadU(df, r + x + 1);
+      const auto in_l = LoadU(df, r + x - 1);
+      const auto in_t = LoadU(df, r2 + x);
+      const auto in_b = LoadU(df, r1 + x);
+      auto base = Mul(quarter, Add(Add(in_r, in_l), Add(in_t, in_b)));
+      auto gammacv =
+          RatioOfDerivativesOfCubicRootToSimpleGamma</*invert=*/false>(
+              df, Add(in, match_gamma_offset_v));
+      auto diff = Mul(gammacv, Sub(in, base));
+      diff = Mul(diff, diff);
+      diff = Min(diff, limit_v);
+      return MaskingSqrt(df, diff);
+    };
+
+    // Process the masking-difference image four source rows at a time. The old
+    // code wrote each row's diff into diff_buffer and reloaded+accumulated it
+    // for the next three rows; here the four rows are summed in registers and
+    // stored once, removing the per-iteration read-modify-write of diff_buffer.
+    // Every pixel stays on the exact same scalar/SIMD path as before, and the
+    // four-row sum reproduces the original accumulation bit-for-bit (FP add is
+    // commutative: original d3+(d2+(d1+d0)) == ((d0+d1)+d2)+d3 here).
+    for (size_t yg = y_start; yg < y_end; yg += 4) {
       float* JXL_RESTRICT row_out = diff_buffer.Row(thread);
-
-      auto scalar_pixel = [&](size_t x) {
-        const size_t x2 = x + 1 < xsize ? x + 1 : x;
-        const size_t x1 = x > 0 ? x - 1 : x;
-        const float base =
-            0.25f * (row_in2[x] + row_in1[x] + row_in[x1] + row_in[x2]);
-        const float gammac = RatioOfDerivativesOfCubicRootToSimpleGamma(
-            row_in[x] + match_gamma_offset);
-        float diff = gammac * (row_in[x] - base);
-        diff *= diff;
-        if (diff >= limit) {
-          diff = limit;
-        }
-        diff = MaskingSqrt(diff);
-        if ((y % 4) != 0) {
-          row_out[x - x_start] += diff;
-        } else {
-          row_out[x - x_start] = diff;
-        }
-      };
+      const float* r[4];
+      const float* r1[4];
+      const float* r2[4];
+      for (size_t k = 0; k < 4; ++k) {
+        const size_t yy = yg + k;
+        const size_t yy2 = yy + 1 < ysize ? yy + 1 : yy;
+        const size_t yy1 = yy > 0 ? yy - 1 : yy;
+        r[k] = xyb.ConstPlaneRow(1, yy);
+        r1[k] = xyb.ConstPlaneRow(1, yy1);
+        r2[k] = xyb.ConstPlaneRow(1, yy2);
+      }
 
       size_t x = x_start;
-      // First pixel of the row.
+      // First pixel of the row(s).
       if (x_start == 0) {
-        scalar_pixel(x_start);
+        float s = scalar_diff(r[0], r1[0], r2[0], x);
+        s += scalar_diff(r[1], r1[1], r2[1], x);
+        s += scalar_diff(r[2], r1[2], r2[2], x);
+        s += scalar_diff(r[3], r1[3], r2[3], x);
+        row_out[x - x_start] = s;
         ++x;
       }
-      // SIMD
-      const auto match_gamma_offset_v = Set(df, match_gamma_offset);
-      const auto quarter = Set(df, 0.25f);
+      // SIMD interior (same boundary as the original to keep each pixel on the
+      // same path).
       for (; x + 1 + Lanes(df) < x_end; x += Lanes(df)) {
-        const auto in = LoadU(df, row_in + x);
-        const auto in_r = LoadU(df, row_in + x + 1);
-        const auto in_l = LoadU(df, row_in + x - 1);
-        const auto in_t = LoadU(df, row_in2 + x);
-        const auto in_b = LoadU(df, row_in1 + x);
-        auto base = Mul(quarter, Add(Add(in_r, in_l), Add(in_t, in_b)));
-        auto gammacv =
-            RatioOfDerivativesOfCubicRootToSimpleGamma</*invert=*/false>(
-                df, Add(in, match_gamma_offset_v));
-        auto diff = Mul(gammacv, Sub(in, base));
-        diff = Mul(diff, diff);
-        diff = Min(diff, Set(df, limit));
-        diff = MaskingSqrt(df, diff);
-        if ((y & 3) != 0) {
-          diff = Add(diff, LoadU(df, row_out + x - x_start));
-        }
-        StoreU(diff, df, row_out + x - x_start);
+        auto s = simd_diff(r[0], r1[0], r2[0], x);
+        s = Add(s, simd_diff(r[1], r1[1], r2[1], x));
+        s = Add(s, simd_diff(r[2], r1[2], r2[2], x));
+        s = Add(s, simd_diff(r[3], r1[3], r2[3], x));
+        StoreU(s, df, row_out + x - x_start);
       }
-      // Scalar
+      // Scalar tail.
       for (; x < x_end; ++x) {
-        scalar_pixel(x);
+        float s = scalar_diff(r[0], r1[0], r2[0], x);
+        s += scalar_diff(r[1], r1[1], r2[1], x);
+        s += scalar_diff(r[2], r1[2], r2[2], x);
+        s += scalar_diff(r[3], r1[3], r2[3], x);
+        row_out[x - x_start] = s;
       }
-      if (y % 4 == 3) {
-        float* row_d_out = pre_erosion[thread].Row((y - y_start) / 4);
-        for (size_t qx = 0; qx < (x_end - x_start) / 4; qx++) {
-          row_d_out[qx] = (row_out[qx * 4] + row_out[qx * 4 + 1] +
-                           row_out[qx * 4 + 2] + row_out[qx * 4 + 3]) *
-                          0.25f;
-        }
+      // Reduce four columns -> one pre_erosion pixel.
+      float* JXL_RESTRICT row_d_out =
+          pre_erosion[thread].Row((yg - y_start) / 4);
+      for (size_t qx = 0; qx < (x_end - x_start) / 4; qx++) {
+        row_d_out[qx] = (row_out[qx * 4] + row_out[qx * 4 + 1] +
+                         row_out[qx * 4 + 2] + row_out[qx * 4 + 3]) *
+                        0.25f;
       }
     }
     JXL_ENSURE(x_start % (kBlockDim / 2) == 0);
