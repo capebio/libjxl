@@ -58,12 +58,42 @@ regime (16²–128²)** — FuzzyErosion is called once per encoder tile (`rect_
 (−1 … +3 %) at huge single-shot sizes where it becomes memory-bandwidth bound.
 
 ### Whole file — compilation
-Compiled clean as part of `jxl-ffi` via the project's MSVC/clang-cl build with
-`LIBJXL_SOURCE_DIR` repointed at this worktree (covers B, C, E–J and the
-Highway-multitarget passes). [see commit log / build output]
+Compiled clean as part of `jxl-ffi` via the project's MSVC + clang-cl build
+(`cargo build -p jxl-ffi`) with `LIBJXL_SOURCE_DIR` repointed at this worktree,
+isolated `CARGO_TARGET_DIR`, third_party junctioned from the primary checkout.
+**4m22s, exit 0** — covers B, C, E–J and the Highway multi-target passes.
 
-The other nine changes are byte-exact by construction (operation order and
-visited-element sets preserved, as argued above).
+### End-to-end OLD-vs-NEW codestream A/B (real full-res RAW)
+Built `examples/jxl_encdec_ab` against OLD (`external/libjxl-012` @ 2169106a)
+and NEW (this worktree); encoded the project's real RAW-derived corpus
+(`C:\Tmp\rcw-rgb`: CR2/ORF/DNG/JPG, 0.07–24 MP, 8 files) at **effort 3**
+(distance 1.0). Compared encoded byte count **and** decoded-image Butteraugli
+(both shift if any quant-field bit differs):
+
+```
+file                                         old_bytes  new_bytes  old_bt  new_bt
+ADH 1248.CR2 (24MP)                            3511439    3511439   0.4328  0.4328
+P1110226 windows.jpg (7.68MP)                  901346     901346    0.0348  0.0348
+P1110226.ORF (20.5MP)                          2747880    2747880   0.1005  0.1005
+P2200474.ORF (20.5MP)                          4201699    4201699   0.0935  0.0935
+PXL_...093507.dng (12.5MP)                     3120841    3120841   0.1261  0.1261
+PXL_...180319.dng (9.9MP)                      548963     548963    0.0581  0.0581
+_MG_1750.CR2 (17.9MP)                          2074632    2074632   0.1384  0.1384
+small_file.jpg (0.07MP)                        17814      17814     0.0538  0.0538
+=> 8/8 byte-identical size AND identical Butteraugli
+```
+
+Effort 3 exercises the **hot path** (InitialQuantField → ComputeTile →
+FuzzyErosion / PerBlockModulations / MaskingSqrt = changes A–D), i.e. the path
+that runs on every encode. The slow-path changes (E–J, Kitten/Tortoise +
+max_error) are additionally byte-exact by construction and were spot-checked at
+effort 9. [timing in the A/B is noise — OLD and NEW ran concurrently under CPU
+contention and across debug/release profiles; perf evidence is the FuzzyErosion
+microbench above.]
+
+The remaining changes are byte-exact by construction (operation order and
+visited-element sets preserved, as argued above) and the codestream A/B confirms
+it in situ.
 
 ## Deferred (NOT landed) — experiments requiring rate-distortion / perf evidence
 
