@@ -522,7 +522,9 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
         // block_idx = (offset - size) / kDCTBlockSize gives the block's
         // position within the group's flat coefficient store.
         if (kReadCoefficients && accumulate) {
-          const size_t block_idx = (offset - size) / kDCTBlockSize;
+          const size_t block_idx =
+              group_idx * kGroupDimInBlocks * kGroupDimInBlocks +
+              (offset - size) / kDCTBlockSize;
           if (block_idx < dec_state->ac_occupancy.size()) {
             uint8_t mask = 0;
             if (ac_type == ACType::k16) {
