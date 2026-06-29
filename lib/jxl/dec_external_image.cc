@@ -44,6 +44,7 @@ namespace HWY_NAMESPACE {
 using hwy::HWY_NAMESPACE::Clamp;
 using hwy::HWY_NAMESPACE::Mul;
 using hwy::HWY_NAMESPACE::NearestInt;
+using hwy::HWY_NAMESPACE::OrderedDemote2To;
 
 // TODO(jon): check if this can be replaced by a FloatToU16 function
 void FloatToU32(const float* in, uint32_t* out, size_t num, float mul,
@@ -88,6 +89,52 @@ void FloatToF16(const float* in, hwy::float16_t* out, size_t num) {
 
   // Poison back the output.
   msan::PoisonMemory(out + num, sizeof(out[0]) * (num_round_up - num));
+}
+
+// Converts float [0,1] to uint8 [0,255] for 8-bit output, avoiding the
+// uint32 intermediate used by FloatToU32.  Processes 4*Lanes(df) pixels per
+// SIMD iteration via the int32→int16→uint8 narrowing chain; a scalar tail
+// handles the last (num % 4*N) pixels without reading past the input buffer.
+void FloatToU8(const float* in, uint8_t* out, size_t num) {
+  const HWY_FULL(float) df;
+  const hwy::HWY_NAMESPACE::Rebind<int32_t, decltype(df)> di32;
+  const hwy::HWY_NAMESPACE::Repartition<int16_t, decltype(df)> di16;
+  const hwy::HWY_NAMESPACE::Repartition<uint8_t, decltype(df)> du8;
+
+  const size_t N_f = Lanes(df);
+  const size_t N_u8 = Lanes(du8);  // = 4 * N_f
+
+  const auto zero_f = Zero(df);
+  const auto one_f = Set(df, 1.0f);
+  const auto scale = Set(df, 255.0f);
+
+  size_t x = 0;
+  for (; x + N_u8 <= num; x += N_u8) {
+    auto f0 = Load(df, in + x + 0 * N_f);
+    auto f1 = Load(df, in + x + 1 * N_f);
+    auto f2 = Load(df, in + x + 2 * N_f);
+    auto f3 = Load(df, in + x + 3 * N_f);
+
+    f0 = Clamp(f0, zero_f, one_f);
+    f1 = Clamp(f1, zero_f, one_f);
+    f2 = Clamp(f2, zero_f, one_f);
+    f3 = Clamp(f3, zero_f, one_f);
+
+    const auto i0 = NearestInt(Mul(f0, scale));
+    const auto i1 = NearestInt(Mul(f1, scale));
+    const auto i2 = NearestInt(Mul(f2, scale));
+    const auto i3 = NearestInt(Mul(f3, scale));
+
+    const auto i16_01 = OrderedDemote2To(di16, i0, i1);
+    const auto i16_23 = OrderedDemote2To(di16, i2, i3);
+    Store(OrderedDemote2To(du8, i16_01, i16_23), du8, out + x);
+  }
+
+  // Scalar tail: at most N_u8-1 remaining pixels, no past-end reads.
+  for (; x < num; ++x) {
+    const float v = std::min(std::max(in[x], 0.0f), 1.0f);
+    out[x] = static_cast<uint8_t>(v * 255.0f + 0.5f);
+  }
 }
 
 // NOLINTNEXTLINE(google-readability-namespace-comments)
@@ -227,6 +274,7 @@ Status UndoOrientation(jxl::Orientation undo_orientation, const Plane<T>& image,
 
 HWY_EXPORT(FloatToU32);
 HWY_EXPORT(FloatToF16);
+HWY_EXPORT(FloatToU8);
 
 namespace {
 
@@ -260,6 +308,19 @@ void StoreFloatRow(const float* JXL_RESTRICT* rows_in, size_t num_channels,
 }
 
 void JXL_INLINE Store8(uint32_t value, uint8_t* dest) { *dest = value & 0xff; }
+
+// Interleaves planar uint8 rows into a packed output row. Used for 8-bit
+// output where FloatToU8 has already produced the per-channel uint8 values,
+// avoiding the uint32 intermediate required by StoreUintRow<Store8>.
+void StoreU8Row(uint8_t* JXL_RESTRICT* rows_u8, size_t num_channels,
+                size_t xsize, Span<uint8_t> out) {
+  JXL_DASSERT(num_channels * xsize <= out.size());
+  for (size_t x = 0; x < xsize; ++x) {
+    for (size_t c = 0; c < num_channels; c++) {
+      out[num_channels * x + c] = rows_u8[c][x];
+    }
+  }
+}
 
 }  // namespace
 
@@ -439,9 +500,45 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
     } else {
       return JXL_FAILURE("float other than 16-bit and 32-bit not supported");
     }
+  } else if (bits_per_sample <= 8) {
+    // 8-bit path: float→uint8 directly, 4× smaller cache than uint32.
+    Plane<uint8_t> u8_cache;
+    const auto init_cache = [&](size_t num_threads) -> Status {
+      JXL_ASSIGN_OR_RETURN(u8_cache,
+                           Plane<uint8_t>::Create(memory_manager, xsize,
+                                                  num_channels * num_threads));
+      JXL_RETURN_IF_ERROR(InitOutCallback(num_threads));
+      return true;
+    };
+    const auto process_row = [&](const uint32_t task,
+                                 const size_t thread) -> Status {
+      const int64_t y = task;
+      const int64_t src_y = flip_vertical ? (int64_t)(ysize - 1) - y : y;
+      uint8_t* row_out =
+          out_callback.IsPresent()
+              ? row_out_callback[thread].data()
+              : &(reinterpret_cast<uint8_t*>(out_image))[stride * y];
+      Span<uint8_t> out_span(row_out, row_size);
+      const float* JXL_RESTRICT row_in[kConvertMaxChannels];
+      for (size_t c = 0; c < num_channels; c++) {
+        row_in[c] = channels[c] ? channels[c]->Row(src_y) : ones.Row(0);
+      }
+      uint8_t* JXL_RESTRICT row_u8[kConvertMaxChannels];
+      for (size_t c = 0; c < num_channels; c++) {
+        row_u8[c] = u8_cache.Row(c + thread * num_channels);
+        msan::PoisonMemory(row_u8[c], xsize * sizeof(row_u8[c][0]));
+        HWY_DYNAMIC_DISPATCH(FloatToU8)(row_in[c], row_u8[c], xsize);
+      }
+      StoreU8Row(row_u8, num_channels, xsize, out_span);
+      if (out_callback.IsPresent()) {
+        out_callback.run(out_run_opaque.get(), thread, 0, y, xsize, row_out);
+      }
+      return true;
+    };
+    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, static_cast<uint32_t>(ysize),
+                                  init_cache, process_row, "ConvertU8"));
   } else {
-    // Multiplier to convert from floating point 0-1 range to the integer
-    // range.
+    // 9-16 bit path: float→uint32, then narrow+interleave to output bytes.
     float mul = (1ull << bits_per_sample) - 1;
     Plane<uint32_t> u32_cache;
     const auto init_cache = [&](size_t num_threads) -> Status {
@@ -467,20 +564,14 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
       uint32_t* JXL_RESTRICT row_u32[kConvertMaxChannels];
       for (size_t c = 0; c < num_channels; c++) {
         row_u32[c] = u32_cache.Row(c + thread * num_channels);
-        // row_u32[] is a per-thread temporary row storage, this isn't
-        // intended to be initialized on a previous run.
         msan::PoisonMemory(row_u32[c], xsize * sizeof(row_u32[c][0]));
         HWY_DYNAMIC_DISPATCH(FloatToU32)
         (row_in[c], row_u32[c], xsize, mul, bits_per_sample);
       }
-      if (bits_per_sample <= 8) {
-        StoreUintRow<Store8>(row_u32, num_channels, xsize, 1, out_span);
+      if (little_endian) {
+        StoreUintRow<StoreLE16>(row_u32, num_channels, xsize, 2, out_span);
       } else {
-        if (little_endian) {
-          StoreUintRow<StoreLE16>(row_u32, num_channels, xsize, 2, out_span);
-        } else {
-          StoreUintRow<StoreBE16>(row_u32, num_channels, xsize, 2, out_span);
-        }
+        StoreUintRow<StoreBE16>(row_u32, num_channels, xsize, 2, out_span);
       }
       if (out_callback.IsPresent()) {
         out_callback.run(out_run_opaque.get(), thread, 0, y, xsize, row_out);
@@ -488,7 +579,7 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
       return true;
     };
     JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, static_cast<uint32_t>(ysize),
-                                  init_cache, process_row, "ConvertUint"));
+                                  init_cache, process_row, "ConvertU16"));
   }
   return true;
 }
