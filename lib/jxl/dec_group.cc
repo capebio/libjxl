@@ -1,4 +1,4 @@
-// Copyright (c) the JPEG XL Project Authors. All rights reserved.
+﻿// Copyright (c) the JPEG XL Project Authors. All rights reserved.
 //
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -436,21 +436,42 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
         const size_t covered_blocks = 1 << log2_covered_blocks;
         const size_t size = covered_blocks * kDCTBlockSize;
 
+        // Active channels: X and B are absent in subsampled positions.
+        // Y (c=1) is always active (luma is never subsampled in JXL).
+        const bool active_x =
+            (sbx[0] << hshift[0] == bx) && (sby[0] << vshift[0] == by);
+        const bool active_b =
+            (sbx[2] << hshift[2] == bx) && (sby[2] << vshift[2] == by);
+
         ACPtr qblock[3];
         if (accumulate) {
           for (size_t c = 0; c < 3; c++) {
             qblock[c] = dec_state->coefficients->PlaneRow(c, group_idx, offset);
           }
         } else {
+          // Only clear qblock planes for active channels. Inactive X/B stale
+          // data is never dequantised or rendered, so clearing is wasteful.
           if (ac_type == ACType::k16) {
-            memset(group_dec_cache->dec_group_qblock16, 0,
-                   size * 3 * sizeof(int16_t));
+            if (active_x)
+              memset(group_dec_cache->dec_group_qblock16 + 0 * size, 0,
+                     size * sizeof(int16_t));
+            memset(group_dec_cache->dec_group_qblock16 + 1 * size, 0,
+                   size * sizeof(int16_t));
+            if (active_b)
+              memset(group_dec_cache->dec_group_qblock16 + 2 * size, 0,
+                     size * sizeof(int16_t));
             for (size_t c = 0; c < 3; c++) {
               qblock[c].ptr16 = group_dec_cache->dec_group_qblock16 + c * size;
             }
           } else {
-            memset(group_dec_cache->dec_group_qblock, 0,
-                   size * 3 * sizeof(int32_t));
+            if (active_x)
+              memset(group_dec_cache->dec_group_qblock + 0 * size, 0,
+                     size * sizeof(int32_t));
+            memset(group_dec_cache->dec_group_qblock + 1 * size, 0,
+                   size * sizeof(int32_t));
+            if (active_b)
+              memset(group_dec_cache->dec_group_qblock + 2 * size, 0,
+                     size * sizeof(int32_t));
             for (size_t c = 0; c < 3; c++) {
               qblock[c].ptr32 = group_dec_cache->dec_group_qblock + c * size;
             }
@@ -464,24 +485,31 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
 
         // DC-only fast path: detect channels where all AC coefficients are zero.
         // Fires on ~89% X, ~86% B, and ~2-49% Y blocks in real photos.
+        // X/B dc_only valid only when no_cfl OR dc_only[Y]: with CfL active,
+        // X output at AC positions = x_cc_mul * Y_dequant[k]. Once Y is DC-only
+        // that contribution is zero, so X can also take the DC fill path.
         bool dc_only[3] = {false, false, false};
         if (JXL_LIKELY(!jpeg_data) && JXL_LIKELY(covered_blocks == 1)) {
-          for (size_t c = 0; c < 3; c++) {
-            if (c != 1 && !no_cfl) continue;
-            bool all_zero = true;
+          auto scan_ac_zero = [&](size_t c) -> bool {
             if (ac_type == ACType::k16) {
               const int16_t* JXL_RESTRICT p = qblock[c].ptr16;
               for (size_t k = 1; k < size; k++) {
-                if (p[k]) { all_zero = false; break; }
+                if (p[k]) return false;
               }
             } else {
               const int32_t* JXL_RESTRICT p = qblock[c].ptr32;
               for (size_t k = 1; k < size; k++) {
-                if (p[k]) { all_zero = false; break; }
+                if (p[k]) return false;
               }
             }
-            dc_only[c] = all_zero;
-          }
+            return true;
+          };
+          // Check Y first; dc_only[1]=true unlocks X/B even when CfL is active.
+          dc_only[1] = scan_ac_zero(1);
+          // X: safe to DC-fill when no CfL or Y is DC-only (CfL term is zero).
+          if (active_x && (no_cfl || dc_only[1])) dc_only[0] = scan_ac_zero(0);
+          // B: same rule.
+          if (active_b && (no_cfl || dc_only[1])) dc_only[2] = scan_ac_zero(2);
         }
 
         if (JXL_UNLIKELY(jpeg_data)) {
@@ -552,8 +580,12 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
           }
         } else {
           HWY_ALIGN float* const block = group_dec_cache->dec_group_block;
-          // Skip dequant entirely when all three channels are DC-only.
-          if (JXL_LIKELY(!(dc_only[0] && dc_only[1] && dc_only[2]))) {
+          // Skip dequant when Y is DC-only and all active chroma channels are
+          // either inactive (subsampled away) or also DC-only.
+          const bool skip_dequant = dc_only[1] &&
+                                    (!active_x || dc_only[0]) &&
+                                    (!active_b || dc_only[2]);
+          if (JXL_LIKELY(!skip_dequant)) {
             dequant_block(
                 inv_global_scale, row_quant[bx], dec_state->x_dm_multiplier,
                 dec_state->b_dm_multiplier, x_cc_mul, b_cc_mul, acs.Strategy(),
