@@ -31,48 +31,74 @@ static void CoeffOrderAndLut(AcStrategy acs, coeff_order_t* out) {
   size_t cy = acs.covered_blocks_y();
   CoefficientLayout(&cy, &cx);
 
-  // CoefficientLayout ensures cx >= cy.
-  // We compute the zigzag order for a cx x cx block, then discard all the
-  // lines that are not multiple of the ratio between cx and cy.
-  size_t xs = cx / cy;
-  size_t xsm = xs - 1;
-  size_t xss = CeilLog2Nonzero(xs);
-  // First half of the block
+  // CoefficientLayout ensures cx >= cy, with xs = cx / cy a power of two.
+  // The zig-zag is conceptually computed for a cx x cx block, keeping only the
+  // diagonal positions whose (post-swap) y is a multiple of xs. Instead of
+  // visiting every position of the enclosing square and discarding (xs-1)/xs of
+  // them, we step the inner index directly by xs from the correct residue, so
+  // only retained positions are visited. This emits the IDENTICAL permutation
+  // (byte-exact) while cutting the inner loop body by a factor of xs (2x for
+  // 2:1 layouts, 4x for 4:1). n = cx * kBlockDim is a multiple of xs, which is
+  // used to derive the second-half residues.
+  const size_t xs = cx / cy;
+  const size_t xsm = xs - 1;
+  const size_t xss = CeilLog2Nonzero(xs);
+  const size_t n = cx * kBlockDim;
   size_t cur = cx * cy;
-  for (size_t i = 0; i < cx * kBlockDim; i++) {
-    for (size_t j = 0; j <= i; j++) {
-      size_t x = j;
-      size_t y = i - j;
-      if (i % 2) std::swap(x, y);
-      if ((y & xsm) != 0) continue;
-      y >>= xss;
-      size_t val = 0;
-      if (x < cx && y < cy) {
-        val = y * cx + x;
-      } else {
-        val = cur++;
+  // First half of the block.
+  for (size_t i = 0; i < n; i++) {
+    if (i & 1) {
+      // After swap: x = i - j, y = j; y % xs == 0  =>  j stepped by xs from 0.
+      for (size_t j = 0; j <= i; j += xs) {
+        size_t x = i - j;
+        size_t y = j >> xss;
+        size_t val = (x < cx && y < cy) ? y * cx + x : cur++;
+        if (is_lut) {
+          out[y * n + x] = val;
+        } else {
+          out[val] = y * n + x;
+        }
       }
-      if (is_lut) {
-        out[y * cx * kBlockDim + x] = val;
-      } else {
-        out[val] = y * cx * kBlockDim + x;
+    } else {
+      // No swap: x = j, y = i - j; (i - j) % xs == 0  =>  j == i (mod xs).
+      for (size_t j = i & xsm; j <= i; j += xs) {
+        size_t x = j;
+        size_t y = (i - j) >> xss;
+        size_t val = (x < cx && y < cy) ? y * cx + x : cur++;
+        if (is_lut) {
+          out[y * n + x] = val;
+        } else {
+          out[val] = y * n + x;
+        }
       }
     }
   }
-  // Second half
-  for (size_t ip = cx * kBlockDim - 1; ip > 0; ip--) {
+  // Second half. n % xs == 0, so n - 1 == xsm (mod xs).
+  for (size_t ip = n - 1; ip > 0; ip--) {
     size_t i = ip - 1;
-    for (size_t j = 0; j <= i; j++) {
-      size_t x = cx * kBlockDim - 1 - (i - j);
-      size_t y = cx * kBlockDim - 1 - j;
-      if (i % 2) std::swap(x, y);
-      if ((y & xsm) != 0) continue;
-      y >>= xss;
-      size_t val = cur++;
-      if (is_lut) {
-        out[y * cx * kBlockDim + x] = val;
-      } else {
-        out[val] = y * cx * kBlockDim + x;
+    if (i & 1) {
+      // After swap: x = n-1-j, y = n-1-i+j; y % xs == 0  =>  j == i+1 (mod xs).
+      for (size_t j = (i + 1) & xsm; j <= i; j += xs) {
+        size_t x = n - 1 - j;
+        size_t y = (n - 1 - i + j) >> xss;
+        size_t val = cur++;
+        if (is_lut) {
+          out[y * n + x] = val;
+        } else {
+          out[val] = y * n + x;
+        }
+      }
+    } else {
+      // No swap: x = n-1-i+j, y = n-1-j; y % xs == 0  =>  j == xsm (mod xs).
+      for (size_t j = xsm; j <= i; j += xs) {
+        size_t x = n - 1 - i + j;
+        size_t y = (n - 1 - j) >> xss;
+        size_t val = cur++;
+        if (is_lut) {
+          out[y * n + x] = val;
+        } else {
+          out[val] = y * n + x;
+        }
       }
     }
   }

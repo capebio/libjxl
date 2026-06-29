@@ -82,6 +82,25 @@ static JXL_INLINE size_t ZeroDensityContext(size_t nonzeros_left, size_t k,
          prev;
 }
 
+// Specialization of ZeroDensityContext for covered_blocks == 1
+// (log2_covered_blocks == 0) - the dominant 8x8 DCT case. The generic
+// normalization `(nonzeros_left + cb - 1) >> log2` and `k >> log2` are both
+// no-ops when cb == 1, but the compiler cannot prove that from the runtime
+// arguments, so the variable shifts execute on every scanned coefficient.
+// Lifting the cb == 1 branch out of the (hot) coefficient loop and calling this
+// removes them. Output is byte-identical to
+// ZeroDensityContext(nonzeros_left, k, /*covered_blocks=*/1,
+//                    /*log2_covered_blocks=*/0, prev).
+static JXL_INLINE size_t ZeroDensityContext1(size_t nonzeros_left, size_t k,
+                                             size_t prev) {
+  JXL_DASSERT(k > 0);
+  JXL_DASSERT(k < 64);
+  JXL_DASSERT(nonzeros_left > 0);
+  JXL_DASSERT(nonzeros_left < 64);
+  return (kCoeffNumNonzeroContext[nonzeros_left] + kCoeffFreqContext[k]) * 2 +
+         prev;
+}
+
 struct BlockCtxMap {
   std::vector<int> dc_thresholds[3];
   std::vector<uint32_t> qf_thresholds;

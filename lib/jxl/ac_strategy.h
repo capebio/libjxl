@@ -26,8 +26,8 @@
 // that transform we are currently in. Note that DCT4x4 is applied on all four
 // 4x4 sub-blocks of an 8x8 block.
 // `AcStrategyImage` defines which strategy should be used for each 8x8 block
-// of the image. The highest 4 bits represent the strategy to be used, the
-// lowest 4 represent the index of the block inside that strategy.
+// of the image. Each block byte packs: bit 0 marks the first (top-left) block
+// of a strategy; bits 7..1 hold the raw AcStrategyType.
 
 namespace jxl {
 
@@ -220,17 +220,21 @@ class AcStrategyImage {
     JXL_DASSERT(y + acs.covered_blocks_y() <= layers_.ysize());
     JXL_DASSERT(x + acs.covered_blocks_x() <= layers_.xsize());
 #endif
-    JXL_RETURN_IF_ERROR(SetNoBoundsCheck(x, y, type, /*check=*/false));
+    SetUnchecked(x, y, type);
     return true;
   }
 
   Status SetNoBoundsCheck(size_t x, size_t y, AcStrategyType type,
                           bool check = true) {
+    if (!check) {
+      SetUnchecked(x, y, type);
+      return true;
+    }
     AcStrategy acs = AcStrategy::FromRawStrategy(type);
     for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
       for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
         size_t pos = (y + iy) * stride_ + x + ix;
-        if (check && row_[pos] != INVALID) {
+        if (row_[pos] != INVALID) {
           return JXL_FAILURE("Invalid AC strategy: block overlap");
         }
         row_[pos] =
@@ -261,6 +265,24 @@ class AcStrategyImage {
   JxlMemoryManager* memory_manager() const { return layers_.memory_manager(); }
 
  private:
+  // Branch-free write of a (possibly multi-block) strategy with no overlap
+  // check. Writes the interior byte (raw type << 1, first-block bit clear) over
+  // the covered rectangle, then sets the first-block bit on the top-left cell.
+  // Byte-identical to the checked writer's output; keeps the per-cell `check`
+  // branch and the `(iy | ix) == 0` test out of the hot construction path.
+  JXL_INLINE void SetUnchecked(size_t x, size_t y, AcStrategyType type) {
+    AcStrategy acs = AcStrategy::FromRawStrategy(type);
+    const size_t bx = acs.covered_blocks_x();
+    const size_t by = acs.covered_blocks_y();
+    const uint8_t interior = static_cast<uint8_t>(type) << 1;
+    uint8_t* JXL_RESTRICT dst = row_ + y * stride_ + x;
+    for (size_t iy = 0; iy < by; iy++) {
+      uint8_t* JXL_RESTRICT r = dst + iy * stride_;
+      for (size_t ix = 0; ix < bx; ix++) r[ix] = interior;
+    }
+    dst[0] |= 1;
+  }
+
   ImageB layers_;
   uint8_t* JXL_RESTRICT row_;
   size_t stride_;

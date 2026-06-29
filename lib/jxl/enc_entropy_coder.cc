@@ -225,15 +225,29 @@ Status TokenizeCoefficients(const coeff_order_t* JXL_RESTRICT orders,
             block_ctx_map.ZeroDensityContextsOffset(block_ctx);
         // Skip LLF.
         size_t prev = (nzeros > static_cast<ptrdiff_t>(size / 16) ? 0 : 1);
-        for (size_t k = covered_blocks; k < size && nzeros != 0; ++k) {
-          int32_t coeff = block[order[k]];
-          size_t ctx =
-              histo_offset + ZeroDensityContext(nzeros, k, covered_blocks,
-                                                log2_covered_blocks, prev);
-          uint32_t u_coeff = PackSigned(coeff);
-          output->emplace_back(static_cast<uint32_t>(ctx), u_coeff);
-          prev = (coeff != 0) ? 1 : 0;
-          nzeros -= prev;
+        // covered_blocks == 1 (the dominant 8x8 DCT case) skips the
+        // per-coefficient normalization shifts inside ZeroDensityContext.
+        // Byte-identical output; see ZeroDensityContext1.
+        if (covered_blocks == 1) {
+          for (size_t k = 1; k < kDCTBlockSize && nzeros != 0; ++k) {
+            int32_t coeff = block[order[k]];
+            size_t ctx = histo_offset + ZeroDensityContext1(nzeros, k, prev);
+            uint32_t u_coeff = PackSigned(coeff);
+            output->emplace_back(static_cast<uint32_t>(ctx), u_coeff);
+            prev = (coeff != 0) ? 1 : 0;
+            nzeros -= prev;
+          }
+        } else {
+          for (size_t k = covered_blocks; k < size && nzeros != 0; ++k) {
+            int32_t coeff = block[order[k]];
+            size_t ctx =
+                histo_offset + ZeroDensityContext(nzeros, k, covered_blocks,
+                                                  log2_covered_blocks, prev);
+            uint32_t u_coeff = PackSigned(coeff);
+            output->emplace_back(static_cast<uint32_t>(ctx), u_coeff);
+            prev = (coeff != 0) ? 1 : 0;
+            nzeros -= prev;
+          }
         }
         JXL_ENSURE(nzeros == 0);
         offset[c] += size;
