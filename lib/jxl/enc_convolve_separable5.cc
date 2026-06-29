@@ -90,20 +90,16 @@ class Separable5Impl {
 
       switch (rect.xsize() % Lanes(Simd())) {
         case 0:
-          RunRows<0>();
-          break;
+          return RunRows<0>();
         case 1:
-          RunRows<1>();
-          break;
+          return RunRows<1>();
         default:
           // kSizeModN >= kRadius all behave identically: the last-vector path is
           // guarded by `kSizeModN < kRadius`, so only the scalar tail differs and
           // it is driven by the runtime `xsize`, not the template value. Collapse
           // them to a single RunRows<2> to avoid a redundant specialization.
-          RunRows<2>();
-          break;
+          return RunRows<2>();
       }
-      return true;
     } else {
       return SlowSeparable5(*in, rect, *weights, pool, out, Rect(*out));
     }
@@ -240,7 +236,7 @@ class Separable5Impl {
 
  private:
   template <size_t kSizeModN>
-  JXL_INLINE void RunRows() {
+  JXL_INLINE Status RunRows() {
     // NB: borders are image-bound, not rect-bound.
     size_t ybegin = rect.y0();
     size_t yend = rect.y1();
@@ -251,21 +247,25 @@ class Separable5Impl {
       yend--;
     }
     if (ybegin > rect.y0()) {
-      RunBorderRows<kSizeModN>(0, ybegin - rect.y0());
+      JXL_RETURN_IF_ERROR(RunBorderRows<kSizeModN>(0, ybegin - rect.y0()));
     }
     if (yend > ybegin) {
-      RunInteriorRows<kSizeModN>(ybegin - rect.y0(), yend - rect.y0());
+      JXL_RETURN_IF_ERROR(
+          RunInteriorRows<kSizeModN>(ybegin - rect.y0(), yend - rect.y0()));
     }
     if (yend < rect.y1()) {
-      RunBorderRows<kSizeModN>(yend - rect.y0(), rect.ysize());
+      JXL_RETURN_IF_ERROR(
+          RunBorderRows<kSizeModN>(yend - rect.y0(), rect.ysize()));
     }
+    return true;
   }
 
   template <size_t kSizeModN>
-  JXL_INLINE void RunBorderRows(const size_t ybegin, const size_t yend) {
+  JXL_INLINE Status RunBorderRows(const size_t ybegin, const size_t yend) {
     for (size_t y = ybegin; y < yend; ++y) {
       ConvolveRow<kSizeModN, true>(y);
     }
+    return true;
   }
 
   // Number of output rows a single pool task convolves as one vertical band.
@@ -394,7 +394,7 @@ class Separable5Impl {
   }
 
   template <size_t kSizeModN>
-  JXL_INLINE void RunInteriorRows(const size_t ybegin, const size_t yend) {
+  JXL_INLINE Status RunInteriorRows(const size_t ybegin, const size_t yend) {
     const size_t count = yend - ybegin;
     const size_t num_bands = (count + kRowsPerBand - 1) / kRowsPerBand;
     const auto process_band = [&](const uint32_t band,
@@ -404,11 +404,8 @@ class Separable5Impl {
       ConvolveInteriorBand<kSizeModN>(b0, b1);
       return true;
     };
-    Status status =
-        RunOnPool(pool, 0, static_cast<uint32_t>(num_bands), ThreadPool::NoInit,
-                  process_band, "ConvolveBands");
-    JXL_DASSERT(status);
-    (void)status;
+    return RunOnPool(pool, 0, static_cast<uint32_t>(num_bands),
+                     ThreadPool::NoInit, process_band, "ConvolveBands");
   }
 
   // Returns IndicesFromVec(d, indices) such that TableLookupLanes on the
