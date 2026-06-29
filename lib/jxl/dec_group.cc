@@ -430,8 +430,12 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
     float* JXL_RESTRICT idct_row[3];
     int16_t* JXL_RESTRICT jpeg_row[3];
     for (size_t c = 0; c < 3; c++) {
-      const auto& buffer = render_pipeline_input.GetBuffer(c);
-      idct_row[c] = buffer.second.Row(buffer.first, sby[c] * kBlockDim);
+      if (JXL_LIKELY(!jpeg_data)) {
+        const auto& buffer = render_pipeline_input.GetBuffer(c);
+        idct_row[c] = buffer.second.Row(buffer.first, sby[c] * kBlockDim);
+      } else {
+        idct_row[c] = nullptr;  // JPEG path writes to jpeg_row[c], not idct_row
+      }
       if (jpeg_data) {
         auto& component = jpeg_data->components[jpeg_params->jpeg_c_map[c]];
         jpeg_row[c] =

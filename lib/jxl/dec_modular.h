@@ -127,6 +127,9 @@ class ModularFrameDecoder {
   bool have_dc() const { return have_something; }
   void MaybeDropFullImage();
   bool UsesFullImage() const { return use_full_image; }
+  // Returns true if DecodeGroup needs a live RenderPipelineInput for modular
+  // output. False when using the full-image path (output goes via image planes).
+  bool NeedsGroupRenderInput() const { return !use_full_image; }
   JxlMemoryManager* memory_manager() const { return memory_manager_; }
 
  private:
