@@ -839,25 +839,49 @@ Status DecodeACVarBlock(size_t ctx_offset, size_t log2_covered_blocks,
 
   size_t prev = (nzeros > size / 16 ? 0 : 1);
   if (JXL_LIKELY(nzeros != 0)) {
-    for (size_t k = covered_blocks; k < size && nzeros != 0; ++k) {
-      const size_t ctx =
-          histo_offset + ZeroDensityContext(nzeros, k, covered_blocks,
-                                            log2_covered_blocks, prev);
-      const size_t u_coeff =
-          decoder->ReadHybridUintInlined<uses_lz77>(ctx, br, context_map);
-      // Hand-rolled version of UnpackSigned, shifting before the conversion to
-      // signed integer to avoid undefined behavior of shifting negative numbers.
-      const size_t magnitude = u_coeff >> 1;
-      const size_t neg_sign = (~u_coeff) & 1;
-      const ptrdiff_t coeff =
-          static_cast<ptrdiff_t>((magnitude ^ (neg_sign - 1)) << shift);
-      if (ac_type == ACType::k16) {
-        block.ptr16[order[k]] += coeff;
-      } else {
-        block.ptr32[order[k]] += coeff;
+    // covered_blocks == 1 (the dominant 8x8 DCT case) skips the per-coefficient
+    // normalization shifts inside ZeroDensityContext. Byte-identical output; see
+    // ZeroDensityContext1. The body is duplicated to keep both context calls off
+    // a per-iteration branch.
+    if (covered_blocks == 1) {
+      for (size_t k = 1; k < kDCTBlockSize && nzeros != 0; ++k) {
+        const size_t ctx = histo_offset + ZeroDensityContext1(nzeros, k, prev);
+        const size_t u_coeff =
+            decoder->ReadHybridUintInlined<uses_lz77>(ctx, br, context_map);
+        const size_t magnitude = u_coeff >> 1;
+        const size_t neg_sign = (~u_coeff) & 1;
+        const ptrdiff_t coeff =
+            static_cast<ptrdiff_t>((magnitude ^ (neg_sign - 1)) << shift);
+        if (ac_type == ACType::k16) {
+          block.ptr16[order[k]] += coeff;
+        } else {
+          block.ptr32[order[k]] += coeff;
+        }
+        prev = static_cast<size_t>(u_coeff != 0);
+        nzeros -= prev;
       }
-      prev = static_cast<size_t>(u_coeff != 0);
-      nzeros -= prev;
+    } else {
+      for (size_t k = covered_blocks; k < size && nzeros != 0; ++k) {
+        const size_t ctx =
+            histo_offset + ZeroDensityContext(nzeros, k, covered_blocks,
+                                              log2_covered_blocks, prev);
+        const size_t u_coeff =
+            decoder->ReadHybridUintInlined<uses_lz77>(ctx, br, context_map);
+        // Hand-rolled version of UnpackSigned, shifting before the conversion to
+        // signed integer to avoid undefined behavior of shifting negative
+        // numbers.
+        const size_t magnitude = u_coeff >> 1;
+        const size_t neg_sign = (~u_coeff) & 1;
+        const ptrdiff_t coeff =
+            static_cast<ptrdiff_t>((magnitude ^ (neg_sign - 1)) << shift);
+        if (ac_type == ACType::k16) {
+          block.ptr16[order[k]] += coeff;
+        } else {
+          block.ptr32[order[k]] += coeff;
+        }
+        prev = static_cast<size_t>(u_coeff != 0);
+        nzeros -= prev;
+      }
     }
   }
   if (JXL_UNLIKELY(nzeros != 0)) {
