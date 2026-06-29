@@ -84,11 +84,26 @@ struct ImageOutput {
 // Temp images required for decoding a single group. Reduces memory allocations
 // for large images because we only initialize min(#threads, #groups) instances.
 struct HWY_ALIGN_MAX GroupDecCache {
+  // Allocates entropy predictor planes (num_nzeroes) for the given pass count.
+  // No-op for passes whose plane is already allocated.
+  Status EnsureEntropyPredictors(JxlMemoryManager* memory_manager,
+                                  size_t num_passes);
+
+  // Allocates the dequant/scratch arena sized for max_block_area coefficients.
   // max_block_area: precomputed from the frame's used_acs bitmap (see
   // PassesDecoderState::max_ac_block_area). Passing it directly avoids
   // re-scanning all 27 strategies on every group call.
+  // No-op if the arena is already large enough.
+  Status EnsureRenderWorkspace(JxlMemoryManager* memory_manager,
+                               size_t max_block_area);
+
+  // Convenience: calls both. Existing call sites need no changes.
   Status InitOnce(JxlMemoryManager* memory_manager, size_t num_passes,
-                  size_t max_block_area);
+                  size_t max_block_area) {
+    JXL_RETURN_IF_ERROR(EnsureEntropyPredictors(memory_manager, num_passes));
+    JXL_RETURN_IF_ERROR(EnsureRenderWorkspace(memory_manager, max_block_area));
+    return true;
+  }
 
   Status InitDCBufferOnce(JxlMemoryManager* memory_manager) {
     if (dc_buffer.xsize() == 0) {
@@ -114,7 +129,7 @@ struct HWY_ALIGN_MAX GroupDecCache {
   // onto the trailing 4 transform-scratch float blocks of the single arena
   // below. qblock is fully consumed by dequant_block before scratch_space is
   // touched (see DequantLane loop in dec_group.cc), so the lifetimes do not
-  // overlap. See InitOnce() for the layout proof.
+  // overlap. See EnsureRenderWorkspace() for the layout proof.
 
   // AC decoding. Stored value is the AC nonzero count averaged over the covered
   // blocks, i.e. (nzeros + covered - 1) >> log2_covered, always in [0, 63], so a

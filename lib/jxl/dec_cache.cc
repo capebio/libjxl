@@ -48,8 +48,8 @@
 
 namespace jxl {
 
-Status GroupDecCache::InitOnce(JxlMemoryManager* memory_manager,
-                               size_t num_passes, size_t max_block_area) {
+Status GroupDecCache::EnsureEntropyPredictors(JxlMemoryManager* memory_manager,
+                                              size_t num_passes) {
   for (size_t i = 0; i < num_passes; i++) {
     if (num_nzeroes[i].xsize() == 0) {
       // Allocate enough for a whole group - partial groups on the
@@ -61,7 +61,11 @@ Status GroupDecCache::InitOnce(JxlMemoryManager* memory_manager,
                                   kGroupDimInBlocks));
     }
   }
+  return true;
+}
 
+Status GroupDecCache::EnsureRenderWorkspace(JxlMemoryManager* memory_manager,
+                                            size_t max_block_area) {
   if (max_block_area > max_block_area_) {
     // One arena of 7 float blocks: 3x for dequantized coefficients + 4x scratch
     // for transforms. The 4x scratch region also backs the quantized buffers
