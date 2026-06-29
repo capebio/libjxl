@@ -170,30 +170,25 @@ class Separable5Impl {
 
     // More than one iteration for scalars.
     for (; x < kRadius; x += Lanes(d)) {
-      const V conv0 =
-          Mul(HorzConvolveFirst(row_m, x, xsize, wh0, wh1, wh2), wv0);
-
-      const V conv1t = HorzConvolveFirst(row_t1, x, xsize, wh0, wh1, wh2);
-      const V conv1b = HorzConvolveFirst(row_b1, x, xsize, wh0, wh1, wh2);
-      const V conv1 = MulAdd(Add(conv1t, conv1b), wv1, conv0);
-
-      const V conv2t = HorzConvolveFirst(row_t2, x, xsize, wh0, wh1, wh2);
-      const V conv2b = HorzConvolveFirst(row_b2, x, xsize, wh0, wh1, wh2);
-      const V conv2 = MulAdd(Add(conv2t, conv2b), wv2, conv1);
+      V h_t2, h_t1, h_m, h_b1, h_b2;
+      HorzFiveDedup<kSizeModN, 0>(row_t2, row_t1, row_m, row_b1, row_b2, x, xsize,
+                                  wh0, wh1, wh2, ml1, ml2, &h_t2, &h_t1, &h_m,
+                                  &h_b1, &h_b2);
+      const V conv0 = Mul(h_m, wv0);
+      const V conv1 = MulAdd(Add(h_t1, h_b1), wv1, conv0);
+      const V conv2 = MulAdd(Add(h_t2, h_b2), wv2, conv1);
       Store(conv2, d, row_out + x);
     }
 
     // Main loop: load inputs without padding
     for (; x + Lanes(d) + kRadius <= xsize; x += Lanes(d)) {
-      const V conv0 = Mul(HorzConvolve(row_m + x, wh0, wh1, wh2), wv0);
-
-      const V conv1t = HorzConvolve(row_t1 + x, wh0, wh1, wh2);
-      const V conv1b = HorzConvolve(row_b1 + x, wh0, wh1, wh2);
-      const V conv1 = MulAdd(Add(conv1t, conv1b), wv1, conv0);
-
-      const V conv2t = HorzConvolve(row_t2 + x, wh0, wh1, wh2);
-      const V conv2b = HorzConvolve(row_b2 + x, wh0, wh1, wh2);
-      const V conv2 = MulAdd(Add(conv2t, conv2b), wv2, conv1);
+      V h_t2, h_t1, h_m, h_b1, h_b2;
+      HorzFiveDedup<kSizeModN, 1>(row_t2, row_t1, row_m, row_b1, row_b2, x, xsize,
+                                  wh0, wh1, wh2, ml1, ml2, &h_t2, &h_t1, &h_m,
+                                  &h_b1, &h_b2);
+      const V conv0 = Mul(h_m, wv0);
+      const V conv1 = MulAdd(Add(h_t1, h_b1), wv1, conv0);
+      const V conv2 = MulAdd(Add(h_t2, h_b2), wv2, conv1);
       Store(conv2, d, row_out + x);
     }
 
@@ -203,21 +198,13 @@ class Separable5Impl {
 #else
     if (kSizeModN < kRadius) {
 #endif
-      const V conv0 = Mul(
-          HorzConvolveLast<kSizeModN>(row_m, x, xsize, wh0, wh1, wh2, ml1, ml2),
-          wv0);
-
-      const V conv1t = HorzConvolveLast<kSizeModN>(row_t1, x, xsize, wh0, wh1,
-                                                   wh2, ml1, ml2);
-      const V conv1b = HorzConvolveLast<kSizeModN>(row_b1, x, xsize, wh0, wh1,
-                                                   wh2, ml1, ml2);
-      const V conv1 = MulAdd(Add(conv1t, conv1b), wv1, conv0);
-
-      const V conv2t = HorzConvolveLast<kSizeModN>(row_t2, x, xsize, wh0, wh1,
-                                                   wh2, ml1, ml2);
-      const V conv2b = HorzConvolveLast<kSizeModN>(row_b2, x, xsize, wh0, wh1,
-                                                   wh2, ml1, ml2);
-      const V conv2 = MulAdd(Add(conv2t, conv2b), wv2, conv1);
+      V h_t2, h_t1, h_m, h_b1, h_b2;
+      HorzFiveDedup<kSizeModN, 2>(row_t2, row_t1, row_m, row_b1, row_b2, x, xsize,
+                                  wh0, wh1, wh2, ml1, ml2, &h_t2, &h_t1, &h_m,
+                                  &h_b1, &h_b2);
+      const V conv0 = Mul(h_m, wv0);
+      const V conv1 = MulAdd(Add(h_t1, h_b1), wv1, conv0);
+      const V conv2 = MulAdd(Add(h_t2, h_b2), wv2, conv1);
       Store(conv2, d, row_out + x);
       x += Lanes(d);
     }
@@ -297,6 +284,42 @@ class Separable5Impl {
     (void)ml2;
     (void)xsize;
     return HorzConvolve(row + x, wh0, wh1, wh2);
+  }
+
+  // Computes the five horizontal convolutions feeding one output vector, reusing
+  // the result whenever two source rows are the same pointer. On border rows the
+  // mirrored neighbours alias the central rows (e.g. the top row has t1==m and
+  // t2==b1; the tiny-height LUT collapses up to four offsets onto one row), so a
+  // band's worth of duplicate HorzConvolve work is eliminated. The compares are
+  // loop-invariant and perfectly predictable; a reused vector is bit-identical
+  // to a recomputed one, so the vertical FMA below stays byte-exact. Interior
+  // rows (all five distinct) fall through to five fresh convolutions as before.
+  template <size_t kSizeModN, int kRegion>
+  static JXL_MAYBE_INLINE void HorzFiveDedup(
+      const float* const r_t2, const float* const r_t1, const float* const r_m,
+      const float* const r_b1, const float* const r_b2, const int64_t x,
+      const int64_t xsize, const V wh0, const V wh1, const V wh2, const I ml1,
+      const I ml2, V* h_t2, V* h_t1, V* h_m, V* h_b1, V* h_b2) {
+    *h_m = HorzPick<kSizeModN, kRegion>(r_m, x, xsize, wh0, wh1, wh2, ml1, ml2);
+    *h_t1 = (r_t1 == r_m)
+                ? *h_m
+                : HorzPick<kSizeModN, kRegion>(r_t1, x, xsize, wh0, wh1, wh2,
+                                               ml1, ml2);
+    *h_b1 = (r_b1 == r_m)    ? *h_m
+            : (r_b1 == r_t1) ? *h_t1
+                             : HorzPick<kSizeModN, kRegion>(r_b1, x, xsize, wh0,
+                                                            wh1, wh2, ml1, ml2);
+    *h_t2 = (r_t2 == r_m)    ? *h_m
+            : (r_t2 == r_t1) ? *h_t1
+            : (r_t2 == r_b1) ? *h_b1
+                             : HorzPick<kSizeModN, kRegion>(r_t2, x, xsize, wh0,
+                                                            wh1, wh2, ml1, ml2);
+    *h_b2 = (r_b2 == r_m)    ? *h_m
+            : (r_b2 == r_t1) ? *h_t1
+            : (r_b2 == r_b1) ? *h_b1
+            : (r_b2 == r_t2) ? *h_t2
+                             : HorzPick<kSizeModN, kRegion>(r_b2, x, xsize, wh0,
+                                                            wh1, wh2, ml1, ml2);
   }
 
   // Convolves a single SIMD column for every output row in [y0, y1) using a
