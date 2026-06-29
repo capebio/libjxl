@@ -405,7 +405,9 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
                                  size_t stride, jxl::ThreadPool* pool,
                                  void* out_image, size_t out_size,
                                  const PixelCallback& out_callback,
-                                 jxl::Orientation undo_orientation) {
+                                 jxl::Orientation undo_orientation,
+                                 const ImageF* per_row_unpremul_alpha,
+                                 size_t num_color_channels) {
   JXL_ENSURE(num_channels != 0 && num_channels <= kConvertMaxChannels);
   JXL_ENSURE(in_channels[0] != nullptr);
   JxlMemoryManager* memory_manager = in_channels[0]->memory_manager();
@@ -488,6 +490,28 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
     }
   }
 
+  // Per-thread scratch rows for inline unpremultiplication.
+  ImageF scratch_color[kConvertMaxChannels];
+
+  // Load row_in[0..num_channels) for output row src_y; apply unpremul if set.
+  auto setup_row_in = [&](const float* JXL_RESTRICT* row_in, int64_t src_y,
+                           size_t thread) -> void {
+    for (size_t c = 0; c < num_channels; c++) {
+      row_in[c] = channels[c] ? channels[c]->Row(src_y) : ones.Row(0);
+    }
+    if (per_row_unpremul_alpha != nullptr) {
+      for (size_t c = 0; c < num_color_channels; c++) {
+        float* scratch = scratch_color[c].Row(thread);
+        memcpy(scratch, row_in[c], xsize * sizeof(float));
+        row_in[c] = scratch;
+      }
+      float* p0 = const_cast<float*>(row_in[0]);
+      float* p1 = (num_color_channels >= 2) ? const_cast<float*>(row_in[1]) : p0;
+      float* p2 = (num_color_channels >= 3) ? const_cast<float*>(row_in[2]) : p0;
+      UnpremultiplyAlpha(p0, p1, p2, per_row_unpremul_alpha->Row(src_y), xsize);
+    }
+  };
+
   if (float_out) {
     if (bits_per_sample == 16) {
       bool swap_endianness = little_endian != IsLittleEndian();
@@ -497,6 +521,12 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
             f16_cache, Plane<hwy::float16_t>::Create(
                            memory_manager, xsize, num_channels * num_threads));
         JXL_RETURN_IF_ERROR(InitOutCallback(num_threads));
+        if (per_row_unpremul_alpha != nullptr) {
+          for (size_t c = 0; c < num_color_channels; c++) {
+            JXL_ASSIGN_OR_RETURN(scratch_color[c],
+                                 ImageF::Create(memory_manager, xsize, num_threads));
+          }
+        }
         return true;
       };
       const auto process_row = [&](const uint32_t task,
@@ -504,9 +534,7 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
         const int64_t y = task;
         const int64_t src_y = flip_vertical ? (int64_t)(ysize - 1) - y : y;
         const float* JXL_RESTRICT row_in[kConvertMaxChannels];
-        for (size_t c = 0; c < num_channels; c++) {
-          row_in[c] = channels[c] ? channels[c]->Row(src_y) : ones.Row(0);
-        }
+        setup_row_in(row_in, src_y, thread);
         hwy::float16_t* JXL_RESTRICT row_f16[kConvertMaxChannels];
         for (size_t c = 0; c < num_channels; c++) {
           row_f16[c] = f16_cache.Row(c + thread * num_channels);
@@ -545,6 +573,12 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
     } else if (bits_per_sample == 32) {
       const auto init_cache = [&](size_t num_threads) -> Status {
         JXL_RETURN_IF_ERROR(InitOutCallback(num_threads));
+        if (per_row_unpremul_alpha != nullptr) {
+          for (size_t c = 0; c < num_color_channels; c++) {
+            JXL_ASSIGN_OR_RETURN(scratch_color[c],
+                                 ImageF::Create(memory_manager, xsize, num_threads));
+          }
+        }
         return true;
       };
       const auto process_row = [&](const uint32_t task,
@@ -557,9 +591,7 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
                 : &(reinterpret_cast<uint8_t*>(out_image))[stride * y];
         Span<uint8_t> out_span(row_out, row_size);
         const float* JXL_RESTRICT row_in[kConvertMaxChannels];
-        for (size_t c = 0; c < num_channels; c++) {
-          row_in[c] = channels[c] ? channels[c]->Row(src_y) : ones.Row(0);
-        }
+        setup_row_in(row_in, src_y, thread);
         if (little_endian) {
           StoreFloatRow<StoreLEFloat>(row_in, num_channels, xsize, out_span);
         } else {
@@ -579,6 +611,12 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
     // 8-bit path: fused float→interleaved uint8, no intermediate cache.
     const auto init_cache = [&](size_t num_threads) -> Status {
       JXL_RETURN_IF_ERROR(InitOutCallback(num_threads));
+      if (per_row_unpremul_alpha != nullptr) {
+        for (size_t c = 0; c < num_color_channels; c++) {
+          JXL_ASSIGN_OR_RETURN(scratch_color[c],
+                               ImageF::Create(memory_manager, xsize, num_threads));
+        }
+      }
       return true;
     };
     const auto process_row = [&](const uint32_t task,
@@ -590,9 +628,7 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
               ? row_out_callback[thread].data()
               : &(reinterpret_cast<uint8_t*>(out_image))[stride * y];
       const float* JXL_RESTRICT row_in[kConvertMaxChannels];
-      for (size_t c = 0; c < num_channels; c++) {
-        row_in[c] = channels[c] ? channels[c]->Row(src_y) : ones.Row(0);
-      }
+      setup_row_in(row_in, src_y, thread);
       HWY_DYNAMIC_DISPATCH(FloatToInterleavedU8)
       (row_in, num_channels, xsize, row_out);
       if (out_callback.IsPresent()) {
@@ -611,6 +647,12 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
                            Plane<uint32_t>::Create(memory_manager, xsize,
                                                    num_channels * num_threads));
       JXL_RETURN_IF_ERROR(InitOutCallback(num_threads));
+      if (per_row_unpremul_alpha != nullptr) {
+        for (size_t c = 0; c < num_color_channels; c++) {
+          JXL_ASSIGN_OR_RETURN(scratch_color[c],
+                               ImageF::Create(memory_manager, xsize, num_threads));
+        }
+      }
       return true;
     };
     const auto process_row = [&](const uint32_t task,
@@ -623,9 +665,7 @@ Status ConvertChannelsToExternal(const ImageF* in_channels[],
               : &(reinterpret_cast<uint8_t*>(out_image))[stride * y];
       Span<uint8_t> out_span(row_out, row_size);
       const float* JXL_RESTRICT row_in[kConvertMaxChannels];
-      for (size_t c = 0; c < num_channels; c++) {
-        row_in[c] = channels[c] ? channels[c]->Row(src_y) : ones.Row(0);
-      }
+      setup_row_in(row_in, src_y, thread);
       uint32_t* JXL_RESTRICT row_u32[kConvertMaxChannels];
       for (size_t c = 0; c < num_channels; c++) {
         row_u32[c] = u32_cache.Row(c + thread * num_channels);
@@ -660,21 +700,13 @@ Status ConvertToExternal(const jxl::ImageBundle& ib, size_t bits_per_sample,
   size_t color_channels = num_channels <= 2 ? 1 : 3;
 
   const Image3F* color = &ib.color();
-  JxlMemoryManager* memory_manager = color->memory_manager();
-  // Undo premultiplied alpha.
-  Image3F unpremul;
+
+  // Inline unpremultiplication: pass alpha plane to ConvertChannelsToExternal
+  // so it can unpremultiply per-row using per-thread scratch, avoiding a full
+  // Image3F copy.
+  const ImageF* per_row_unpremul_alpha = nullptr;
   if (ib.AlphaIsPremultiplied() && ib.HasAlpha() && unpremul_alpha) {
-    JXL_ASSIGN_OR_RETURN(
-        unpremul,
-        Image3F::Create(memory_manager, color->xsize(), color->ysize()));
-    JXL_RETURN_IF_ERROR(CopyImageTo(*color, &unpremul));
-    const ImageF* alpha = ib.alpha();
-    for (size_t y = 0; y < unpremul.ysize(); y++) {
-      UnpremultiplyAlpha(unpremul.PlaneRow(0, y), unpremul.PlaneRow(1, y),
-                         unpremul.PlaneRow(2, y), alpha->Row(y),
-                         unpremul.xsize());
-    }
-    color = &unpremul;
+    per_row_unpremul_alpha = ib.alpha();
   }
 
   const ImageF* channels[kConvertMaxChannels];
@@ -689,7 +721,8 @@ Status ConvertToExternal(const jxl::ImageBundle& ib, size_t bits_per_sample,
 
   return ConvertChannelsToExternal(
       channels, num_channels, bits_per_sample, float_out, endianness, stride,
-      pool, out_image, out_size, out_callback, undo_orientation);
+      pool, out_image, out_size, out_callback, undo_orientation,
+      per_row_unpremul_alpha, color_channels);
 }
 
 }  // namespace jxl

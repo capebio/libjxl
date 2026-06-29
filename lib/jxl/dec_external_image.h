@@ -32,13 +32,19 @@ const size_t kConvertMaxChannels = 4;
 // instead. This is useful for handling when a user requests an alpha channel
 // from an image that doesn't have one. The first channel in the list may not
 // be nullptr, since it is used to determine the image size.
+// per_row_unpremul_alpha: when non-null, the first num_color_channels channels
+// are unpremultiplied per-row against this alpha plane using per-thread scratch
+// rows, avoiding the full Image3F copy that ConvertToExternal would otherwise
+// require.  num_color_channels must be 0 when per_row_unpremul_alpha is null.
 Status ConvertChannelsToExternal(const ImageF* in_channels[],
                                  size_t num_channels, size_t bits_per_sample,
                                  bool float_out, JxlEndianness endianness,
                                  size_t stride, jxl::ThreadPool* pool,
                                  void* out_image, size_t out_size,
                                  const PixelCallback& out_callback,
-                                 jxl::Orientation undo_orientation);
+                                 jxl::Orientation undo_orientation,
+                                 const ImageF* per_row_unpremul_alpha = nullptr,
+                                 size_t num_color_channels = 0);
 
 // Converts ib to interleaved void* pixel buffer with the given format.
 // bits_per_sample: must be 16 or 32 if float_out is true, and at most 16
