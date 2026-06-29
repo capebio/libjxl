@@ -311,6 +311,34 @@ void DequantBlock(float inv_global_scale, int quant, float x_dm_multiplier,
   }
 }
 
+// Specialisation of DequantBlock for the dominant covered_blocks == 1 case.
+// kDCTBlockSize (64) is a compile-time constant here, allowing the compiler to
+// unroll the SIMD loop and eliminate the LowestFrequenciesFromDC branch.
+template <ACType ac_type>
+void DequantSingleBlock(float inv_global_scale, int quant, float x_dm_multiplier,
+                        float b_dm_multiplier, Vec<D> x_cc_mul, Vec<D> b_cc_mul,
+                        AcStrategyType kind, const Quantizer& quantizer,
+                        const size_t* sbx,
+                        const float* JXL_RESTRICT* JXL_RESTRICT dc_row,
+                        const float* JXL_RESTRICT biases,
+                        ACPtr qblock[3], float* JXL_RESTRICT block) {
+  constexpr size_t kSize = kDCTBlockSize;  // 64, compile-time constant
+  const auto scaled_dequant_s = inv_global_scale / quant;
+  const auto scaled_dequant_x = Set(d, scaled_dequant_s * x_dm_multiplier);
+  const auto scaled_dequant_y = Set(d, scaled_dequant_s);
+  const auto scaled_dequant_b = Set(d, scaled_dequant_s * b_dm_multiplier);
+  const float* dequant_matrices = quantizer.DequantMatrix(kind, 0);
+  for (size_t k = 0; k < kSize; k += Lanes(d)) {
+    DequantLane<ac_type>(scaled_dequant_x, scaled_dequant_y, scaled_dequant_b,
+                         dequant_matrices, kSize, k, x_cc_mul, b_cc_mul, biases,
+                         qblock, block);
+  }
+  // Direct DC overwrite — no LowestFrequenciesFromDC needed for single block.
+  block[0]         = dc_row[0][sbx[0]];
+  block[kSize]     = dc_row[1][sbx[1]];
+  block[2 * kSize] = dc_row[2][sbx[2]];
+}
+
 // DecodeGroupImpl renders one group to pixels. kReadCoefficients is false
 // for progressive redraws that render the persistent coefficient store: that
 // path must not construct or touch the entropy reader. kDontDraw groups are
@@ -349,6 +377,9 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
   ACType ac_type = dec_state->coefficients->Type();
   auto dequant_block = ac_type == ACType::k16 ? DequantBlock<ACType::k16>
                                               : DequantBlock<ACType::k32>;
+  auto dequant_single_block =
+      ac_type == ACType::k16 ? DequantSingleBlock<ACType::k16>
+                             : DequantSingleBlock<ACType::k32>;
   // Whether or not coefficients should be stored for future usage, and/or read
   // from past usage.
   bool accumulate = !dec_state->coefficients->IsEmpty();
@@ -586,14 +617,23 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
                                     (!active_x || dc_only[0]) &&
                                     (!active_b || dc_only[2]);
           if (JXL_LIKELY(!skip_dequant)) {
-            dequant_block(
-                inv_global_scale, row_quant[bx], dec_state->x_dm_multiplier,
-                dec_state->b_dm_multiplier, x_cc_mul, b_cc_mul, acs.Strategy(),
-                size, dec_state->shared->quantizer,
-                acs.covered_blocks_y() * acs.covered_blocks_x(), sbx, dc_rows,
-                dc_stride,
-                dec_state->output_encoding_info.opsin_params.quant_biases, qblock,
-                block, group_dec_cache->scratch_space);
+            if (JXL_LIKELY(covered_blocks == 1)) {
+              dequant_single_block(
+                  inv_global_scale, row_quant[bx], dec_state->x_dm_multiplier,
+                  dec_state->b_dm_multiplier, x_cc_mul, b_cc_mul, acs.Strategy(),
+                  dec_state->shared->quantizer, sbx, dc_rows,
+                  dec_state->output_encoding_info.opsin_params.quant_biases,
+                  qblock, block);
+            } else {
+              dequant_block(
+                  inv_global_scale, row_quant[bx], dec_state->x_dm_multiplier,
+                  dec_state->b_dm_multiplier, x_cc_mul, b_cc_mul, acs.Strategy(),
+                  size, dec_state->shared->quantizer,
+                  acs.covered_blocks_y() * acs.covered_blocks_x(), sbx, dc_rows,
+                  dc_stride,
+                  dec_state->output_encoding_info.opsin_params.quant_biases,
+                  qblock, block, group_dec_cache->scratch_space);
+            }
           }
 
           for (size_t c : {1, 0, 2}) {
