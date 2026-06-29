@@ -33,7 +33,7 @@ Status TokenizeCoefficients(const coeff_order_t* JXL_RESTRICT orders,
                             const int32_t* JXL_RESTRICT* JXL_RESTRICT ac_rows,
                             const AcStrategyImage& ac_strategy,
                             const YCbCrChromaSubsampling& cs,
-                            Image3I* JXL_RESTRICT tmp_num_nzeroes,
+                            Image3B* JXL_RESTRICT tmp_num_nzeroes,
                             std::vector<Token>* JXL_RESTRICT output,
                             const ImageB& qdc, const ImageI& qf,
                             const BlockCtxMap& block_ctx_map);

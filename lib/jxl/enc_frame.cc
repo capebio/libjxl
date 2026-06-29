@@ -1180,13 +1180,13 @@ struct EncCache {
   Status InitOnce(JxlMemoryManager* memory_manager) {
     if (num_nzeroes.xsize() == 0) {
       JXL_ASSIGN_OR_RETURN(num_nzeroes,
-                           Image3I::Create(memory_manager, kGroupDimInBlocks,
+                           Image3B::Create(memory_manager, kGroupDimInBlocks,
                                            kGroupDimInBlocks));
     }
     return true;
   }
-  // TokenizeCoefficients
-  Image3I num_nzeroes;
+  // TokenizeCoefficients (prediction values are bounded by 63, so 1 byte each).
+  Image3B num_nzeroes;
 };
 
 Status TokenizeAllCoefficients(const FrameHeader& frame_header,

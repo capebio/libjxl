@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "lib/jxl/base/rect.h"
@@ -48,7 +49,7 @@ int32_t NumNonZeroExceptLLF(const size_t cx, const size_t cy,
                             const size_t log2_covered_blocks,
                             const int32_t* JXL_RESTRICT block,
                             const size_t nzeros_stride,
-                            int32_t* JXL_RESTRICT nzeros_pos) {
+                            uint8_t* JXL_RESTRICT nzeros_pos) {
   const HWY_CAPPED(int32_t, kBlockDim) di;
 
   const auto zero = Zero(di);
@@ -90,13 +91,15 @@ int32_t NumNonZeroExceptLLF(const size_t cx, const size_t cy,
   const int32_t nzeros = static_cast<int32_t>(cx * cy * kDCTBlockSize) +
                          GetLane(SumOfLanes(di, neg_sum_zero));
 
-  const int32_t shifted_nzeros = static_cast<int32_t>(
+  // Stored prediction value is ceil(nzeros / covered_blocks), bounded by 63
+  // (an AC block has at most kDCTBlockSize-1 nonzeros), so it fits in a byte.
+  const uint8_t shifted_nzeros = static_cast<uint8_t>(
       (nzeros + covered_blocks - 1) >> log2_covered_blocks);
-  // Need non-canonicalized dimensions!
+  // Need non-canonicalized dimensions! Each covered row holds one identical
+  // value, so a byte fill replaces per-cell stores.
+  const size_t cbx = acs.covered_blocks_x();
   for (size_t y = 0; y < acs.covered_blocks_y(); y++) {
-    for (size_t x = 0; x < acs.covered_blocks_x(); x++) {
-      nzeros_pos[x + y * nzeros_stride] = shifted_nzeros;
-    }
+    memset(nzeros_pos + y * nzeros_stride, shifted_nzeros, cbx);
   }
 
   return nzeros;
@@ -105,7 +108,7 @@ int32_t NumNonZeroExceptLLF(const size_t cx, const size_t cy,
 // Specialization for 8x8, where only top-left is LLF/DC.
 // About 1% overall speedup vs. NumNonZeroExceptLLF.
 int32_t NumNonZero8x8ExceptDC(const int32_t* JXL_RESTRICT block,
-                              int32_t* JXL_RESTRICT nzeros_pos) {
+                              uint8_t* JXL_RESTRICT nzeros_pos) {
   const HWY_CAPPED(int32_t, kBlockDim) di;
 
   const auto zero = Zero(di);
@@ -139,7 +142,8 @@ int32_t NumNonZero8x8ExceptDC(const int32_t* JXL_RESTRICT block,
   const int32_t nzeros = static_cast<int32_t>(kDCTBlockSize) +
                          GetLane(SumOfLanes(di, neg_sum_zero));
 
-  *nzeros_pos = nzeros;
+  // At most kDCTBlockSize-1 == 63 AC nonzeros in an 8x8 block, fits a byte.
+  *nzeros_pos = static_cast<uint8_t>(nzeros);
 
   return nzeros;
 }
@@ -155,7 +159,7 @@ Status TokenizeCoefficients(const coeff_order_t* JXL_RESTRICT orders,
                             const int32_t* JXL_RESTRICT* JXL_RESTRICT ac_rows,
                             const AcStrategyImage& ac_strategy,
                             const YCbCrChromaSubsampling& cs,
-                            Image3I* JXL_RESTRICT tmp_num_nzeroes,
+                            Image3B* JXL_RESTRICT tmp_num_nzeroes,
                             std::vector<Token>* JXL_RESTRICT output,
                             const ImageB& qdc, const ImageI& qf,
                             const BlockCtxMap& block_ctx_map) {
@@ -163,19 +167,30 @@ Status TokenizeCoefficients(const coeff_order_t* JXL_RESTRICT orders,
   const size_t ysize_blocks = rect.ysize();
   output->clear();
   // TODO(user): update the estimate: usually less coefficients are used.
-  output->reserve(3 * xsize_blocks * ysize_blocks * kDCTBlockSize);
+  // Upper bound on emitted coefficient tokens, honouring chroma subsampling so
+  // we do not over-reserve by 1.5x (4:2:2) or 2x (4:2:0). For 4:4:4 this equals
+  // 3 * xsize_blocks * ysize_blocks * kDCTBlockSize as before.
+  size_t reserve_tokens = 0;
+  for (size_t c = 0; c < 3; ++c) {
+    const size_t cxs =
+        (xsize_blocks + (size_t{1} << cs.HShift(c)) - 1) >> cs.HShift(c);
+    const size_t cys =
+        (ysize_blocks + (size_t{1} << cs.VShift(c)) - 1) >> cs.VShift(c);
+    reserve_tokens += cxs * cys * kDCTBlockSize;
+  }
+  output->reserve(reserve_tokens);
 
   size_t offset[3] = {};
   const size_t nzeros_stride = tmp_num_nzeroes->PixelsPerRow();
   for (size_t by = 0; by < ysize_blocks; ++by) {
     size_t sby[3] = {by >> cs.VShift(0), by >> cs.VShift(1),
                      by >> cs.VShift(2)};
-    int32_t* JXL_RESTRICT row_nzeros[3] = {
+    uint8_t* JXL_RESTRICT row_nzeros[3] = {
         tmp_num_nzeroes->PlaneRow(0, sby[0]),
         tmp_num_nzeroes->PlaneRow(1, sby[1]),
         tmp_num_nzeroes->PlaneRow(2, sby[2]),
     };
-    const int32_t* JXL_RESTRICT row_nzeros_top[3] = {
+    const uint8_t* JXL_RESTRICT row_nzeros_top[3] = {
         sby[0] == 0 ? nullptr : tmp_num_nzeroes->ConstPlaneRow(0, sby[0] - 1),
         sby[1] == 0 ? nullptr : tmp_num_nzeroes->ConstPlaneRow(1, sby[1] - 1),
         sby[2] == 0 ? nullptr : tmp_num_nzeroes->ConstPlaneRow(2, sby[2] - 1),
@@ -184,17 +199,24 @@ Status TokenizeCoefficients(const coeff_order_t* JXL_RESTRICT orders,
         qdc.ConstRow(rect.y0() + by) + rect.x0();
     const int32_t* JXL_RESTRICT row_qf = rect.ConstRow(qf, by);
     AcStrategyRow acs_row = ac_strategy.ConstRow(rect, by);
-    for (size_t bx = 0; bx < xsize_blocks; ++bx) {
+    for (size_t bx = 0; bx < xsize_blocks;) {
       AcStrategy acs = acs_row[bx];
-      if (!acs.IsFirstBlock()) continue;
+      if (!acs.IsFirstBlock()) {
+        ++bx;
+        continue;
+      }
+      // Raw (non-canonical) horizontal coverage; also the per-row stride of
+      // covered non-first blocks we can jump over below.
+      const size_t raw_cx = acs.covered_blocks_x();
       size_t sbx[3] = {bx >> cs.HShift(0), bx >> cs.HShift(1),
                        bx >> cs.HShift(2)};
-      size_t cx = acs.covered_blocks_x();
+      size_t cx = raw_cx;
       size_t cy = acs.covered_blocks_y();
       const size_t covered_blocks = cx * cy;  // = #LLF coefficients
       const size_t log2_covered_blocks =
           Num0BitsBelowLS1Bit_Nonzero(covered_blocks);
       const size_t size = covered_blocks * kDCTBlockSize;
+      const int ord = kStrategyOrder[acs.RawStrategy()];
 
       CoefficientLayout(&cy, &cx);  // swap cx/cy to canonical order
 
@@ -210,7 +232,6 @@ Status TokenizeCoefficients(const coeff_order_t* JXL_RESTRICT orders,
                                       log2_covered_blocks, block, nzeros_stride,
                                       row_nzeros[c] + sbx[c]);
 
-        int ord = kStrategyOrder[acs.RawStrategy()];
         const coeff_order_t* JXL_RESTRICT order =
             &orders[CoeffOrderOffset(ord, c)];
 
@@ -239,6 +260,9 @@ Status TokenizeCoefficients(const coeff_order_t* JXL_RESTRICT orders,
         JXL_ENSURE(nzeros == 0);
         offset[c] += size;
       }
+      // Every block horizontally covered by this transform is a non-first
+      // block that the loop would skip; jump straight past them.
+      bx += raw_cx;
     }
   }
   return true;
@@ -257,7 +281,7 @@ Status TokenizeCoefficients(const coeff_order_t* JXL_RESTRICT orders,
                             const int32_t* JXL_RESTRICT* JXL_RESTRICT ac_rows,
                             const AcStrategyImage& ac_strategy,
                             const YCbCrChromaSubsampling& cs,
-                            Image3I* JXL_RESTRICT tmp_num_nzeroes,
+                            Image3B* JXL_RESTRICT tmp_num_nzeroes,
                             std::vector<Token>* JXL_RESTRICT output,
                             const ImageB& qdc, const ImageI& qf,
                             const BlockCtxMap& block_ctx_map) {
