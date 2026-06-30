@@ -9,7 +9,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <map>
 #include <numeric>
 #include <queue>
 #include <tuple>
@@ -33,6 +32,7 @@ using hwy::HWY_NAMESPACE::AllTrue;
 using hwy::HWY_NAMESPACE::Eq;
 using hwy::HWY_NAMESPACE::GetLane;
 using hwy::HWY_NAMESPACE::IfThenZeroElse;
+using hwy::HWY_NAMESPACE::StoreU;
 using hwy::HWY_NAMESPACE::SumOfLanes;
 using hwy::HWY_NAMESPACE::Zero;
 
@@ -80,23 +80,82 @@ void HistogramEntropy(const Histogram& a) {
   a.entropy += GetLane(SumOfLanes(df, entropy_lanes));
 }
 
+// Fold `src` into `dst` and refresh dst.entropy in a single pass over the
+// count vector. FastClusterHistograms needs dst.entropy immediately after
+// growing a cluster, so the previous AddHistogram()+HistogramEntropy() pair
+// traversed the same counts twice. Counts are always a multiple of kRounding
+// (>= SIMD width), so every loop bound is lane-aligned. Byte-exact with the
+// two-call sequence: identical summed counts, identical ascending lane
+// accumulation order, identical total_count.
+void HistogramAddAndEntropy(Histogram& dst, const Histogram& src) {
+  const size_t dst_size = dst.counts.size();
+  const size_t src_size = src.counts.size();
+  if (src_size > dst_size) {
+    dst.counts.resize(src_size);
+  }
+  dst.total_count += src.total_count;
+  dst.entropy = 0.0f;
+  if (dst.total_count == 0) return;
+
+  const HWY_CAPPED(float, Histogram::kRounding) df;
+  const HWY_CAPPED(int32_t, Histogram::kRounding) di;
+  const size_t lanes = Lanes(di);
+
+  const auto inv_tot = Set(df, 1.0f / dst.total_count);
+  auto entropy_lanes = Zero(df);
+  const auto total = Set(df, dst.total_count);
+  const size_t common_size = std::min(dst_size, src_size);
+
+  size_t i = 0;
+  for (; i < common_size; i += lanes) {
+    const auto counts =
+        Add(LoadU(di, &dst.counts[i]), LoadU(di, &src.counts[i]));
+    StoreU(counts, di, &dst.counts[i]);
+    entropy_lanes =
+        Add(entropy_lanes, Entropy(ConvertTo(df, counts), inv_tot, total));
+  }
+  if (src_size > dst_size) {
+    for (; i < src_size; i += lanes) {
+      const auto counts = LoadU(di, &src.counts[i]);
+      StoreU(counts, di, &dst.counts[i]);
+      entropy_lanes =
+          Add(entropy_lanes, Entropy(ConvertTo(df, counts), inv_tot, total));
+    }
+  } else {
+    for (; i < dst_size; i += lanes) {
+      const auto counts = LoadU(di, &dst.counts[i]);
+      entropy_lanes =
+          Add(entropy_lanes, Entropy(ConvertTo(df, counts), inv_tot, total));
+    }
+  }
+  dst.entropy = GetLane(SumOfLanes(df, entropy_lanes));
+}
+
 float HistogramDistance(const Histogram& a, const Histogram& b) {
   if (a.total_count == 0 || b.total_count == 0) return 0;
 
   const HWY_CAPPED(float, Histogram::kRounding) df;
   const HWY_CAPPED(int32_t, Histogram::kRounding) di;
+  const size_t lanes = Lanes(di);
+  const size_t a_size = a.counts.size();
+  const size_t b_size = b.counts.size();
+  const size_t common_size = std::min(a_size, b_size);
 
   const auto inv_tot = Set(df, 1.0f / (a.total_count + b.total_count));
   auto distance_lanes = Zero(df);
-  auto total = Set(df, a.total_count + b.total_count);
+  const auto total = Set(df, a.total_count + b.total_count);
 
-  for (size_t i = 0; i < std::max(a.counts.size(), b.counts.size());
-       i += Lanes(di)) {
-    const auto a_counts =
-        a.counts.size() > i ? LoadU(di, &a.counts[i]) : Zero(di);
-    const auto b_counts =
-        b.counts.size() > i ? LoadU(di, &b.counts[i]) : Zero(di);
-    const auto counts = ConvertTo(df, Add(a_counts, b_counts));
+  // Overlapping alphabet: both operands present, no per-lane size test.
+  size_t i = 0;
+  for (; i < common_size; i += lanes) {
+    const auto counts =
+        ConvertTo(df, Add(LoadU(di, &a.counts[i]), LoadU(di, &b.counts[i])));
+    distance_lanes = Add(distance_lanes, Entropy(counts, inv_tot, total));
+  }
+  // Tail of the longer operand: the shorter contributes zero.
+  const Histogram& longer = a_size > b_size ? a : b;
+  for (; i < longer.counts.size(); i += lanes) {
+    const auto counts = ConvertTo(df, LoadU(di, &longer.counts[i]));
     distance_lanes = Add(distance_lanes, Entropy(counts, inv_tot, total));
   }
   const float total_distance = GetLane(SumOfLanes(df, distance_lanes));
@@ -111,19 +170,31 @@ float HistogramKLDivergence(const Histogram& actual, const Histogram& coding) {
 
   const HWY_CAPPED(float, Histogram::kRounding) df;
   const HWY_CAPPED(int32_t, Histogram::kRounding) di;
+  const size_t lanes = Lanes(di);
+  const auto zero = Zero(di);
+  const size_t common_size =
+      std::min(actual.counts.size(), coding.counts.size());
+
+  // Any positive actual count beyond coding's alphabet has zero coding
+  // probability => infinite divergence. Reject without log work. This matches
+  // the original SIMD path, which produced +inf for those lanes; the finite
+  // path below is byte-exact because those tail lanes contributed exactly 0.
+  for (size_t i = common_size; i < actual.counts.size(); i += lanes) {
+    if (!AllTrue(di, Eq(LoadU(di, &actual.counts[i]), zero))) {
+      return kInfinity;
+    }
+  }
 
   const auto coding_inv = Set(df, 1.0f / coding.total_count);
   auto cost_lanes = Zero(df);
-
-  for (size_t i = 0; i < actual.counts.size(); i += Lanes(di)) {
+  for (size_t i = 0; i < common_size; i += lanes) {
     const auto counts = LoadU(di, &actual.counts[i]);
-    const auto coding_counts =
-        coding.counts.size() > i ? LoadU(di, &coding.counts[i]) : Zero(di);
+    const auto coding_counts = LoadU(di, &coding.counts[i]);
     const auto coding_probs = Mul(ConvertTo(df, coding_counts), coding_inv);
     const auto neg_coding_cost = BitCast(
         df,
-        IfThenZeroElse(Eq(counts, Zero(di)),
-                       IfThenElse(Eq(coding_counts, Zero(di)),
+        IfThenZeroElse(Eq(counts, zero),
+                       IfThenElse(Eq(coding_counts, zero),
                                   BitCast(di, Set(df, -kInfinity)),
                                   BitCast(di, FastLog2f(df, coding_probs)))));
     cost_lanes = NegMulAdd(ConvertTo(df, counts), neg_coding_cost, cost_lanes);
@@ -199,8 +270,8 @@ Status FastClusterHistograms(const std::vector<Histogram>& in,
     }
     JXL_ENSURE(best_dist < std::numeric_limits<float>::max());
     if (best >= prev_histograms) {
-      (*out)[best].AddHistogram(in[i]);
-      HistogramEntropy((*out)[best]);
+      // Fused: AddHistogram(in[i]) + HistogramEntropy, single counts traversal.
+      HistogramAddAndEntropy((*out)[best], in[i]);
     }
     (*histogram_symbols)[i] = best;
   }
@@ -229,27 +300,103 @@ namespace {
 // -----------------------------------------------------------------------------
 // Histogram refinement
 
+constexpr uint32_t kInvalidHistogram = std::numeric_limits<uint32_t>::max();
+
 // Reorder histograms in *out so that the new symbols in *symbols come in
-// increasing order.
+// increasing order. The permutation is applied in place with swaps: histogram
+// payload (count) vectors are never deep-copied merely to canonicalize the
+// context map. Unreferenced (dead) histograms are permuted past the live tail
+// and dropped by the final resize.
 void HistogramReindex(std::vector<Histogram>* out, size_t prev_histograms,
                       std::vector<uint32_t>* symbols) {
-  std::vector<Histogram> tmp(*out);
-  std::map<int, int> new_index;
+  const size_t num_histograms = out->size();
+  if (prev_histograms == num_histograms) return;
+
+  // new_index maps old slot -> new slot. Pre-existing histograms keep theirs.
+  std::vector<uint32_t> new_index(num_histograms, kInvalidHistogram);
   for (size_t i = 0; i < prev_histograms; ++i) {
-    new_index[i] = i;
+    new_index[i] = static_cast<uint32_t>(i);
   }
-  int next_index = prev_histograms;
-  for (uint32_t symbol : *symbols) {
-    if (new_index.find(symbol) == new_index.end()) {
-      new_index[symbol] = next_index;
-      (*out)[next_index] = tmp[symbol];
+
+  size_t next_index = prev_histograms;
+  bool is_identity = true;
+  for (uint32_t& symbol : *symbols) {
+    uint32_t new_symbol = new_index[symbol];
+    if (new_symbol == kInvalidHistogram) {
+      new_symbol = static_cast<uint32_t>(next_index);
+      new_index[symbol] = new_symbol;
+      is_identity &= symbol == next_index;
       ++next_index;
+    }
+    symbol = new_symbol;
+  }
+
+  if (next_index == prev_histograms) {
+    // No new histograms survived; drop any dead tail.
+    out->resize(prev_histograms);
+    return;
+  }
+
+  // Complete old->new into a full permutation by sending dead slots past the
+  // live region (they get truncated below).
+  size_t next_unused = next_index;
+  for (size_t old_index = 0; old_index < num_histograms; ++old_index) {
+    if (new_index[old_index] == kInvalidHistogram) {
+      new_index[old_index] = static_cast<uint32_t>(next_unused++);
+    }
+  }
+
+  if (!is_identity) {
+    // Cycle-sort: the element currently at i belongs at new_index[i].
+    for (size_t i = 0; i < num_histograms; ++i) {
+      while (new_index[i] != i) {
+        const size_t target = new_index[i];
+        (*out)[i].swap((*out)[target]);
+        std::swap(new_index[i], new_index[target]);
+      }
     }
   }
   out->resize(next_index);
-  for (uint32_t& symbol : *symbols) {
-    symbol = new_index[symbol];
+}
+
+// Union-find with path halving. Returns the surviving cluster that `index` was
+// merged into, equivalent to the old per-merge renumbering scan.
+uint32_t FindHistogramRepresentative(std::vector<uint32_t>* parent,
+                                     uint32_t index) {
+  while ((*parent)[index] != index) {
+    (*parent)[index] = (*parent)[(*parent)[index]];
+    index = (*parent)[index];
   }
+  return index;
+}
+
+// Exact merge cost of `first` + `second`, reusing a single scratch histogram
+// for the merged counts instead of allocating a fresh Histogram per candidate
+// pair. Byte-exact with the old `Histogram histo; histo.AddHistogram(first);
+// histo.AddHistogram(second); cost - (first.entropy + second.entropy)`: the
+// entropy subtraction keeps the original `cost - (a + b)` rounding order.
+StatusOr<float> HistogramMergeCost(const Histogram& first,
+                                   const Histogram& second, Histogram* merged) {
+  const size_t first_size = first.counts.size();
+  const size_t second_size = second.counts.size();
+  const size_t common_size = std::min(first_size, second_size);
+  const size_t merged_size = std::max(first_size, second_size);
+
+  merged->counts.resize(merged_size);
+  for (size_t i = 0; i < common_size; ++i) {
+    merged->counts[i] = first.counts[i] + second.counts[i];
+  }
+  if (first_size > second_size) {
+    std::copy(first.counts.begin() + common_size, first.counts.end(),
+              merged->counts.begin() + common_size);
+  } else {
+    std::copy(second.counts.begin() + common_size, second.counts.end(),
+              merged->counts.begin() + common_size);
+  }
+  merged->total_count = first.total_count + second.total_count;
+
+  JXL_ASSIGN_OR_RETURN(float cost, merged->ANSPopulationCost());
+  return cost - (first.entropy + second.entropy);
 }
 
 }  // namespace
@@ -261,6 +408,14 @@ Status ClusterHistograms(const HistogramParams& params,
                          const std::vector<Histogram>& in,
                          size_t max_histograms, std::vector<Histogram>* out,
                          std::vector<uint32_t>* histogram_symbols) {
+  // Guard the empty-input path: with pre-existing histograms present,
+  // FastClusterHistograms' seed search would dereference std::max_element over
+  // an empty distance vector.
+  if (in.empty()) {
+    histogram_symbols->clear();
+    return true;
+  }
+
   size_t prev_histograms = out->size();
   max_histograms = std::min(max_histograms, params.max_histograms);
   max_histograms = std::min(max_histograms, in.size());
@@ -278,8 +433,9 @@ Status ClusterHistograms(const HistogramParams& params,
     }
     uint32_t next_version = 2;
     std::vector<uint32_t> version(out->size(), 1);
-    std::vector<uint32_t> renumbering(out->size());
-    std::iota(renumbering.begin(), renumbering.end(), 0);
+    // Union-find parent links: parent[c] points at the cluster c merged into.
+    std::vector<uint32_t> parent(out->size());
+    std::iota(parent.begin(), parent.end(), 0u);
 
     // Try to pair up clusters if doing so reduces the total cost.
 
@@ -300,13 +456,11 @@ Status ClusterHistograms(const HistogramParams& params,
 
     // Create list of all pairs by increasing merging cost.
     std::priority_queue<HistogramPair> pairs_to_merge;
+    Histogram merged;  // Reused scratch for every merge-cost evaluation.
     for (uint32_t i = 0; i < out->size(); i++) {
       for (uint32_t j = i + 1; j < out->size(); j++) {
-        Histogram histo;
-        histo.AddHistogram((*out)[i]);
-        histo.AddHistogram((*out)[j]);
-        JXL_ASSIGN_OR_RETURN(float cost, histo.ANSPopulationCost());
-        cost -= (*out)[i].entropy + (*out)[j].entropy;
+        JXL_ASSIGN_OR_RETURN(
+            float cost, HistogramMergeCost((*out)[i], (*out)[j], &merged));
         // Avoid enqueueing pairs that are not advantageous to merge.
         if (cost >= 0) continue;
         pairs_to_merge.push(
@@ -328,21 +482,15 @@ Status ClusterHistograms(const HistogramParams& params,
       (*out)[first].AddHistogram((*out)[second]);
       JXL_ASSIGN_OR_RETURN((*out)[first].entropy,
                            (*out)[first].ANSPopulationCost());
-      for (uint32_t& item : renumbering) {
-        if (item == second) {
-          item = first;
-        }
-      }
+      parent[second] = first;
       version[second] = 0;
       version[first] = next_version++;
       for (uint32_t j = 0; j < out->size(); j++) {
         if (j == first) continue;
         if (version[j] == 0) continue;
-        Histogram histo;
-        histo.AddHistogram((*out)[first]);
-        histo.AddHistogram((*out)[j]);
-        JXL_ASSIGN_OR_RETURN(float merge_cost, histo.ANSPopulationCost());
-        merge_cost -= (*out)[first].entropy + (*out)[j].entropy;
+        JXL_ASSIGN_OR_RETURN(
+            float merge_cost,
+            HistogramMergeCost((*out)[first], (*out)[j], &merged));
         // Avoid enqueueing pairs that are not advantageous to merge.
         if (merge_cost >= 0) continue;
         pairs_to_merge.push(
@@ -350,16 +498,12 @@ Status ClusterHistograms(const HistogramParams& params,
                           std::max(version[first], version[j])});
       }
     }
-    std::vector<uint32_t> reverse_renumbering(out->size(), -1);
-    size_t num_alive = 0;
-    for (size_t i = 0; i < out->size(); i++) {
-      if (version[i] == 0) continue;
-      (*out)[num_alive++] = (*out)[i];
-      reverse_renumbering[i] = num_alive - 1;
-    }
-    out->resize(num_alive);
+
+    // Each surviving cluster still occupies its original slot. Resolve every
+    // context to its union-find root; HistogramReindex below performs the sole
+    // compaction + canonical first-use ordering pass (dead slots dropped).
     for (uint32_t& item : *histogram_symbols) {
-      item = reverse_renumbering[renumbering[item]];
+      item = FindHistogramRepresentative(&parent, item);
     }
   }
 
