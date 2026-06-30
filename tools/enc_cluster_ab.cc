@@ -537,7 +537,9 @@ float HistogramMergeCost(const Histogram& first, const Histogram& second, Histog
     std::copy(second.counts.begin() + common, second.counts.end(), merged->counts.begin() + common);
   merged->total_count = first.total_count + second.total_count;
   float cost = merged->ANSPopulationCost();
-  return cost - first.entropy - second.entropy;
+  // Match landed code's float order `cost - (a + b)` exactly (EC-FIX): the
+  // left-to-right `(cost - a) - b` rounds differently and could flip a merge.
+  return cost - (first.entropy + second.entropy);
 }
 
 enum class Clustering { kBest, kFast, kFastest };
