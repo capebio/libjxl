@@ -6,10 +6,12 @@
 
 #include <jxl/memory_manager.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 
 #include "lib/jxl/ac_strategy.h"
@@ -130,30 +132,49 @@ Status GetQuantWeights(
     size_t ROWS, size_t COLS,
     const DctQuantWeightParams::DistanceBandsArray& distance_bands,
     size_t num_bands, float* out) {
+  // Radial geometry (dx, dy, distance) is channel-independent: only the band
+  // curve differs by channel. Compute the three band curves once, then visit
+  // each (y, x) position a single time and emit all three channels, instead of
+  // recomputing dx/dy/sqrt three times (once per channel). Byte-identical: the
+  // per-element expression and the write offset are unchanged.
+  float bands[3][DctQuantWeightParams::kMaxDistanceBands];
   for (size_t c = 0; c < 3; c++) {
-    float bands[DctQuantWeightParams::kMaxDistanceBands] = {
-        distance_bands[c][0]};
-    if (bands[0] < kAlmostZero) return JXL_FAILURE("Invalid distance bands");
+    bands[c][0] = distance_bands[c][0];
+    if (bands[c][0] < kAlmostZero) return JXL_FAILURE("Invalid distance bands");
     for (size_t i = 1; i < num_bands; i++) {
-      bands[i] = bands[i - 1] * Mult(distance_bands[c][i]);
-      if (bands[i] < kAlmostZero) return JXL_FAILURE("Invalid distance bands");
-    }
-    float scale = (num_bands - 1) / (kSqrt2 + 1e-6f);
-    float rcpcol = scale / (COLS - 1);
-    float rcprow = scale / (ROWS - 1);
-    JXL_ENSURE(COLS >= Lanes(DF4()));
-    HWY_ALIGN float l0123[4] = {0, 1, 2, 3};
-    for (uint32_t y = 0; y < ROWS; y++) {
-      float dy = y * rcprow;
-      float dy2 = dy * dy;
-      for (uint32_t x = 0; x < COLS; x += Lanes(DF4())) {
-        auto dx =
-            Mul(Add(Set(DF4(), x), Load(DF4(), l0123)), Set(DF4(), rcpcol));
-        auto scaled_distance = Sqrt(MulAdd(dx, dx, Set(DF4(), dy2)));
-        auto weight = num_bands == 1 ? Set(DF4(), bands[0])
-                                     : InterpolateVec(scaled_distance, bands);
-        StoreU(weight, DF4(), out + c * COLS * ROWS + y * COLS + x);
+      bands[c][i] = bands[c][i - 1] * Mult(distance_bands[c][i]);
+      if (bands[c][i] < kAlmostZero) {
+        return JXL_FAILURE("Invalid distance bands");
       }
+    }
+  }
+  const size_t plane = COLS * ROWS;
+  // num_bands == 1: every output equals bands[c][0] (distance is unused). Fill
+  // directly, skipping all geometry and interpolation.
+  if (num_bands == 1) {
+    for (size_t c = 0; c < 3; c++) {
+      std::fill_n(out + c * plane, plane, bands[c][0]);
+    }
+    return true;
+  }
+  const float scale = (num_bands - 1) / (kSqrt2 + 1e-6f);
+  const float rcpcol = scale / (COLS - 1);
+  const float rcprow = scale / (ROWS - 1);
+  JXL_ENSURE(COLS >= Lanes(DF4()));
+  HWY_ALIGN float l0123[4] = {0, 1, 2, 3};
+  for (uint32_t y = 0; y < ROWS; y++) {
+    float dy = y * rcprow;
+    float dy2 = dy * dy;
+    for (uint32_t x = 0; x < COLS; x += Lanes(DF4())) {
+      auto dx =
+          Mul(Add(Set(DF4(), x), Load(DF4(), l0123)), Set(DF4(), rcpcol));
+      auto scaled_distance = Sqrt(MulAdd(dx, dx, Set(DF4(), dy2)));
+      StoreU(InterpolateVec(scaled_distance, bands[0]), DF4(),
+             out + 0 * plane + y * COLS + x);
+      StoreU(InterpolateVec(scaled_distance, bands[1]), DF4(),
+             out + 1 * plane + y * COLS + x);
+      StoreU(InterpolateVec(scaled_distance, bands[2]), DF4(),
+             out + 2 * plane + y * COLS + x);
     }
   }
   return true;
@@ -170,7 +191,18 @@ Status ComputeQuantTable(const QuantEncoding& encoding,
   size_t wcols = 8 * DequantMatrices::required_size_y[quant_table_idx];
   size_t num = wrows * wcols;
 
-  std::vector<float> weights(3 * num);
+  // The generated weights ARE the inverse-table values, so write them straight
+  // into their final destination (inv_table + *pos) instead of a temporary
+  // 3*num-float vector that is then copied into inv_table. table is derived in
+  // place as the reciprocal. Saves the allocation, its zero-init, and a full
+  // copy pass (up to ~768 KiB for DCT256X256). Byte-identical: every mode below
+  // fully covers [*pos, *pos + 3*num) (today any unwritten entry would be 0 and
+  // rejected by the validity check). The debug poison + assert below guard that
+  // coverage invariant for any future mode.
+  float* weights = inv_table + *pos;
+#if JXL_IS_DEBUG_BUILD
+  std::fill_n(weights, 3 * num, std::numeric_limits<float>::quiet_NaN());
+#endif
 
   switch (encoding.mode) {
     case QuantEncoding::kQuantModeLibrary: {
@@ -181,12 +213,12 @@ Status ComputeQuantTable(const QuantEncoding& encoding,
     }
     case QuantEncoding::kQuantModeID: {
       JXL_ENSURE(num == kDCTBlockSize);
-      GetQuantWeightsIdentity(encoding.idweights, weights.data());
+      GetQuantWeightsIdentity(encoding.idweights, weights);
       break;
     }
     case QuantEncoding::kQuantModeDCT2: {
       JXL_ENSURE(num == kDCTBlockSize);
-      GetQuantWeightsDCT2(encoding.dct2weights, weights.data());
+      GetQuantWeightsDCT2(encoding.dct2weights, weights);
       break;
     }
     case QuantEncoding::kQuantModeDCT4: {
@@ -230,7 +262,7 @@ Status ComputeQuantTable(const QuantEncoding& encoding,
     case QuantEncoding::kQuantModeDCT: {
       JXL_RETURN_IF_ERROR(GetQuantWeights(
           wrows, wcols, encoding.dct_params.distance_bands,
-          encoding.dct_params.num_distance_bands, weights.data()));
+          encoding.dct_params.num_distance_bands, weights));
       break;
     }
     case QuantEncoding::kQuantModeRAW: {
@@ -283,7 +315,7 @@ Status ComputeQuantTable(const QuantEncoding& encoding,
           if (bands[i] < kAlmostZero) return JXL_FAILURE("Invalid AFV bands");
         }
         size_t start = c * 64;
-        auto set_weight = [&start, &weights](size_t x, size_t y, float val) {
+        auto set_weight = [&start, weights](size_t x, size_t y, float val) {
           weights[start + y * 8 + x] = val;
         };
         weights[start] = 1;  // Not used, but causes MSAN error otherwise.
@@ -326,16 +358,22 @@ Status ComputeQuantTable(const QuantEncoding& encoding,
     }
   }
   size_t prev_pos = *pos;
+#if JXL_IS_DEBUG_BUILD
+  // All 3*num entries must have been written by the switch above; an unwritten
+  // (poisoned) entry would not be caught by the range check below (NaN compares
+  // false), so assert coverage explicitly.
+  for (size_t i = 0; i < 3 * num; i++) JXL_DASSERT(!std::isnan(weights[i]));
+#endif
   HWY_CAPPED(float, 64) d;
   for (size_t i = 0; i < num * 3; i += Lanes(d)) {
-    auto inv_val = LoadU(d, weights.data() + i);
+    auto inv_val = LoadU(d, weights + i);
     if (JXL_UNLIKELY(!AllFalse(d, Ge(inv_val, Set(d, 1.0f / kAlmostZero))) ||
                      !AllFalse(d, Lt(inv_val, Set(d, kAlmostZero))))) {
       return JXL_FAILURE("Invalid quantization table");
     }
     auto val = Div(Set(d, 1.0f), inv_val);
     StoreU(val, d, table + *pos + i);
-    StoreU(inv_val, d, inv_table + *pos + i);
+    // inv_table[*pos + i] already holds inv_val: weights aliases inv_table+*pos.
   }
   (*pos) += 3 * num;
 

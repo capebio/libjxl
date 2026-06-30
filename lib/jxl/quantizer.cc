@@ -99,14 +99,12 @@ Status Quantizer::SetQuantField(const float quant_dc, const ImageF& qf,
   }
   std::nth_element(data.begin(), data.begin() + data.size() / 2, data.end());
   const float quant_median = data[data.size() / 2];
-  std::vector<float> deviations(data.size());
-  for (size_t i = 0; i < data.size(); i++) {
-    deviations[i] = std::abs(data[i] - quant_median);
-  }
-  std::nth_element(deviations.begin(),
-                   deviations.begin() + deviations.size() / 2,
-                   deviations.end());
-  const float quant_median_absd = deviations[deviations.size() / 2];
+  // Reuse `data` in place for absolute deviations: it is no longer needed after
+  // the median, and the MAD depends only on the value multiset, not its order.
+  // Saves a second full-size allocation. Byte-identical median and MAD.
+  for (float& v : data) v = std::abs(v - quant_median);
+  std::nth_element(data.begin(), data.begin() + data.size() / 2, data.end());
+  const float quant_median_absd = data[data.size() / 2];
   ComputeGlobalScaleAndQuant(quant_dc, quant_median, quant_median_absd);
   if (raw_quant_field) {
     JXL_ENSURE(SameSize(*raw_quant_field, qf));
