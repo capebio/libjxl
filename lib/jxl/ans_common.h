@@ -148,9 +148,13 @@ struct AliasTable {
   }
 };
 
-// Computes an alias table for a given distribution.
-Status InitAliasTable(std::vector<int32_t> distribution, uint32_t log_range,
-                      size_t log_alpha_size, AliasTable::Entry* JXL_RESTRICT a);
+// Computes an alias table for a given distribution. `distribution` is taken by
+// const reference: both call sites pass an lvalue / rvalue that the previous
+// by-value parameter copied (enc) or moved (dec); the body no longer mutates
+// it, so no copy is required.
+Status InitAliasTable(const std::vector<int32_t>& distribution,
+                      uint32_t log_range, size_t log_alpha_size,
+                      AliasTable::Entry* JXL_RESTRICT a);
 
 }  // namespace jxl
 
