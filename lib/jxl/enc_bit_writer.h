@@ -12,7 +12,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -89,16 +88,22 @@ struct BitWriter {
   // referenced via byte offset (TOCs point to groups), or byte-aligned reading
   // is required for speed.
   void ZeroPadToByte() {
-    const size_t remainder_bits =
-        RoundUpBitsToByteMultiple(bits_written_) - bits_written_;
-    if (remainder_bits == 0) return;
-    Write(remainder_bits, 0);
+    // The bits between the last valid bit and the next byte boundary are
+    // already zero: Write's 64-bit store zeroes the remainder of the current
+    // byte (and the next), and every Append path preserves that invariant.
+    // So advancing over them is equivalent to Write(remainder_bits, 0) but
+    // skips the read-modify-write store.
+    const size_t remainder_bits = (-bits_written_) & (kBitsPerByte - 1);
+    bits_written_ += remainder_bits;
     JXL_DASSERT(bits_written_ % kBitsPerByte == 0);
   }
 
+  // Templated to bind the callable directly (typically a lambda) instead of
+  // type-erasing through std::function, which removes the indirect call and a
+  // possible heap allocation for the closure on every allotment scope.
+  template <typename Function>
   Status WithMaxBits(size_t max_bits, LayerType layer,
-                     AuxOut* JXL_RESTRICT aux_out,
-                     const std::function<Status()>& function,
+                     AuxOut* JXL_RESTRICT aux_out, Function&& function,
                      bool finished_histogram = false);
 
  private:
@@ -135,17 +140,34 @@ struct BitWriter {
                           size_t* JXL_RESTRICT used_bits,
                           size_t* JXL_RESTRICT unused_bits);
 
-    size_t prev_bits_written_;
+    size_t prev_bits_written_ = 0;
     const size_t max_bits_;
     size_t histogram_bits_ = 0;
     bool called_ = false;
-    Allotment* parent_;
+    Allotment* parent_ = nullptr;
   };
 
   size_t bits_written_;
   PaddedBytes storage_;
   Allotment* current_allotment_ = nullptr;
 };
+
+template <typename Function>
+Status BitWriter::WithMaxBits(size_t max_bits, LayerType layer,
+                              AuxOut* JXL_RESTRICT aux_out, Function&& function,
+                              bool finished_histogram) {
+  BitWriter::Allotment allotment(max_bits);
+  JXL_RETURN_IF_ERROR(allotment.Init(this));
+  Status result = std::forward<Function>(function)();
+  if (result && finished_histogram) {
+    result = allotment.FinishedHistogram(this);
+  }
+  // Always reclaim once Init succeeded, even if the body or FinishedHistogram
+  // failed, otherwise the allotment is left uncalled (storage not reclaimed,
+  // current_allotment_ dangling).
+  JXL_RETURN_IF_ERROR(allotment.ReclaimAndCharge(this, layer, aux_out));
+  return result;
+}
 
 }  // namespace jxl
 
