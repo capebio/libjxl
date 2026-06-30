@@ -38,8 +38,7 @@ Quantizer::Quantizer(const DequantMatrices& dequant, int quant_dc,
     : global_scale_(global_scale), quant_dc_(quant_dc), dequant_(&dequant) {
   RecomputeFromGlobalScale();
   // inv_quant_dc_ is already set by RecomputeFromGlobalScale() above using the
-  // identical expression; no need to recompute it here.
-  memcpy(zero_bias_, kZeroBiasDefault, sizeof(kZeroBiasDefault));
+  // identical expression; zero_bias_ field removed (write-only dead).
 }
 
 void Quantizer::ComputeGlobalScaleAndQuant(float quant_dc, float quant_median,
@@ -62,16 +61,18 @@ void Quantizer::ComputeGlobalScaleAndQuant(float quant_dc, float quant_median,
     new_global_scale = scaled_quant_dc;
     if (new_global_scale <= 0) new_global_scale = 1;
   }
-  global_scale_ = new_global_scale;
-  // Code below uses inv_global_scale_.
-  RecomputeFromGlobalScale();
-
-  float fval = quant_dc * inv_global_scale_ + 0.5f;
+  // The intermediate RecomputeFromGlobalScale() only needs inv_global_scale_
+  // here; every other derived field it would compute uses the still-stale
+  // quant_dc_ and is overwritten by the final recompute below. Derive the
+  // reciprocal locally (same double->float path as the member) so the result
+  // is byte-identical, then rebuild all derived state exactly once.
+  const float inv_global_scale =
+      static_cast<float>(1.0 * kGlobalScaleDenom / new_global_scale);
+  float fval = quant_dc * inv_global_scale + 0.5f;
   fval = std::min<float>(1 << 16, fval);
-  const int new_quant_dc = static_cast<int>(fval);
-  quant_dc_ = new_quant_dc;
 
-  // quant_dc_ was updated, recompute values.
+  global_scale_ = new_global_scale;
+  quant_dc_ = static_cast<int>(fval);
   RecomputeFromGlobalScale();
 }
 
@@ -89,22 +90,24 @@ void Quantizer::SetQuantFieldRect(const ImageF& qf, const Rect& rect,
 
 Status Quantizer::SetQuantField(const float quant_dc, const ImageF& qf,
                                 ImageI* JXL_RESTRICT raw_quant_field) {
-  std::vector<float> data(qf.xsize() * qf.ysize());
+  const size_t xsize = qf.xsize();
+  std::vector<float> data(xsize * qf.ysize());
   for (size_t y = 0; y < qf.ysize(); ++y) {
     const float* JXL_RESTRICT row_qf = qf.Row(y);
-    for (size_t x = 0; x < qf.xsize(); ++x) {
-      float quant = row_qf[x];
-      data[qf.xsize() * y + x] = quant;
-    }
+    memcpy(data.data() + y * xsize, row_qf, xsize * sizeof(*row_qf));
   }
-  std::nth_element(data.begin(), data.begin() + data.size() / 2, data.end());
-  const float quant_median = data[data.size() / 2];
-  // Reuse `data` in place for absolute deviations: it is no longer needed after
-  // the median, and the MAD depends only on the value multiset, not its order.
-  // Saves a second full-size allocation. Byte-identical median and MAD.
-  for (float& v : data) v = std::abs(v - quant_median);
-  std::nth_element(data.begin(), data.begin() + data.size() / 2, data.end());
-  const float quant_median_absd = data[data.size() / 2];
+  // The median selection already destroys the row order, so reuse the same
+  // scratch buffer for the absolute deviations instead of allocating a second
+  // full quant-field-sized vector. The deviation multiset is independent of the
+  // order in which `data` is left by nth_element, so both medians are exact.
+  const auto middle = data.begin() + data.size() / 2;
+  std::nth_element(data.begin(), middle, data.end());
+  const float quant_median = *middle;
+  for (float& v : data) {
+    v = std::abs(v - quant_median);
+  }
+  std::nth_element(data.begin(), middle, data.end());
+  const float quant_median_absd = *middle;
   ComputeGlobalScaleAndQuant(quant_dc, quant_median, quant_median_absd);
   if (raw_quant_field) {
     JXL_ENSURE(SameSize(*raw_quant_field, qf));

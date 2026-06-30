@@ -176,7 +176,6 @@ class Quantizer {
   // [0] is an unused sentinel. Derived in RecomputeFromGlobalScale().
   float inv_quant_ac_lut_[kQuantMax + 1];
 
-  float zero_bias_[3];
   const DequantMatrices* dequant_;
 };
 
