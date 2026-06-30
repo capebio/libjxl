@@ -7,7 +7,6 @@
 
 #include <cstdint>
 #include <cstring>  // memcpy
-#include <functional>
 #include <memory>
 #include <vector>
 
@@ -20,18 +19,16 @@
 
 namespace jxl {
 
-Status BitWriter::WithMaxBits(size_t max_bits, LayerType layer, AuxOut* aux_out,
-                              const std::function<Status()>& function,
-                              bool finished_histogram) {
-  BitWriter::Allotment allotment(max_bits);
-  JXL_RETURN_IF_ERROR(allotment.Init(this));
-  const Status result = function();
-  if (result && finished_histogram) {
-    JXL_RETURN_IF_ERROR(allotment.FinishedHistogram(this));
-  }
-  JXL_RETURN_IF_ERROR(allotment.ReclaimAndCharge(this, layer, aux_out));
-  return result;
-}
+namespace {
+// Low `kMaxBitsPerCall` (56) bits set; the high 8 bits of a 64-bit source word
+// are discarded when transferring seven bytes per Write.
+constexpr uint64_t kLow56BitsMask =
+    (uint64_t{1} << BitWriter::kMaxBitsPerCall) - 1;
+}  // namespace
+
+// WithMaxBits is defined in the header as a template (binds the callable
+// directly instead of through std::function).
+
 BitWriter::Allotment::Allotment(size_t max_bits) : max_bits_(max_bits) {}
 
 Status BitWriter::Allotment::Init(BitWriter* JXL_RESTRICT writer) {
@@ -93,11 +90,13 @@ Status BitWriter::Allotment::PrivateReclaim(BitWriter* JXL_RESTRICT writer,
   JXL_DASSERT(*used_bits <= max_bits_);
   *unused_bits = max_bits_ - *used_bits;
 
-  // Reclaim unused bytes whole bytes from writer's allotment.
+  // Reclaim unused whole bytes from writer's allotment.
   const size_t unused_bytes = *unused_bits / kBitsPerByte;  // truncate
-  JXL_ENSURE(writer->storage_.size() >= unused_bytes);
-  JXL_RETURN_IF_ERROR(
-      writer->storage_.resize(writer->storage_.size() - unused_bytes));
+  if (unused_bytes != 0) {
+    JXL_ENSURE(writer->storage_.size() >= unused_bytes);
+    JXL_RETURN_IF_ERROR(
+        writer->storage_.resize(writer->storage_.size() - unused_bytes));
+  }
   writer->current_allotment_ = parent_;
   // Ensure we don't also charge the parent for these bits.
   auto* parent = parent_;
@@ -110,12 +109,19 @@ Status BitWriter::Allotment::PrivateReclaim(BitWriter* JXL_RESTRICT writer,
 
 Status BitWriter::AppendByteAligned(const Span<const uint8_t>& span) {
   if (span.empty()) return true;
-  JXL_RETURN_IF_ERROR(storage_.resize(storage_.size() + span.size() +
-                                      1));  // extra zero padding
+  JXL_ENSURE(BitsWritten() % kBitsPerByte == 0);
+
+  // Grow only to the actual write endpoint (payload + one zero-padding byte).
+  // Using BitsWritten()/8 as the base, rather than storage_.size(), avoids
+  // leaking one stray byte of accounted size per call on repeated appends and
+  // preserves any storage reserved by an enclosing allotment.
+  size_t pos = BitsWritten() / kBitsPerByte;
+  const size_t required = pos + span.size() + 1;  // +1: extra zero padding
+  if (storage_.size() < required) {
+    JXL_RETURN_IF_ERROR(storage_.resize(required));
+  }
 
   // Concatenate by copying bytes because both source and destination are bytes.
-  JXL_ENSURE(BitsWritten() % kBitsPerByte == 0);
-  size_t pos = BitsWritten() / kBitsPerByte;
   memcpy(storage_.data() + pos, span.data(), span.size());
   pos += span.size();
   JXL_ENSURE(pos < storage_.size());
@@ -125,15 +131,58 @@ Status BitWriter::AppendByteAligned(const Span<const uint8_t>& span) {
 }
 
 Status BitWriter::AppendUnaligned(const BitWriter& other) {
-  return WithMaxBits(other.BitsWritten(), LayerType::Header, nullptr, [&] {
-    size_t full_bytes = other.BitsWritten() / kBitsPerByte;
-    size_t remaining_bits = other.BitsWritten() % kBitsPerByte;
-    for (size_t i = 0; i < full_bytes; ++i) {
-      Write(8, other.storage_[i]);
+  const size_t other_bits = other.BitsWritten();
+  if (other_bits == 0) return true;
+
+  return WithMaxBits(other_bits, LayerType::Header, nullptr, [&] {
+    size_t full_bytes = other_bits / kBitsPerByte;
+    const size_t remaining_bits = other_bits % kBitsPerByte;
+    const uint8_t* src = other.storage_.data();
+
+    if (bits_written_ % kBitsPerByte == 0) {
+      // Byte-aligned destination: bulk-copy all full bytes in one memcpy, then
+      // restore the single zero byte that Write requires after the copied run.
+      uint8_t* dst = storage_.data() + bits_written_ / kBitsPerByte;
+      memcpy(dst, src, full_bytes);
+      dst[full_bytes] = 0;  // for next Write / zero tail
+      bits_written_ += full_bytes * kBitsPerByte;
+      if (remaining_bits != 0) {
+        Write(remaining_bits,
+              src[full_bytes] & ((uint64_t{1} << remaining_bits) - 1));
+      }
+      return true;
     }
-    if (remaining_bits > 0) {
-      Write(remaining_bits,
-            other.storage_[full_bytes] & ((1u << remaining_bits) - 1));
+
+    // Unaligned destination: transfer seven source bytes per Write(56) instead
+    // of one byte per Write(8), cutting the per-byte read-modify-write store
+    // count by ~7x.
+#if JXL_BYTE_ORDER_LITTLE
+    while (full_bytes >= 7) {
+      uint64_t chunk;
+      // Loads 8 bytes; the 8th is always within PaddedBytes' padding and is
+      // masked off below.
+      memcpy(&chunk, src, sizeof(chunk));
+      Write(kMaxBitsPerCall, chunk & kLow56BitsMask);
+      src += 7;
+      full_bytes -= 7;
+    }
+#else
+    while (full_bytes >= 7) {
+      uint64_t chunk = 0;
+      for (size_t i = 0; i < 7; ++i) {
+        chunk |= static_cast<uint64_t>(src[i]) << (i * kBitsPerByte);
+      }
+      Write(kMaxBitsPerCall, chunk);
+      src += 7;
+      full_bytes -= 7;
+    }
+#endif
+    while (full_bytes != 0) {
+      Write(kBitsPerByte, *src++);
+      --full_bytes;
+    }
+    if (remaining_bits != 0) {
+      Write(remaining_bits, *src & ((uint64_t{1} << remaining_bits) - 1));
     }
     return true;
   });
@@ -146,7 +195,7 @@ Status BitWriter::AppendByteAligned(
   size_t other_bytes = 0;
   for (const auto& writer : others) {
     JXL_ENSURE(writer->BitsWritten() % kBitsPerByte == 0);
-    other_bytes += DivCeil(writer->BitsWritten(), kBitsPerByte);
+    other_bytes += writer->BitsWritten() / kBitsPerByte;  // aligned: exact
   }
   if (other_bytes == 0) {
     // No bytes to append: this happens for example when creating per-group
@@ -154,12 +203,16 @@ Status BitWriter::AppendByteAligned(
     // images with no alpha. Do nothing.
     return true;
   }
-  JXL_RETURN_IF_ERROR(storage_.resize(storage_.size() + other_bytes +
-                                      1));  // extra zero padding
+  JXL_ENSURE(BitsWritten() % kBitsPerByte == 0);
+
+  // Grow only to the actual write endpoint (see AppendByteAligned(span)).
+  size_t pos = BitsWritten() / kBitsPerByte;
+  const size_t required = pos + other_bytes + 1;  // +1: extra zero padding
+  if (storage_.size() < required) {
+    JXL_RETURN_IF_ERROR(storage_.resize(required));
+  }
 
   // Concatenate by copying bytes because both source and destination are bytes.
-  JXL_ENSURE(BitsWritten() % kBitsPerByte == 0);
-  size_t pos = DivCeil(BitsWritten(), kBitsPerByte);
   for (const auto& writer : others) {
     const Span<const uint8_t> span = writer->GetSpan();
     memcpy(storage_.data() + pos, span.data(), span.size());

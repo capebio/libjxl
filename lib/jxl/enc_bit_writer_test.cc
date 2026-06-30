@@ -70,5 +70,73 @@ TEST(BitWriterTest, RandomSequence) {
   EXPECT_EQ(num_mismatches, 0u);
 }
 
+// Exercises AppendUnaligned: the byte-aligned bulk-copy fast path (prefix == 0),
+// the unaligned 56-bit block path (prefix != 0 and back-to-back appends), the
+// partial-bit tail, and preservation of the zero-tail invariant via a trailing
+// Write after the append.
+TEST(BitWriterTest, AppendUnaligned) {
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+  // 192 bits = 24 bytes exactly (no partial byte, several 7-byte blocks);
+  // 197 bits = 24 bytes + 5 partial bits.
+  constexpr size_t kSourceBits[] = {192, 197};
+
+  for (size_t source_bits : kSourceBits) {
+    // Build a deterministic source BitWriter holding exactly `source_bits` bits.
+    auto mt = jxl::make_unique<std::mt19937>(static_cast<uint32_t>(source_bits));
+    std::uniform_int_distribution<> len_dist(1, BitWriter::kMaxBitsPerCall);
+    std::vector<BitPatch> patches;
+    BitWriter source{memory_manager};
+    auto write_source = [&]() -> Status {
+      size_t written = 0;
+      while (written < source_bits) {
+        size_t len = len_dist(*mt);
+        if (len > source_bits - written) len = source_bits - written;
+        uint64_t mask = (static_cast<uint64_t>(1) << len) - 1;
+        uint64_t bits = ((static_cast<uint64_t>((*mt)()) << 32) | (*mt)()) & mask;
+        source.Write(len, bits);
+        patches.emplace_back(BitPatch{len, bits});
+        written += len;
+      }
+      return true;
+    };
+    ASSERT_TRUE(source.WithMaxBits(source_bits, LayerType::Header, nullptr,
+                                   write_source));
+    ASSERT_EQ(source.BitsWritten(), source_bits);
+
+    // Every destination bit offset 0..7 (offset 0 hits the aligned fast path).
+    for (size_t prefix_bits = 0; prefix_bits < kBitsPerByte; ++prefix_bits) {
+      const uint64_t prefix =
+          prefix_bits == 0 ? 0u
+                           : ((static_cast<uint64_t>(1) << prefix_bits) - 1);
+      BitWriter dst{memory_manager};
+      auto build_dst = [&]() -> Status {
+        if (prefix_bits != 0) dst.Write(prefix_bits, prefix);
+        // First append: destination aligned iff prefix_bits == 0.
+        JXL_RETURN_IF_ERROR(dst.AppendUnaligned(source));
+        // Second append: destination now unaligned iff source_bits % 8 != 0,
+        // exercising the unaligned block path back-to-back (the enc_ans usage).
+        JXL_RETURN_IF_ERROR(dst.AppendUnaligned(source));
+        // Trailing write proves the fast path preserved the zero tail.
+        dst.Write(1, 1);
+        dst.ZeroPadToByte();
+        return true;
+      };
+      ASSERT_TRUE(dst.WithMaxBits(prefix_bits + 2 * source_bits + 1 + 7,
+                                  LayerType::Header, nullptr, build_dst));
+
+      BitReader reader(dst.GetSpan());
+      if (prefix_bits != 0) EXPECT_EQ(reader.ReadBits(prefix_bits), prefix);
+      for (int rep = 0; rep < 2; ++rep) {
+        for (const BitPatch& patch : patches) {
+          EXPECT_EQ(reader.ReadBits(patch.len), patch.bits);
+        }
+      }
+      EXPECT_EQ(reader.ReadBits(1), 1u);
+      EXPECT_TRUE(reader.JumpToByteBoundary());
+      EXPECT_TRUE(reader.Close());
+    }
+  }
+}
+
 }  // namespace
 }  // namespace jxl
