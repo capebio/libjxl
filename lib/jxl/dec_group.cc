@@ -237,7 +237,13 @@ void Transpose8x8InPlace(int32_t* JXL_RESTRICT block) {
   }
 }
 
-template <ACType ac_type>
+// kXCfL=false specialises the case where the X color-correlation factor is
+// exactly 0 (base_correlation_x + map == 0, the XYB default for the whole X
+// channel). Then MulAdd(0, dequant_y, dequant_x_cc) == dequant_x_cc bit-for-bit
+// (dequant_y is finite for valid streams, so 0*y is exactly 0), letting us drop
+// one vector FMA per X lane. B keeps its FMA: XYB's base B correlation is
+// nonzero by default.
+template <ACType ac_type, bool kXCfL>
 void DequantLane(Vec<D> scaled_dequant_x, Vec<D> scaled_dequant_y,
                  Vec<D> scaled_dequant_b,
                  const float* JXL_RESTRICT dequant_matrices, size_t size,
@@ -270,14 +276,20 @@ void DequantLane(Vec<D> scaled_dequant_x, Vec<D> scaled_dequant_y,
   const auto dequant_b_cc =
       Mul(AdjustQuantBias(di, 2, quantized_b_int, biases), b_mul);
 
-  const auto dequant_x = MulAdd(x_cc_mul, dequant_y, dequant_x_cc);
+  Vec<D> dequant_x;
+  if constexpr (kXCfL) {
+    dequant_x = MulAdd(x_cc_mul, dequant_y, dequant_x_cc);
+  } else {
+    (void)x_cc_mul;
+    dequant_x = dequant_x_cc;
+  }
   const auto dequant_b = MulAdd(b_cc_mul, dequant_y, dequant_b_cc);
   Store(dequant_x, d, block + k);
   Store(dequant_y, d, block + size + k);
   Store(dequant_b, d, block + 2 * size + k);
 }
 
-template <ACType ac_type>
+template <ACType ac_type, bool kXCfL>
 void DequantBlock(float inv_global_scale, int quant, float x_dm_multiplier,
                   float b_dm_multiplier, Vec<D> x_cc_mul, Vec<D> b_cc_mul,
                   AcStrategyType kind, size_t size, const Quantizer& quantizer,
@@ -295,9 +307,9 @@ void DequantBlock(float inv_global_scale, int quant, float x_dm_multiplier,
   const float* dequant_matrices = quantizer.DequantMatrix(kind, 0);
 
   for (size_t k = 0; k < covered_blocks * kDCTBlockSize; k += Lanes(d)) {
-    DequantLane<ac_type>(scaled_dequant_x, scaled_dequant_y, scaled_dequant_b,
-                         dequant_matrices, size, k, x_cc_mul, b_cc_mul, biases,
-                         qblock, block);
+    DequantLane<ac_type, kXCfL>(
+        scaled_dequant_x, scaled_dequant_y, scaled_dequant_b, dequant_matrices,
+        size, k, x_cc_mul, b_cc_mul, biases, qblock, block);
   }
   if (JXL_LIKELY(covered_blocks == 1)) {
     block[0]        = dc_row[0][sbx[0]];
@@ -314,7 +326,7 @@ void DequantBlock(float inv_global_scale, int quant, float x_dm_multiplier,
 // Specialisation of DequantBlock for the dominant covered_blocks == 1 case.
 // kDCTBlockSize (64) is a compile-time constant here, allowing the compiler to
 // unroll the SIMD loop and eliminate the LowestFrequenciesFromDC branch.
-template <ACType ac_type>
+template <ACType ac_type, bool kXCfL>
 void DequantSingleBlock(float inv_global_scale, int quant, float x_dm_multiplier,
                         float b_dm_multiplier, Vec<D> x_cc_mul, Vec<D> b_cc_mul,
                         AcStrategyType kind, const Quantizer& quantizer,
@@ -329,9 +341,9 @@ void DequantSingleBlock(float inv_global_scale, int quant, float x_dm_multiplier
   const auto scaled_dequant_b = Set(d, scaled_dequant_s * b_dm_multiplier);
   const float* dequant_matrices = quantizer.DequantMatrix(kind, 0);
   for (size_t k = 0; k < kSize; k += Lanes(d)) {
-    DequantLane<ac_type>(scaled_dequant_x, scaled_dequant_y, scaled_dequant_b,
-                         dequant_matrices, kSize, k, x_cc_mul, b_cc_mul, biases,
-                         qblock, block);
+    DequantLane<ac_type, kXCfL>(
+        scaled_dequant_x, scaled_dequant_y, scaled_dequant_b, dequant_matrices,
+        kSize, k, x_cc_mul, b_cc_mul, biases, qblock, block);
   }
   // Direct DC overwrite — no LowestFrequenciesFromDC needed for single block.
   block[0]         = dc_row[0][sbx[0]];
@@ -375,11 +387,19 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
   }
 
   ACType ac_type = dec_state->coefficients->Type();
-  auto dequant_block = ac_type == ACType::k16 ? DequantBlock<ACType::k16>
-                                              : DequantBlock<ACType::k32>;
+  // Two variants per dequant routine: the full path (X uses CfL) and the
+  // X-CfL-free path selected per color tile when the X factor is exactly 0.
+  auto dequant_block = ac_type == ACType::k16 ? DequantBlock<ACType::k16, true>
+                                              : DequantBlock<ACType::k32, true>;
+  auto dequant_block_nox =
+      ac_type == ACType::k16 ? DequantBlock<ACType::k16, false>
+                             : DequantBlock<ACType::k32, false>;
   auto dequant_single_block =
-      ac_type == ACType::k16 ? DequantSingleBlock<ACType::k16>
-                             : DequantSingleBlock<ACType::k32>;
+      ac_type == ACType::k16 ? DequantSingleBlock<ACType::k16, true>
+                             : DequantSingleBlock<ACType::k32, true>;
+  auto dequant_single_block_nox =
+      ac_type == ACType::k16 ? DequantSingleBlock<ACType::k16, false>
+                             : DequantSingleBlock<ACType::k32, false>;
   // Whether or not coefficients should be stored for future usage, and/or read
   // from past usage.
   bool accumulate = !dec_state->coefficients->IsEmpty();
@@ -454,6 +474,9 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
       auto x_cc_mul = Set(d, x_cc_mul_s);
       auto b_cc_mul = Set(d, b_cc_mul_s);
       const bool no_cfl = (x_cc_mul_s == 0.0f && b_cc_mul_s == 0.0f);
+      // Per-tile X-CfL selector: when the X factor is exactly 0, the dequant
+      // routine can drop the X MulAdd (bit-exact, see DequantLane).
+      const bool x_cfl_active = (x_cc_mul_s != 0.0f);
       // Increment bx by llf_x because those iterations would otherwise
       // immediately continue (!IsFirstBlock). Reduces mispredictions.
       for (; bx < xsize_blocks && bx < (tx + 1) * kColorTileDimInBlocks;) {
@@ -650,21 +673,22 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
                                     (!active_b || dc_only[2]);
           if (JXL_LIKELY(!skip_dequant)) {
             if (JXL_LIKELY(covered_blocks == 1)) {
-              dequant_single_block(
-                  inv_global_scale, row_quant[bx], dec_state->x_dm_multiplier,
-                  dec_state->b_dm_multiplier, x_cc_mul, b_cc_mul, acs.Strategy(),
-                  dec_state->shared->quantizer, sbx, dc_rows,
-                  dec_state->output_encoding_info.opsin_params.quant_biases,
-                  qblock, block);
+              auto fn =
+                  x_cfl_active ? dequant_single_block : dequant_single_block_nox;
+              fn(inv_global_scale, row_quant[bx], dec_state->x_dm_multiplier,
+                 dec_state->b_dm_multiplier, x_cc_mul, b_cc_mul, acs.Strategy(),
+                 dec_state->shared->quantizer, sbx, dc_rows,
+                 dec_state->output_encoding_info.opsin_params.quant_biases,
+                 qblock, block);
             } else {
-              dequant_block(
-                  inv_global_scale, row_quant[bx], dec_state->x_dm_multiplier,
-                  dec_state->b_dm_multiplier, x_cc_mul, b_cc_mul, acs.Strategy(),
-                  size, dec_state->shared->quantizer,
-                  acs.covered_blocks_y() * acs.covered_blocks_x(), sbx, dc_rows,
-                  dc_stride,
-                  dec_state->output_encoding_info.opsin_params.quant_biases,
-                  qblock, block, group_dec_cache->scratch_space);
+              auto fn = x_cfl_active ? dequant_block : dequant_block_nox;
+              fn(inv_global_scale, row_quant[bx], dec_state->x_dm_multiplier,
+                 dec_state->b_dm_multiplier, x_cc_mul, b_cc_mul, acs.Strategy(),
+                 size, dec_state->shared->quantizer,
+                 acs.covered_blocks_y() * acs.covered_blocks_x(), sbx, dc_rows,
+                 dc_stride,
+                 dec_state->output_encoding_info.opsin_params.quant_biases,
+                 qblock, block, group_dec_cache->scratch_space);
             }
           }
 
