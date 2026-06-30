@@ -161,7 +161,6 @@ class Quantizer {
   float global_scale_float_;  // reciprocal of inv_global_scale_
   float inv_quant_dc_;
 
-  float zero_bias_[3];
   const DequantMatrices* dequant_;
 };
 
