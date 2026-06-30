@@ -87,6 +87,15 @@ class Quantizer {
       mul_dc_[c] = GetDcStep(c);
       inv_mul_dc_[c] = GetInvDcStep(c);
     }
+    // Precompute the AC inverse-quant step for every valid raw quant value so
+    // inv_quant_ac() is a load instead of a per-block division. Filled in this
+    // single-threaded recompute; the parallel per-group encode only reads it,
+    // under the same "global scale frozen during encode" invariant the existing
+    // inv_global_scale_ read already relies on. Byte-identical to the division.
+    inv_quant_ac_lut_[0] = 0.0f;  // sentinel; valid quant is >= 1, never read.
+    for (int32_t q = 1; q <= kQuantMax; q++) {
+      inv_quant_ac_lut_[q] = inv_global_scale_ / q;
+    }
   }
 
   // Returns scaling factor such that Scale() * (RawDC() or RawQuantField())
@@ -111,7 +120,10 @@ class Quantizer {
   float inv_quant_dc() const { return inv_quant_dc_; }
 
   // Dequantize by multiplying with this times dequant_matrix.
-  float inv_quant_ac(int32_t quant) const { return inv_global_scale_ / quant; }
+  float inv_quant_ac(int32_t quant) const {
+    JXL_DASSERT(quant >= 1 && quant <= kQuantMax);
+    return inv_quant_ac_lut_[quant];
+  }
 
   QuantizerParams GetParams() const;
 
@@ -160,6 +172,9 @@ class Quantizer {
   float inv_global_scale_;
   float global_scale_float_;  // reciprocal of inv_global_scale_
   float inv_quant_dc_;
+  // inv_quant_ac_lut_[q] == inv_global_scale_ / q for q in [1, kQuantMax];
+  // [0] is an unused sentinel. Derived in RecomputeFromGlobalScale().
+  float inv_quant_ac_lut_[kQuantMax + 1];
 
   float zero_bias_[3];
   const DequantMatrices* dequant_;
