@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "lib/jxl/ac_strategy.h"
@@ -264,8 +265,9 @@ class QuantEncoding final : public QuantEncodingInternal {
   // RAW, note that this one is not a constexpr one.
   static QuantEncoding RAW(std::vector<int>&& qtable, int shift = 0) {
     QuantEncoding encoding(kQuantModeRAW);
-    encoding.qraw.qtable = new std::vector<int>();
-    *encoding.qraw.qtable = qtable;
+    // Move the (possibly large) table into the heap vector instead of
+    // default-constructing one and copying into it from the named rvalue.
+    encoding.qraw.qtable = new std::vector<int>(std::move(qtable));
     encoding.qraw.qtable_den = (1 << shift) * (1.f / (8 * 255));
     return encoding;
   }

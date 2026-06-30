@@ -37,8 +37,8 @@ Quantizer::Quantizer(const DequantMatrices& dequant, int quant_dc,
                      int global_scale)
     : global_scale_(global_scale), quant_dc_(quant_dc), dequant_(&dequant) {
   RecomputeFromGlobalScale();
-  inv_quant_dc_ = inv_global_scale_ / quant_dc_;
-
+  // inv_quant_dc_ is already set by RecomputeFromGlobalScale() above using the
+  // identical expression; no need to recompute it here.
   memcpy(zero_bias_, kZeroBiasDefault, sizeof(kZeroBiasDefault));
 }
 
