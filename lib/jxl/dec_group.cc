@@ -276,15 +276,13 @@ void DequantLane(Vec<D> scaled_dequant_x, Vec<D> scaled_dequant_y,
   const auto dequant_b_cc =
       Mul(AdjustQuantBias(di, 2, quantized_b_int, biases), b_mul);
 
-  Vec<D> dequant_x;
   if constexpr (kXCfL) {
-    dequant_x = MulAdd(x_cc_mul, dequant_y, dequant_x_cc);
+    Store(MulAdd(x_cc_mul, dequant_y, dequant_x_cc), d, block + k);
   } else {
     (void)x_cc_mul;
-    dequant_x = dequant_x_cc;
+    Store(dequant_x_cc, d, block + k);
   }
   const auto dequant_b = MulAdd(b_cc_mul, dequant_y, dequant_b_cc);
-  Store(dequant_x, d, block + k);
   Store(dequant_y, d, block + size + k);
   Store(dequant_b, d, block + 2 * size + k);
 }
