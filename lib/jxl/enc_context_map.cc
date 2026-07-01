@@ -77,6 +77,11 @@ Status EncodeContextMap(const std::vector<uint8_t>& context_map,
   std::vector<uint8_t> transformed_symbols = MoveToFrontTransform(context_map);
   std::vector<std::vector<Token>> tokens(1);
   std::vector<std::vector<Token>> mtf_tokens(1);
+  // Exact final sizes are known (one token per context-map entry); reserve to
+  // avoid the geometric-growth reallocations during the two fill loops. The
+  // later tokens[0].clear() + refill reuses this retained capacity.
+  tokens[0].reserve(context_map.size());
+  mtf_tokens[0].reserve(transformed_symbols.size());
   for (const uint8_t& ctx : context_map) {
     tokens[0].emplace_back(0, ctx);
   }
