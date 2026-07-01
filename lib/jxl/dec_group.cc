@@ -1246,14 +1246,13 @@ Status DecodeGroup(const FrameHeader& frame_header,
     jpeg_params_ptr = &jpeg_params;
   }
 
-  // Pre-size AC-occupancy sidecar for accumulate-mode groups.
-  if (!dec_state->coefficients->IsEmpty()) {
-    const size_t needed =
-        dec_state->shared->frame_dim.num_groups * kGroupDimInBlocks * kGroupDimInBlocks;
-    if (dec_state->ac_occupancy.size() < needed) {
-      dec_state->ac_occupancy.assign(needed, 0);
-    }
-  }
+  // The AC-occupancy sidecar is sized once per frame at AC-global setup
+  // (dec_frame.cc, alongside the retained coefficient store), which runs
+  // single-threaded before any AC group task is dispatched. DecodeGroup runs
+  // per group across the worker pool, so it must NOT (re)allocate the sidecar
+  // here — that lazy assign() raced across threads on the first accumulate
+  // group of a frame. The population site keeps a bounds guard, so an unsized
+  // sidecar (e.g. a caller that skips AC-global setup) simply skips population.
 
   // A progressive redraw has no new entropy-coded passes. Coefficients were
   // retained by earlier no-draw or partial-draw calls, so bypass the entire
