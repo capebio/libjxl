@@ -105,14 +105,20 @@ Status InitializePassesEncoder(const FrameHeader& frame_header,
   JXL_ASSIGN_OR_RETURN(
       Image3F dc, Image3F::Create(memory_manager, shared.frame_dim.xsize_blocks,
                                   shared.frame_dim.ysize_blocks));
-  const auto process_group = [&](size_t group_idx, size_t _) -> Status {
-    JXL_RETURN_IF_ERROR(
-        ComputeCoefficients(group_idx, enc_state, opsin, rect, &dc));
+  // One reusable scratch per worker thread: ComputeCoefficients otherwise does
+  // two aligned allocations per group. Sized in the init callback below.
+  std::vector<ACGroupScratch> group_scratch;
+  const auto init_scratch = [&](size_t num_threads) -> Status {
+    group_scratch.resize(num_threads);
+    return true;
+  };
+  const auto process_group = [&](size_t group_idx, size_t thread) -> Status {
+    JXL_RETURN_IF_ERROR(ComputeCoefficients(group_idx, enc_state, opsin, rect,
+                                            &dc, &group_scratch[thread]));
     return true;
   };
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, shared.frame_dim.num_groups,
-                                ThreadPool::NoInit, process_group,
-                                "Compute coeffs"));
+                                init_scratch, process_group, "Compute coeffs"));
 
   if (frame_header.flags & FrameHeader::kUseDcFrame) {
     CompressParams cparams = enc_state->cparams;
