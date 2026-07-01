@@ -47,16 +47,32 @@ void GroupBorderAssigner::Init(const FrameDimensions& frame_dim) {
 }
 
 void GroupBorderAssigner::ClearDone(size_t group_id) {
-  auto clear = [this](size_t x, size_t y, uint32_t corners) {
-    counters_[y * counters_stride_ + x / 8].fetch_and(
-        ~(corners << (4 * (x & 7u))), std::memory_order_release);
+  // Clear the two same-row corners (columns x and x+1) in one atomic RMW when
+  // they share a counter word — true for 7 of every 8 column positions. The
+  // corners occupy disjoint nibbles, so masking both bits in a single fetch_and
+  // is byte-identical to two sequential fetch_and ops, while halving the locked
+  // memory operations. On a word boundary (x & 7 == 7) fall back to two ops.
+  auto clear_pair = [this](size_t x, size_t y, uint32_t bit_left,
+                           uint32_t bit_right) {
+    const size_t idx_l = y * counters_stride_ + x / 8;
+    const size_t idx_r = y * counters_stride_ + (x + 1) / 8;
+    const size_t shift_l = 4 * (x & 7u);
+    const size_t shift_r = 4 * ((x + 1) & 7u);
+    if (JXL_LIKELY(idx_l == idx_r)) {
+      counters_[idx_l].fetch_and(
+          ~((bit_left << shift_l) | (bit_right << shift_r)),
+          std::memory_order_release);
+    } else {
+      counters_[idx_l].fetch_and(~(bit_left << shift_l),
+                                 std::memory_order_release);
+      counters_[idx_r].fetch_and(~(bit_right << shift_r),
+                                 std::memory_order_release);
+    }
   };
   size_t x = group_id % frame_dim_.xsize_groups;
   size_t y = group_id / frame_dim_.xsize_groups;
-  clear(x, y, kBottomRight);
-  clear(x + 1, y, kBottomLeft);
-  clear(x, y + 1, kTopRight);
-  clear(x + 1, y + 1, kTopLeft);
+  clear_pair(x, y, kBottomRight, kBottomLeft);
+  clear_pair(x, y + 1, kTopRight, kTopLeft);
 }
 
 // Looking at each corner between groups, we can guarantee that the four
@@ -78,23 +94,52 @@ void GroupBorderAssigner::GroupDone(size_t group_id, size_t padx, size_t pady,
                   frame_dim_.group_dim / kBlockDim, frame_dim_.xsize_blocks,
                   frame_dim_.ysize_blocks);
 
-  auto fetch_status = [this](size_t x, size_t y, uint32_t bit) {
-    // Note that the acq-rel semantics of this fetch are actually needed to
-    // ensure that the pixel data of the group is already written to memory.
-    size_t shift = 4 * (x & 7u);
-    // acq-rel matches the documented requirement above; seq_cst (the default)
-    // is stricter than needed and costs on weak-memory targets (ARM/wasm).
-    size_t status = counters_[y * counters_stride_ + x / 8].fetch_or(
-        bit << shift, std::memory_order_acq_rel);
-    status >>= shift;
-    JXL_DASSERT((bit & status) == 0);
-    return (bit | status) & 0xF;
+  // Publish two same-row corners (columns x and x+1) with a single atomic RMW
+  // when they share a counter word — true for 7 of every 8 column positions.
+  // The corners occupy disjoint nibbles, so OR-ing both bits in one fetch_or
+  // returns the same per-corner old value (hence the same status and the same
+  // "last group handles the corner" decision) as two sequential fetch_or ops,
+  // while halving the locked memory operations on this per-group hot path. The
+  // acq-rel semantics (needed so the group's pixel writes are visible before
+  // the corner is observed done) are preserved on the combined op.
+  auto fetch_status_pair = [this](size_t x, size_t y, uint32_t bit_left,
+                                  uint32_t bit_right, size_t* out_left,
+                                  size_t* out_right) {
+    const size_t idx_l = y * counters_stride_ + x / 8;
+    const size_t idx_r = y * counters_stride_ + (x + 1) / 8;
+    const size_t shift_l = 4 * (x & 7u);
+    const size_t shift_r = 4 * ((x + 1) & 7u);
+    size_t old_l;
+    size_t old_r;
+    if (JXL_LIKELY(idx_l == idx_r)) {
+      const size_t old = counters_[idx_l].fetch_or(
+          (bit_left << shift_l) | (bit_right << shift_r),
+          std::memory_order_acq_rel);
+      old_l = old;
+      old_r = old;
+    } else {
+      // Column boundary (x & 7 == 7): corners live in different words.
+      old_l = counters_[idx_l].fetch_or(bit_left << shift_l,
+                                        std::memory_order_acq_rel);
+      old_r = counters_[idx_r].fetch_or(bit_right << shift_r,
+                                        std::memory_order_acq_rel);
+    }
+    const size_t status_l = (old_l >> shift_l) & 0xF;
+    const size_t status_r = (old_r >> shift_r) & 0xF;
+    JXL_DASSERT((bit_left & status_l) == 0);
+    JXL_DASSERT((bit_right & status_r) == 0);
+    *out_left = (bit_left | status_l) & 0xF;
+    *out_right = (bit_right | status_r) & 0xF;
   };
 
-  size_t top_left_status = fetch_status(x, y, kBottomRight);
-  size_t top_right_status = fetch_status(x + 1, y, kBottomLeft);
-  size_t bottom_right_status = fetch_status(x + 1, y + 1, kTopLeft);
-  size_t bottom_left_status = fetch_status(x, y + 1, kTopRight);
+  size_t top_left_status;
+  size_t top_right_status;
+  size_t bottom_left_status;
+  size_t bottom_right_status;
+  fetch_status_pair(x, y, kBottomRight, kBottomLeft, &top_left_status,
+                    &top_right_status);
+  fetch_status_pair(x, y + 1, kTopRight, kTopLeft, &bottom_left_status,
+                    &bottom_right_status);
 
   size_t x1 = block_rect.x0() + block_rect.xsize();
   size_t y1 = block_rect.y0() + block_rect.ysize();
