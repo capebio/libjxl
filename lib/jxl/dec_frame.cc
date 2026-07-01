@@ -431,6 +431,17 @@ Status FrameDecoder::ProcessACGlobal(BitReader* br) {
     }
     if (store) {
       dec_state_->coefficients->ZeroFill();
+      // Frame-owned AC-occupancy sidecar: one byte per block of the retained
+      // coefficient store. Sized once here, single-threaded, before any AC
+      // group task is dispatched (AC groups run only after decoded_ac_global_
+      // is set, at the end of this function). Per-group DecodeGroup calls then
+      // only read/OR into it — they must never (re)allocate it concurrently,
+      // which would be a data race across the worker pool. assign() reuses the
+      // existing capacity across same-resolution frames and just re-zeroes.
+      dec_state_->ac_occupancy.assign(
+          frame_dim_.num_groups * kGroupDimInBlocks * kGroupDimInBlocks, 0);
+    } else {
+      dec_state_->ac_occupancy.clear();
     }
   }
 
