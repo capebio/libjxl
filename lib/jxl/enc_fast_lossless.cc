@@ -328,14 +328,6 @@ size_t TOCBucket(size_t group_size) {
 }
 
 #if !FJXL_STANDALONE
-size_t TOCSize(const std::vector<size_t>& group_sizes) {
-  size_t toc_bits = 0;
-  for (size_t group_size : group_sizes) {
-    toc_bits += kTOCBits[TOCBucket(group_size)];
-  }
-  return (toc_bits + 7) / 8;
-}
-
 size_t FrameHeaderSize(bool have_alpha, bool is_last) {
   size_t nbits = 28 + (have_alpha ? 4 : 0) + (is_last ? 0 : 2);
   return (nbits + 7) / 8;
@@ -368,9 +360,16 @@ size_t ComputeDcGlobalPadding(const std::vector<size_t>& group_sizes,
                               size_t ac_group_data_offset,
                               size_t min_dc_global_size, bool have_alpha,
                               bool is_last) {
-  std::vector<size_t> new_group_sizes = group_sizes;
-  new_group_sizes[0] = min_dc_global_size;
-  size_t toc_size = TOCSize(new_group_sizes);
+  // TOC size with group_sizes[0] overridden by min_dc_global_size, computed
+  // inline (sum kTOCBits[TOCBucket(...)] then round bits->bytes) to avoid
+  // copying the whole group_sizes vector just to change element 0. The
+  // rounding happens after the sum, so this must recompute bits rather than
+  // delta bytes.
+  size_t toc_bits = kTOCBits[TOCBucket(min_dc_global_size)];
+  for (size_t i = 1; i < group_sizes.size(); i++) {
+    toc_bits += kTOCBits[TOCBucket(group_sizes[i])];
+  }
+  size_t toc_size = (toc_bits + 7) / 8;
   size_t actual_offset =
       FrameHeaderSize(have_alpha, is_last) + toc_size + group_sizes[0];
   return ac_group_data_offset - actual_offset;
@@ -3111,7 +3110,11 @@ struct ChannelRowProcessor {
   void ProcessChunk(const pixel_t* row, const pixel_t* row_left,
                     const pixel_t* row_top, const pixel_t* row_topleft,
                     size_t n) {
-    alignas(64) upixel_t residuals[kChunkSize] = {};
+    // Every lane in [0, kChunkSize) is written by the predictor loop below
+    // before any consumer reads it (both the SIMD and scalar paths iterate the
+    // full kChunkSize regardless of `n`), so zero-initialization here is a dead
+    // store on the hottest path.
+    alignas(64) upixel_t residuals[kChunkSize];
     size_t prefix_size = 0;
     size_t required_prefix_size = 0;
 #ifdef FJXL_GENERIC_SIMD
@@ -3425,19 +3428,18 @@ void ProcessImageArea(const unsigned char* rgba, size_t x0, size_t y0,
   constexpr size_t kAlign = 64;
   constexpr size_t kAlignPixels = kAlign / sizeof(pixel_t);
 
-  auto align = [=](pixel_t* ptr) {
-    size_t offset = reinterpret_cast<size_t>(ptr) % kAlign;
-    if (offset) {
-      ptr += offset / sizeof(pixel_t);
-    }
-    return ptr;
-  };
-
   constexpr size_t kNumPx =
       (256 + kPadding * 2 + kAlignPixels + kAlignPixels - 1) / kAlignPixels *
       kAlignPixels;
 
-  std::vector<std::array<std::array<pixel_t, kNumPx>, 2>> group_data(nb_chans);
+  // 64-byte-aligned fixed scratch: each channel keeps two row banks. Because
+  // the base is kAlign-aligned, kNumPx is a multiple of kAlignPixels, and
+  // kPadding*sizeof(pixel_t) is a multiple of kAlign, every
+  // `&group_data[i][b][kPadding]` already lands on a 64-byte boundary — so the
+  // former (incorrect) runtime `align()` fixup is unnecessary. Stack storage
+  // also removes the per-group heap allocation. nb_chans is always <= 4.
+  alignas(kAlign)
+      std::array<std::array<std::array<pixel_t, kNumPx>, 2>, 4> group_data{};
 
   for (size_t y = 0; y < ys; y++) {
     const auto rgba_row =
@@ -3445,8 +3447,8 @@ void ProcessImageArea(const unsigned char* rgba, size_t x0, size_t y0,
     pixel_t* crow[4] = {};
     pixel_t* prow[4] = {};
     for (size_t i = 0; i < nb_chans; i++) {
-      crow[i] = align(&group_data[i][y & 1][kPadding]);
-      prow[i] = align(&group_data[i][(y - 1) & 1][kPadding]);
+      crow[i] = &group_data[i][y & 1][kPadding];
+      prow[i] = &group_data[i][(y - 1) & 1][kPadding];
     }
 
     // Pre-fill rows with YCoCg converted pixels.
@@ -3574,7 +3576,10 @@ void ProcessImageAreaPalette(const unsigned char* rgba, size_t x0, size_t y0,
                              size_t nb_chans, Processor* processors) {
   constexpr size_t kPadding = 32;
 
-  std::vector<std::array<int16_t, 256 + kPadding * 2>> group_data(2);
+  // Fixed two-row scratch on the stack (was a per-call heap allocation). Each
+  // row is 64-byte aligned so the palette fill/predict loop can use aligned
+  // access. Byte-identical to the previous zero-initialized vector.
+  alignas(64) std::array<std::array<int16_t, 256 + kPadding * 2>, 2> group_data{};
   Processor& row_encoder = processors[0];
 
   for (size_t y = 0; y < ys; y++) {
@@ -3794,12 +3799,23 @@ JxlFastLosslessFrameState* LLPrepare(JxlChunkedFrameInputSource input,
   assert(width != 0);
   assert(height != 0);
 
-  // Count colors to try palette
-  std::vector<uint32_t> palette(kHashSize);
-  std::vector<int16_t> lookup(kHashSize);
-  lookup[0] = 0;
+  // Count colors to try palette. Palette coding is only attempted for 8-bit,
+  // effort>=2, oneshot inputs; otherwise `collided` starts true, which
+  // short-circuits both the detection loop and every `lookup`/`palette`
+  // dereference (CollectSamples and WriteACSectionPalette only touch `lookup`
+  // when !collided). So for the common non-candidate case (e.g. 16-bit RAW)
+  // these two tables (384 KiB total) are never read — allocate them lazily.
+  const bool palette_candidate =
+      effort >= 2 && bitdepth.bitdepth == 8 && oneshot;
+  std::vector<uint32_t> palette;
+  std::vector<int16_t> lookup;
+  bool collided = !palette_candidate;
+  if (palette_candidate) {
+    palette.assign(kHashSize, 0);
+    lookup.assign(kHashSize, 0);
+    lookup[0] = 0;
+  }
   int pcolors = 0;
-  bool collided = effort < 2 || bitdepth.bitdepth != 8 || !oneshot;
   for (size_t y0 = 0; y0 < height && !collided; y0 += 256) {
     size_t ys = std::min<size_t>(height - y0, 256);
     for (size_t x0 = 0; x0 < width && !collided; x0 += 256) {
