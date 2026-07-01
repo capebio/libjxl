@@ -22,6 +22,19 @@
 //
 //   BM_AdjustDCT16_Old  vs  BM_AdjustDCT16_New
 //     Per-coeff DC-region branch vs loop-bound fix.
+//
+// VERDICTS (2026-07-01, native AVX2, clang 22, interleaved standalone A/B;
+// all pairs verified byte-exact):
+//   QuantizeAC static mask  new/old 0.99-1.00  -> LANDED (general path; the
+//       win is on narrow-SIMD/WASM where the wide-vector fast path is skipped).
+//   RoundtripY fused        new/old 1.24-1.26  -> REJECTED (~25% regression;
+//       fusing breaks the two tight vectorized loops / adds register pressure).
+//   Cfl four-way dispatch   both-active 1.00, skip-one 0.67, skip-both 0.22
+//       -> LANDED (byte-exact: a zero ratio leaves its channel unchanged;
+//       base_correlation_x_==0 makes the X ratio exactly zero on neutral tiles).
+//   AdjustDCT16 loop-bound  new/old 1.05-1.08  -> REJECTED (~6% regression;
+//       the removed branch is trivially predicted and the variable loop start
+//       hurts codegen). See docs/1 rejected optimizations.md.
 
 #include "benchmark/benchmark.h"
 

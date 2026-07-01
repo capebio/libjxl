@@ -107,7 +107,8 @@ void QuantizeBlockAC(const Quantizer& quantizer, const bool error_diffusion,
     for (size_t x = 0; x < xsize * kBlockDim; x += Lanes(df)) {
       auto threshold = Zero(df);
       if (xsize == 1) {
-        HWY_ALIGN uint32_t kMask[kBlockDim] = {0, 0, 0, 0, ~0u, ~0u, ~0u, ~0u};
+        HWY_ALIGN static const uint32_t kMask[kBlockDim] = {0,   0,   0,   0,
+                                                            ~0u, ~0u, ~0u, ~0u};
         const auto mask = MaskFromVec(BitCast(df, Load(du, kMask + x)));
         threshold = IfThenElse(mask, Set(df, thresholds[yfix + 1]),
                                Set(df, thresholds[yfix]));
@@ -482,10 +483,18 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
           enc_state->shared.ac_strategy.ConstRow(block_group_rect, by);
       for (size_t tx = 0; tx < DivCeil(xsize_blocks, kColorTileDimInBlocks);
            tx++) {
-        const auto x_factor =
-            Set(d, enc_state->shared.cmap.base().YtoXRatio(row_cmap[0][tx]));
-        const auto b_factor =
-            Set(d, enc_state->shared.cmap.base().YtoBRatio(row_cmap[2][tx]));
+        const float x_ratio =
+            enc_state->shared.cmap.base().YtoXRatio(row_cmap[0][tx]);
+        const float b_ratio =
+            enc_state->shared.cmap.base().YtoBRatio(row_cmap[2][tx]);
+        const auto x_factor = Set(d, x_ratio);
+        const auto b_factor = Set(d, b_ratio);
+        // A CfL ratio that is exactly zero leaves its channel unchanged:
+        // NegMulAdd(0, in_y, in) == in, so the store is a no-op. Skip that
+        // channel entirely. base_correlation_x_ is 0, so the X ratio is exactly
+        // zero on color-neutral tiles (common in RAW); dispatch skips it.
+        const uint8_t cfl_mask = static_cast<uint8_t>(
+            (x_ratio != 0.f ? 1u : 0u) | (b_ratio != 0.f ? 2u : 0u));
         for (size_t bx = tx * kColorTileDimInBlocks;
              bx < xsize_blocks && bx < (tx + 1) * kColorTileDimInBlocks; ++bx) {
           const AcStrategy acs = ac_strategy_row[bx];
@@ -513,16 +522,30 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
               acs.Strategy(), xblocks, yblocks, kDefaultQuantBias, &quant_ac,
               coeffs_in, quantized);
 
-          // Unapply color correlation
-          for (size_t k = 0; k < size; k += Lanes(d)) {
-            const auto in_x = Load(d, coeffs_in + k);
-            const auto in_y = Load(d, coeffs_in + size + k);
-            const auto in_b = Load(d, coeffs_in + 2 * size + k);
-            const auto out_x = NegMulAdd(x_factor, in_y, in_x);
-            const auto out_b = NegMulAdd(b_factor, in_y, in_b);
-            Store(out_x, d, coeffs_in + k);
-            Store(out_b, d, coeffs_in + 2 * size + k);
+          // Unapply color correlation. Dispatch on which ratios are nonzero;
+          // a zero ratio leaves that channel byte-identical, so skip it.
+          if (cfl_mask == 3) {
+            for (size_t k = 0; k < size; k += Lanes(d)) {
+              const auto in_y = Load(d, coeffs_in + size + k);
+              Store(NegMulAdd(x_factor, in_y, Load(d, coeffs_in + k)), d,
+                    coeffs_in + k);
+              Store(NegMulAdd(b_factor, in_y, Load(d, coeffs_in + 2 * size + k)),
+                    d, coeffs_in + 2 * size + k);
+            }
+          } else if (cfl_mask == 2) {
+            for (size_t k = 0; k < size; k += Lanes(d)) {
+              const auto in_y = Load(d, coeffs_in + size + k);
+              Store(NegMulAdd(b_factor, in_y, Load(d, coeffs_in + 2 * size + k)),
+                    d, coeffs_in + 2 * size + k);
+            }
+          } else if (cfl_mask == 1) {
+            for (size_t k = 0; k < size; k += Lanes(d)) {
+              const auto in_y = Load(d, coeffs_in + size + k);
+              Store(NegMulAdd(x_factor, in_y, Load(d, coeffs_in + k)), d,
+                    coeffs_in + k);
+            }
           }
+          // cfl_mask == 0: both ratios zero, nothing to unapply.
 
           // Quantize X and B channels and set DC.
           for (size_t c : {0, 2}) {
