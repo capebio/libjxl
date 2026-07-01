@@ -74,6 +74,11 @@ Status PatchDictionaryEncoder::Encode(const PatchDictionary& pdic,
   add_num(kNumRefPatchContext, num_ref_patch);
   size_t blend_pos = 0;
   size_t blending_stride = pdic.blendings_stride_;
+  // Lower-bound reserve to avoid repeated token-vector reallocation while
+  // serializing patch metadata (alpha/clamp fields may add a few more). Does
+  // not change emitted tokens.
+  tokens[0].reserve(1 + 6 * num_ref_patch +
+                    pdic.positions_.size() * (2 + blending_stride));
   // blending_stride == num_ec + 1; num_ec > 1 =>
   bool choose_alpha = (blending_stride > 1 + 1);
   for (size_t i = 0; i < pdic.positions_.size();) {
@@ -129,50 +134,50 @@ Status PatchDictionaryEncoder::Encode(const PatchDictionary& pdic,
 // static
 Status PatchDictionaryEncoder::SubtractFrom(const PatchDictionary& pdic,
                                             Image3F* opsin) {
-  // TODO(veluca): this can likely be optimized knowing it runs on full images.
+  // Runs on full images. The blend mode is constant per patch, so hoist the
+  // dispatch out of the pixel loop and apply each plane contiguously — the
+  // inner kAdd loop then vectorizes and the reference rows are only touched on
+  // the kAdd path. Byte-exact: every output element is still computed by the
+  // same op exactly once; only the loop order changes (no accumulation across
+  // elements, so no FP reassociation).
   for (size_t y = 0; y < opsin->ysize(); y++) {
     float* JXL_RESTRICT rows[3] = {
         opsin->PlaneRow(0, y),
         opsin->PlaneRow(1, y),
         opsin->PlaneRow(2, y),
     };
-    size_t blending_stride = pdic.blendings_stride_;
+    const size_t blending_stride = pdic.blendings_stride_;
     for (size_t pos_idx : pdic.GetPatchesForRow(y)) {
       const size_t blending_idx = pos_idx * blending_stride;
       const PatchPosition& pos = pdic.positions_[pos_idx];
       const PatchReferencePosition& ref_pos =
           pdic.ref_positions_[pos.ref_pos_idx];
       const PatchBlendMode mode = pdic.blendings_[blending_idx].mode;
-      size_t by = pos.y;
-      size_t bx = pos.x;
-      size_t xsize = ref_pos.xsize;
+      const size_t by = pos.y;
+      const size_t bx = pos.x;
+      const size_t xsize = ref_pos.xsize;
       JXL_ENSURE(y >= by);
       JXL_ENSURE(y < by + ref_pos.ysize);
-      size_t iy = y - by;
-      size_t ref = ref_pos.ref;
-      const float* JXL_RESTRICT ref_rows[3] = {
-          pdic.reference_frames_->at(ref).frame->color()->ConstPlaneRow(
-              0, ref_pos.y0 + iy) +
-              ref_pos.x0,
-          pdic.reference_frames_->at(ref).frame->color()->ConstPlaneRow(
-              1, ref_pos.y0 + iy) +
-              ref_pos.x0,
-          pdic.reference_frames_->at(ref).frame->color()->ConstPlaneRow(
-              2, ref_pos.y0 + iy) +
-              ref_pos.x0,
-      };
-      for (size_t ix = 0; ix < xsize; ix++) {
+      if (mode == PatchBlendMode::kNone) continue;
+      if (mode == PatchBlendMode::kReplace) {
         for (size_t c = 0; c < 3; c++) {
-          if (mode == PatchBlendMode::kAdd) {
-            rows[c][bx + ix] -= ref_rows[c][ix];
-          } else if (mode == PatchBlendMode::kReplace) {
-            rows[c][bx + ix] = 0;
-          } else if (mode == PatchBlendMode::kNone) {
-            // Nothing to do.
-          } else {
-            return JXL_UNREACHABLE("blending mode %u not yet implemented",
-                                   static_cast<uint32_t>(mode));
-          }
+          std::fill_n(rows[c] + bx, xsize, 0.0f);
+        }
+        continue;
+      }
+      if (mode != PatchBlendMode::kAdd) {
+        return JXL_UNREACHABLE("blending mode %u not yet implemented",
+                               static_cast<uint32_t>(mode));
+      }
+      const size_t iy = y - by;
+      const Image3F& ref_color =
+          *pdic.reference_frames_->at(ref_pos.ref).frame->color();
+      for (size_t c = 0; c < 3; c++) {
+        float* JXL_RESTRICT dst = rows[c] + bx;
+        const float* JXL_RESTRICT src =
+            ref_color.ConstPlaneRow(c, ref_pos.y0 + iy) + ref_pos.x0;
+        for (size_t ix = 0; ix < xsize; ix++) {
+          dst[ix] -= src[ix];
         }
       }
     }
