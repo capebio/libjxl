@@ -405,8 +405,8 @@ void QuantizeRoundtripYBlockAC(PassesEncoderState* enc_state, const size_t size,
 }
 
 Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
-                           const Image3F& opsin, const Rect& rect,
-                           Image3F* dc) {
+                           const Image3F& opsin, const Rect& rect, Image3F* dc,
+                           ACGroupScratch* scratch) {
   JxlMemoryManager* memory_manager = opsin.memory_manager();
   const Rect block_group_rect =
       enc_state->shared.frame_dim.BlockGroupRect(group_idx);
@@ -432,13 +432,23 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
       3 * (MaxVectorSize() / sizeof(float)) * AcStrategy::kMaxBlockDim;
 
   // TODO(veluca): consider strategies to reduce this memory.
+  // Both sizes are transform-independent constants, so the worker's scratch is
+  // allocated once and reused for every group (and frame) instead of two
+  // aligned allocations per group. Byte-identical: buffers are fully written
+  // before being read on each group.
   size_t mem_bytes = 3 * AcStrategy::kMaxCoeffArea * sizeof(int32_t);
-  JXL_ASSIGN_OR_RETURN(auto mem,
-                       AlignedMemory::Create(memory_manager, mem_bytes));
   size_t fmem_bytes =
       (5 * AcStrategy::kMaxCoeffArea + dct_scratch_size) * sizeof(float);
-  JXL_ASSIGN_OR_RETURN(auto fmem,
-                       AlignedMemory::Create(memory_manager, fmem_bytes));
+  if (!scratch->imem) {
+    JXL_ASSIGN_OR_RETURN(scratch->imem,
+                         AlignedMemory::Create(memory_manager, mem_bytes));
+  }
+  if (!scratch->fmem) {
+    JXL_ASSIGN_OR_RETURN(scratch->fmem,
+                         AlignedMemory::Create(memory_manager, fmem_bytes));
+  }
+  AlignedMemory& mem = scratch->imem;
+  AlignedMemory& fmem = scratch->fmem;
   float* JXL_RESTRICT scratch_space =
       fmem.address<float>() + 3 * AcStrategy::kMaxCoeffArea;
   {
@@ -583,10 +593,10 @@ HWY_AFTER_NAMESPACE();
 namespace jxl {
 HWY_EXPORT(ComputeCoefficients);
 Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
-                           const Image3F& opsin, const Rect& rect,
-                           Image3F* dc) {
+                           const Image3F& opsin, const Rect& rect, Image3F* dc,
+                           ACGroupScratch* scratch) {
   return HWY_DYNAMIC_DISPATCH(ComputeCoefficients)(group_idx, enc_state, opsin,
-                                                   rect, dc);
+                                                   rect, dc, scratch);
 }
 
 Status EncodeGroupTokenizedCoefficients(size_t group_idx, size_t pass_idx,
