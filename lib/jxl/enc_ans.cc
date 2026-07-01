@@ -855,6 +855,13 @@ Status EntropyEncodingData::ChooseUintConfigs(
       AlignedMemory tmp,
       AlignedMemory::Create(memory_manager, (max_histo_volume + max_vec_size) *
                                                 sizeof(uint32_t)));
+  // Reused across all (histogram x config) trials below. Clear() empties the
+  // counts buffer but keeps its capacity, so each trial reuses one allocation
+  // instead of constructing and destroying a fresh Histogram per config. After
+  // Clear() + EnsureCapacity() the counts are zeroed exactly as for a freshly
+  // constructed Histogram, and Condition() recomputes total_count from scratch,
+  // so ANSPopulationCost and the resulting config choice are identical.
+  Histogram cfg_histo;
   for (size_t h = 0; h < num_histo; h++) {
     float best_cost = std::numeric_limits<float>::max();
     for (HybridUintConfig cfg : configs) {
@@ -869,17 +876,17 @@ Status EntropyEncodingData::ChooseUintConfigs(
         capacity = tok + 1;
       }
 
-      Histogram histo;
-      histo.EnsureCapacity(capacity);
+      cfg_histo.Clear();
+      cfg_histo.EnsureCapacity(capacity);
       size_t len = histo_volume[h];
       uint32_t* data = transposed.data() + histo_offset[h];
       size_t extra_bits = EstimateTokenCost(data, len, cfg, tmp);
       uint32_t* tmp_tokens = tmp.address<uint32_t>();
       for (size_t i = 0; i < len; ++i) {
-        histo.FastAdd(tmp_tokens[i]);
+        cfg_histo.FastAdd(tmp_tokens[i]);
       }
-      histo.Condition();
-      JXL_ASSIGN_OR_RETURN(float cost, histo.ANSPopulationCost());
+      cfg_histo.Condition();
+      JXL_ASSIGN_OR_RETURN(float cost, cfg_histo.ANSPopulationCost());
       cost += extra_bits;
       // Add signaling cost of the hybriduintconfig itself.
       cost += CeilLog2Nonzero(cfg.split_exponent + 1);
@@ -887,7 +894,7 @@ Status EntropyEncodingData::ChooseUintConfigs(
       if (cost < best_cost) {
         uint_config[h] = cfg;
         best_cost = cost;
-        clustered_histograms[h].swap(histo);
+        clustered_histograms[h].swap(cfg_histo);
       }
     }
   }
