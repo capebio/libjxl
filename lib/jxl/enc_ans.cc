@@ -861,8 +861,7 @@ Status EntropyEncodingData::ChooseUintConfigs(
       uint32_t max_v = max_value_per_histo[h];
       size_t capacity;
       {
-        uint32_t tok, nbits, bits;
-        cfg.Encode(max_v, &tok, &nbits, &bits);
+        uint32_t tok = cfg.EncodeToken(max_v);
         tok |= cfg.LsbMask();
         if (tok >= max_alpha || (lz77.enabled && tok >= lz77.min_symbol)) {
           continue;  // Not valid config for this context
@@ -900,8 +899,7 @@ Status EntropyEncodingData::ChooseUintConfigs(
     size_t len = histo_volume[num_histo + h];
     if (len == 0) continue;  // E.g. when lz77 not enabled
     size_t max_histo_tok = max_value_per_histo[num_histo + h];
-    uint32_t tok, nbits, bits;
-    lz77.length_uint_config.Encode(max_histo_tok, &tok, &nbits, &bits);
+    uint32_t tok = lz77.length_uint_config.EncodeToken(max_histo_tok);
     tok |= lz77.length_uint_config.LsbMask();
     tok += lz77.min_symbol;
     histo.EnsureCapacity(tok + 1);
@@ -1156,23 +1154,23 @@ StatusOr<size_t> BuildAndEncodeHistograms(
       total_tokens += stream.size();
       if (codes->lz77.enabled) {
         for (const auto& token : stream) {
-          uint32_t tok, nbits, bits;
-          (token.is_lz77_length ? codes->lz77.length_uint_config : uint_config)
-              .Encode(token.value, &tok, &nbits, &bits);
+          // Histogram build consumes only the token; use the token-only
+          // encode (byte-exact with Encode's `*token`).
+          uint32_t tok =
+              (token.is_lz77_length ? codes->lz77.length_uint_config
+                                    : uint_config)
+                  .EncodeToken(token.value);
           tok += token.is_lz77_length ? codes->lz77.min_symbol : 0;
           JXL_DASSERT(token.context < num_contexts);
           builder[token.context].Add(tok);
         }
       } else if (num_contexts == 1) {
         for (const auto& token : stream) {
-          uint32_t tok, nbits, bits;
-          uint_config.Encode(token.value, &tok, &nbits, &bits);
-          builder[0].Add(tok);
+          builder[0].Add(uint_config.EncodeToken(token.value));
         }
       } else {
         for (const auto& token : stream) {
-          uint32_t tok, nbits, bits;
-          uint_config.Encode(token.value, &tok, &nbits, &bits);
+          uint32_t tok = uint_config.EncodeToken(token.value);
           JXL_DASSERT(token.context < num_contexts);
           builder[token.context].Add(tok);
         }
@@ -1280,8 +1278,15 @@ size_t WriteTokens(const std::vector<Token>& tokens,
     }
     return num_extra_bits;
   }
+  // Each flushed chunk holds <= kMaxBitsPerCall (56) payload bits, leaving the
+  // top 8 bits of the 64-bit word free to carry the chunk's bit-length. Packing
+  // length + payload into a single vector drops the parallel out_nbits
+  // allocation and its cache stream. Byte-exact: identical bits, identical
+  // (reversed) emission order.
+  static_assert(BitWriter::kMaxBitsPerCall <= 56,
+                "chunk bit-length must fit in the top 8 bits of the word");
+  constexpr uint64_t kChunkPayloadMask = (uint64_t{1} << 56) - 1;
   std::vector<uint64_t> out;
-  std::vector<uint8_t> out_nbits;
   // A flush only happens once the 56-bit accumulator fills, so the number of
   // entries is far below one-per-token (a single token contributes <= 16 ANS
   // bits + <= 31 extra bits). Reserve a realistic fraction instead of
@@ -1289,7 +1294,6 @@ size_t WriteTokens(const std::vector<Token>& tokens,
   // correctly in the rare high-entropy case.
   const size_t out_reserve = tokens.size() / 3 + 64;
   out.reserve(out_reserve);
-  out_nbits.reserve(out_reserve);
   uint64_t allbits = 0;
   size_t numallbits = 0;
   // Writes in *reversed* order.
@@ -1297,8 +1301,7 @@ size_t WriteTokens(const std::vector<Token>& tokens,
     if (JXL_UNLIKELY(nbits)) {
       JXL_DASSERT(bits >> nbits == 0);
       if (JXL_UNLIKELY(numallbits + nbits > BitWriter::kMaxBitsPerCall)) {
-        out.push_back(allbits);
-        out_nbits.push_back(numallbits);
+        out.push_back(allbits | (static_cast<uint64_t>(numallbits) << 56));
         numallbits = allbits = 0;
       }
       allbits <<= nbits;
@@ -1308,8 +1311,9 @@ size_t WriteTokens(const std::vector<Token>& tokens,
   };
   const int end = tokens.size();
   ANSCoder ans;
-  if (codes.lz77.enabled || codes.context_map.size() > 1) {
-    // Hoist loop-invariant base pointers out of the hot reverse loop.
+  if (codes.lz77.enabled) {
+    // LZ77 path: length tokens use a separate uint config and a symbol offset,
+    // so the per-token is_lz77 select/offset is genuinely needed here.
     const uint8_t* JXL_RESTRICT cmap = codes.context_map.data() + context_offset;
     const HybridUintConfig* JXL_RESTRICT ucfg = codes.uint_config.data();
     for (int i = end - 1; i >= 0; --i) {
@@ -1319,6 +1323,26 @@ size_t WriteTokens(const std::vector<Token>& tokens,
       (token.is_lz77_length ? codes.lz77.length_uint_config : ucfg[histo])
           .Encode(token.value, &tok, &nbits, &bits);
       tok += token.is_lz77_length ? codes.lz77.min_symbol : 0;
+      const ANSEncSymbolInfo& info = codes.encoding_info[histo].info[tok];
+      JXL_DASSERT(info.freq_ > 0);
+      // Extra bits first as this is reversed.
+      addbits(bits, nbits);
+      num_extra_bits += nbits;
+      uint8_t ans_nbits = 0;
+      uint32_t ans_bits = ans.PutSymbol(info, &ans_nbits);
+      addbits(ans_bits, ans_nbits);
+    }
+  } else if (codes.context_map.size() > 1) {
+    // No LZ77, multiple clustered histograms: with LZ77 disabled every token is
+    // a literal (is_lz77_length is always false), so the per-token is_lz77
+    // config-select and symbol-offset add are dropped. Byte-exact.
+    const uint8_t* JXL_RESTRICT cmap = codes.context_map.data() + context_offset;
+    const HybridUintConfig* JXL_RESTRICT ucfg = codes.uint_config.data();
+    for (int i = end - 1; i >= 0; --i) {
+      const Token token = tokens[i];
+      const uint8_t histo = cmap[token.context];
+      uint32_t tok, nbits, bits;
+      ucfg[histo].Encode(token.value, &tok, &nbits, &bits);
       const ANSEncSymbolInfo& info = codes.encoding_info[histo].info[tok];
       JXL_DASSERT(info.freq_ > 0);
       // Extra bits first as this is reversed.
@@ -1350,7 +1374,8 @@ size_t WriteTokens(const std::vector<Token>& tokens,
   writer->Write(32, state);
   writer->Write(numallbits, allbits);
   for (int i = out.size(); i > 0; --i) {
-    writer->Write(out_nbits[i - 1], out[i - 1]);
+    const uint64_t chunk = out[i - 1];
+    writer->Write(chunk >> 56, chunk & kChunkPayloadMask);
   }
   return num_extra_bits;
 }

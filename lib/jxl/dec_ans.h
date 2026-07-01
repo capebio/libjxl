@@ -79,7 +79,9 @@ struct HybridUintConfig {
       *bits = 0;
     } else {
       uint32_t n = FloorLog2Nonzero(value);
-      uint32_t m = value - (1 << n);
+      // `value` may be up to 2^32-1, so `n` can reach 31; `1 << 31` on a signed
+      // `int` is UB. Use an unsigned literal — same bit pattern, no UB.
+      uint32_t m = value - (uint32_t{1} << n);
       *token = split_token +
                ((n - split_exponent) << (msb_in_token + lsb_in_token)) +
                ((m >> (n - msb_in_token)) << lsb_in_token) +
@@ -87,6 +89,20 @@ struct HybridUintConfig {
       *nbits = n - msb_in_token - lsb_in_token;
       *bits = (value >> lsb_in_token) & ((1UL << *nbits) - 1);
     }
+  }
+
+  // Token-only counterpart of Encode: returns the entropy-coded token and
+  // skips deriving the extra-bit count/payload. Byte-exact with Encode's
+  // `*token` output; used by the encoder's histogram-building and capacity
+  // passes, which consume only the token. Keep in lockstep with Encode.
+  JXL_INLINE uint32_t EncodeToken(uint32_t value) const {
+    if (value < split_token) return value;
+    uint32_t n = FloorLog2Nonzero(value);
+    uint32_t m = value - (uint32_t{1} << n);
+    return split_token +
+           ((n - split_exponent) << (msb_in_token + lsb_in_token)) +
+           ((m >> (n - msb_in_token)) << lsb_in_token) +
+           (m & ((1 << lsb_in_token) - 1));
   }
 
   JXL_INLINE uint32_t LsbMask() const { return (1 << lsb_in_token) - 1; }
