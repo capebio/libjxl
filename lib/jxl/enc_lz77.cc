@@ -10,7 +10,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <unordered_map>
 #include <vector>
 
 #include "lib/jxl/ans_params.h"
@@ -144,9 +143,7 @@ std::vector<std::vector<Token>> ApplyLZ77_RLE(
                             ? CeilLog2Nonzero(lz77_len + 1) + 1
                             : 0;
       if (num_to_copy < lz77.min_length || cost <= lz77_cost) {
-        for (size_t j = 0; j < num_to_copy; j++) {
-          out.push_back(in[i + j]);
-        }
+        out.insert(out.end(), in.begin() + i, in.begin() + i + num_to_copy);
         i += num_to_copy - 1;
         continue;
       }
@@ -192,9 +189,45 @@ struct HashChain {
   size_t min_length_;
   size_t max_length_;
 
-  // Map of special distance codes.
-  std::unordered_map<int, int> special_dist_table_;
+  // Map of special distance codes. Fixed-size open-addressed table instead of
+  // std::unordered_map: there are only kNumSpecialDistances (120) entries and
+  // this is probed inside the innermost match loop, so a cache-resident array
+  // beats node-chasing. Special distances are always >= 1 (SpecialDistance
+  // clamps), so key 0 is a free empty-slot sentinel.
+  static constexpr size_t kSpecialDistSlots = 256;  // pow2 > 2*kNum, load < 0.5
+  static constexpr uint32_t kSpecialDistMask = kSpecialDistSlots - 1;
+  int sd_keys_[kSpecialDistSlots] = {};    // 0 == empty
+  int16_t sd_codes_[kSpecialDistSlots] = {};
   size_t num_special_distances_ = 0;
+
+  static uint32_t SpecialHash(int key) {
+    return (static_cast<uint32_t>(key) * 2654435761u) >> 24;  // top 8 bits
+  }
+  // Insert with overwrite-on-existing-key so that, when called with descending
+  // codes, the smallest code wins for a duplicate distance (matches the old
+  // count-down unordered_map fill).
+  void SpecialInsert(int key, int code) {
+    uint32_t s = SpecialHash(key);
+    for (;;) {
+      if (sd_keys_[s] == 0 || sd_keys_[s] == key) {
+        sd_keys_[s] = key;
+        sd_codes_[s] = static_cast<int16_t>(code);
+        return;
+      }
+      s = (s + 1) & kSpecialDistMask;
+    }
+  }
+  // Returns the special-distance code for `key`, or -1 if absent (empty table
+  // included: an all-zero key array short-circuits on the first probe).
+  int SpecialLookup(int key) const {
+    uint32_t s = SpecialHash(key);
+    for (;;) {
+      int k = sd_keys_[s];
+      if (k == key) return sd_codes_[s];
+      if (k == 0) return -1;
+      s = (s + 1) & kSpecialDistMask;
+    }
+  }
 
   uint32_t maxchainlength = 256;  // window_size_ to allow all
 
@@ -228,7 +261,7 @@ struct HashChain {
       // Count down, so if due to small distance multiplier multiple distances
       // map to the same code, the smallest code will be used in the end.
       for (int i = kNumSpecialDistances - 1; i >= 0; --i) {
-        special_dist_table_[SpecialDistance(i, distance_multiplier)] = i;
+        SpecialInsert(SpecialDistance(i, distance_multiplier), i);
       }
       num_special_distances_ = kNumSpecialDistances;
     }
@@ -265,8 +298,11 @@ struct HashChain {
     return num;
   }
 
-  void Update(size_t pos) {
-    uint32_t hashval = GetHash(pos);
+  void Update(size_t pos) { UpdateHashed(pos, GetHash(pos)); }
+
+  // Same as Update(pos) but takes a precomputed GetHash(pos) so callers that
+  // also need the hash for FindMatch(es) do not recompute it.
+  void UpdateHashed(size_t pos, uint32_t hashval) {
     uint32_t wpos = pos & window_mask_;
 
     val[wpos] = static_cast<int>(hashval);
@@ -288,9 +324,8 @@ struct HashChain {
   }
 
   template <typename CB>
-  void FindMatches(size_t pos, int max_dist, const CB& found_match) const {
+  void FindMatches(size_t pos, uint32_t hashval, const CB& found_match) const {
     uint32_t wpos = pos & window_mask_;
-    uint32_t hashval = GetHash(pos);
     uint32_t hashpos = chain[wpos];
 
     int prev_dist = 0;
@@ -321,10 +356,11 @@ struct HashChain {
         // best length, because it is possible for a slightly cheaper distance
         // symbol to occur.
         if (len >= min_length_ && len + 2 >= best_len) {
-          auto it = special_dist_table_.find(dist);
-          int dist_symbol = (it == special_dist_table_.end())
-                                ? (num_special_distances_ + dist - 1)
-                                : it->second;
+          int special = SpecialLookup(dist);
+          int dist_symbol =
+              (special < 0)
+                  ? static_cast<int>(num_special_distances_ + dist - 1)
+                  : special;
           found_match(len, dist_symbol);
           if (len > best_len) best_len = len;
         }
@@ -347,11 +383,11 @@ struct HashChain {
       }
     }
   }
-  void FindMatch(size_t pos, int max_dist, size_t* result_dist_symbol,
+  void FindMatch(size_t pos, uint32_t hashval, size_t* result_dist_symbol,
                  size_t* result_len) const {
     *result_dist_symbol = 0;
     *result_len = 1;
-    FindMatches(pos, max_dist, [&](size_t len, size_t dist_symbol) {
+    FindMatches(pos, hashval, [&](size_t len, size_t dist_symbol) {
       if (len > *result_len ||
           (len == *result_len && *result_dist_symbol > dist_symbol)) {
         *result_len = len;
@@ -483,16 +519,18 @@ std::vector<std::vector<Token>> ApplyLZ77_LZ77(
     bool already_updated = false;
     for (size_t i = 0; i < in.size(); i++) {
       out.push_back(in[i]);
-      if (!already_updated) chain.Update(i);
+      uint32_t hashval = chain.GetHash(i);
+      if (!already_updated) chain.UpdateHashed(i, hashval);
       already_updated = false;
-      chain.FindMatch(i, max_distance, &dist_symbol, &len);
+      chain.FindMatch(i, hashval, &dist_symbol, &len);
       if (len >= min_length) {
         if (len < max_lazy_match_len && i + 1 < in.size()) {
           // Try length at next symbol lazy matching
-          chain.Update(i + 1);
+          uint32_t hashval2 = chain.GetHash(i + 1);
+          chain.UpdateHashed(i + 1, hashval2);
           already_updated = true;
           size_t len2, dist_symbol2;
-          chain.FindMatch(i + 1, max_distance, &dist_symbol2, &len2);
+          chain.FindMatch(i + 1, hashval2, &dist_symbol2, &len2);
           if (len2 > len) {
             // Use the lazy match. Add literal, and use the next length starting
             // from the next byte.
@@ -519,9 +557,7 @@ std::vector<std::vector<Token>> ApplyLZ77_LZ77(
         } else {
           // LZ77 match ignored, and symbol already pushed. Push all other
           // symbols and skip.
-          for (size_t j = 1; j < len; j++) {
-            out.push_back(in[i + j]);
-          }
+          out.insert(out.end(), in.begin() + i + 1, in.begin() + i + len);
         }
 
         if (already_updated) {
@@ -553,22 +589,17 @@ std::vector<std::vector<Token>> ApplyLZ77_Optimal(
   if (tokens_for_cost_estimate.empty()) return {};
   SymbolCostEstimator sce(num_contexts + 1, params.force_huffman,
                           tokens_for_cost_estimate, lz77);
+  // The greedy token stream was only needed to build the cost model; release it
+  // before allocating the DP state below to reduce peak memory.
+  std::vector<std::vector<Token>>().swap(tokens_for_cost_estimate);
   std::vector<std::vector<Token>> tokens_lz77(tokens.size());
   HybridUintConfig uint_config;
-  std::vector<float> sym_cost;
   std::vector<uint32_t> dist_symbols;
   for (size_t stream = 0; stream < tokens.size(); stream++) {
     size_t distance_multiplier =
         params.image_widths.size() > stream ? params.image_widths[stream] : 0;
     const auto& in = tokens[stream];
     auto& out = tokens_lz77[stream];
-    // Cumulative sum of bit costs.
-    sym_cost.resize(in.size() + 1);
-    for (size_t i = 0; i < in.size(); i++) {
-      uint32_t tok, nbits, unused_bits;
-      uint_config.Encode(in[i].value, &tok, &nbits, &unused_bits);
-      sym_cost[i + 1] = sce.Bits(in[i].context, tok) + nbits + sym_cost[i];
-    }
 
     out.reserve(in.size());
     size_t max_distance = in.size();
@@ -588,7 +619,9 @@ std::vector<std::vector<Token>> ApplyLZ77_Optimal(
     struct MatchInfo {
       uint32_t len;
       uint32_t dist_symbol;
-      uint32_t ctx;
+      // The context of a step is recoverable from the source at reconstruction
+      // time (in[pos - len].context), so it is not stored here (saves 4 bytes
+      // per position in the DP table).
       float total_cost = std::numeric_limits<float>::max();
     };
     // Total cost to encode the first N symbols.
@@ -597,14 +630,24 @@ std::vector<std::vector<Token>> ApplyLZ77_Optimal(
 
     size_t rle_length = 0;
     size_t skip_lz77 = 0;
+    // Running cumulative literal bit cost. next_sym_cost/running_sym_cost mirror
+    // the former sym_cost[i+1]/sym_cost[i] with the same operand values and
+    // op order, so lit_cost is byte-identical to the old prefix-sum array while
+    // avoiding the O(n) array and its separate pass.
+    float running_sym_cost = 0.0f;
     for (size_t i = 0; i < in.size(); i++) {
-      chain.Update(i);
+      uint32_t hashval = chain.GetHash(i);
+      chain.UpdateHashed(i, hashval);
+      uint32_t tok, nbits, unused_bits;
+      uint_config.Encode(in[i].value, &tok, &nbits, &unused_bits);
+      float next_sym_cost =
+          sce.Bits(in[i].context, tok) + nbits + running_sym_cost;
       float lit_cost =
-          prefix_costs[i].total_cost + sym_cost[i + 1] - sym_cost[i];
+          prefix_costs[i].total_cost + next_sym_cost - running_sym_cost;
+      running_sym_cost = next_sym_cost;
       if (prefix_costs[i + 1].total_cost > lit_cost) {
         prefix_costs[i + 1].dist_symbol = 0;
         prefix_costs[i + 1].len = 1;
-        prefix_costs[i + 1].ctx = in[i].context;
         prefix_costs[i + 1].total_cost = lit_cost;
       }
       if (skip_lz77 > 0) {
@@ -612,7 +655,7 @@ std::vector<std::vector<Token>> ApplyLZ77_Optimal(
         continue;
       }
       dist_symbols.clear();
-      chain.FindMatches(i, max_distance,
+      chain.FindMatches(i, hashval,
                         [&dist_symbols](size_t len, size_t dist_symbol) {
                           if (dist_symbols.size() <= len) {
                             dist_symbols.resize(len + 1, dist_symbol);
@@ -639,7 +682,6 @@ std::vector<std::vector<Token>> ApplyLZ77_Optimal(
         if (prefix_costs[i + j].total_cost > cost) {
           prefix_costs[i + j].len = j;
           prefix_costs[i + j].dist_symbol = dist_symbols[j] + 1;
-          prefix_costs[i + j].ctx = in[i].context;
           prefix_costs[i + j].total_cost = cost;
         }
       }
@@ -670,7 +712,11 @@ std::vector<std::vector<Token>> ApplyLZ77_Optimal(
           is_lz77_length
               ? (prefix_costs[pos].len - static_cast<uint32_t>(min_length))
               : in[pos - 1].value;
-      out.emplace_back(prefix_costs[pos].ctx, val);
+      // Context recovered from the source (see MatchInfo): the step covering
+      // [pos-len, pos) begins at in[pos-len], whose context was used to price
+      // it. For a literal (len==1) this is in[pos-1].
+      size_t ctx = in[pos - prefix_costs[pos].len].context;
+      out.emplace_back(static_cast<uint32_t>(ctx), val);
       out.back().is_lz77_length = is_lz77_length;
       pos -= prefix_costs[pos].len;
     }
