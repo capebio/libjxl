@@ -361,12 +361,37 @@ class ANSEncodingHistogram {
       info[s].reverse_map_ = pool + pool_pos;
       pool_pos += freq;
     }
-    size_t log_entry_size = ANS_LOG_TAB_SIZE - log_alpha_size;
-    size_t entry_size_minus_1 = (1 << log_entry_size) - 1;
-    for (int i = 0; i < ANS_TAB_SIZE; i++) {
-      AliasTable::Symbol s =
-          AliasTable::Lookup(table, i, log_entry_size, entry_size_minus_1);
-      info[s.value].reverse_map_[s.offset] = i;
+    // Fill the reverse maps by walking the alias table entry-by-entry instead
+    // of probing AliasTable::Lookup for each of the ANS_TAB_SIZE states. Entry
+    // `i` owns the state range [i << log_entry_size, (i+1) << log_entry_size).
+    // Within it, positions [0, cutoff) map to symbol `i` at reverse-map offset
+    // `pos`, and positions [cutoff, entry_size) map to `right_value` at offset
+    // `offsets1 + pos` (offsets0 is always 0). This writes exactly the same
+    // (symbol, offset) -> state pairs as the Lookup loop — every state once —
+    // but replaces the per-state packed load + branchless select with two
+    // straight-line store runs.
+    const size_t log_entry_size = ANS_LOG_TAB_SIZE - log_alpha_size;
+    const size_t entry_size = size_t{1} << log_entry_size;
+    const size_t table_size = size_t{1} << log_alpha_size;
+    for (size_t i = 0; i < table_size; ++i) {
+      const AliasTable::Entry& e = table[i];
+      const size_t base = i << log_entry_size;
+      const size_t cutoff = e.cutoff;
+      // Left side: symbol `i`. cutoff == 0 marks an overflow entry with no
+      // ANSEncSymbolInfo slot for `i`; the Lookup loop likewise never touches
+      // info[i] then, so skip it.
+      if (cutoff != 0) {
+        uint16_t* JXL_RESTRICT left = info[i].reverse_map_;
+        for (size_t pos = 0; pos < cutoff; ++pos) {
+          left[pos] = static_cast<uint16_t>(base + pos);
+        }
+      }
+      // Right side: symbol `right_value`, always a valid symbol < alphabet size.
+      uint16_t* JXL_RESTRICT right = info[e.right_value].reverse_map_;
+      const size_t off1 = e.offsets1;
+      for (size_t pos = cutoff; pos < entry_size; ++pos) {
+        right[off1 + pos] = static_cast<uint16_t>(base + pos);
+      }
     }
   }
 
