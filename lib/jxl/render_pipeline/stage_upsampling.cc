@@ -241,23 +241,32 @@ class UpsamplingStage : public RenderPipelineStage {
     }
 
     for (size_t x = 0; x < len; x += Lanes(df)) {
+      // The 25 input taps and the clamp bounds are identical for every one of
+      // the N*N output subpixels at this x. Load them once into locals: this
+      // removes the redundant per-subpixel loads and frees the compiler from
+      // the input/output aliasing assumption (input[] may point into the same
+      // allocation family as the output rows) that otherwise forces a reload
+      // after each StoreInterleaved. Values and MulAdd order are unchanged, so
+      // results are bit-identical.
+      V vin[25];
+      for (size_t i = 0; i < 25; ++i) vin[i] = LoadU(df, input[i]);
+      const V vmin = Load(df, mins + x);
+      const V vmax = Load(df, maxs + x);
       for (size_t oy = 0; oy < N; oy++) {
         float* dst_row = GetOutputRow(output_rows, c_, oy);
         for (size_t ox = 0; ox < N; ox++) {
           size_t k = N * oy + ox;
-          auto acc0 = Mul(LoadU(df, input[0]), Set(df, Kernel(k, 0)));
-          auto acc1 = Mul(LoadU(df, input[1]), Set(df, Kernel(k, 1)));
-          auto acc2 = Mul(LoadU(df, input[2]), Set(df, Kernel(k, 2)));
+          auto acc0 = Mul(vin[0], Set(df, Kernel(k, 0)));
+          auto acc1 = Mul(vin[1], Set(df, Kernel(k, 1)));
+          auto acc2 = Mul(vin[2], Set(df, Kernel(k, 2)));
           for (size_t i = 3; i < 24; i += 3) {
-            acc0 = MulAdd(LoadU(df, input[i]), Set(df, Kernel(k, i)), acc0);
-            acc1 = MulAdd(LoadU(df, input[i + 1]), Set(df, Kernel(k, i + 1)),
-                          acc1);
-            acc2 = MulAdd(LoadU(df, input[i + 2]), Set(df, Kernel(k, i + 2)),
-                          acc2);
+            acc0 = MulAdd(vin[i], Set(df, Kernel(k, i)), acc0);
+            acc1 = MulAdd(vin[i + 1], Set(df, Kernel(k, i + 1)), acc1);
+            acc2 = MulAdd(vin[i + 2], Set(df, Kernel(k, i + 2)), acc2);
           }
-          acc0 = MulAdd(LoadU(df, input[24]), Set(df, Kernel(k, 24)), acc0);
+          acc0 = MulAdd(vin[24], Set(df, Kernel(k, 24)), acc0);
           auto result = Add(Add(acc1, acc2), acc0);
-          *ups[ox] = Clamp(result, Load(df, mins + x), Load(df, maxs + x));
+          *ups[ox] = Clamp(result, vmin, vmax);
         }
         if (N == 2) {
           StoreInterleaved(df, ups0, ups1, dst_row + x * N);
