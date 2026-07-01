@@ -67,6 +67,15 @@ using hwy::HWY_NAMESPACE::IfThenElseZero;
 using hwy::HWY_NAMESPACE::MaskFromVec;
 using hwy::HWY_NAMESPACE::Round;
 
+// Prevent the compiler from constant-folding a benchmark's CfL ratios (which
+// would let it delete a cfl_mask==0 branch, or prove NegMulAdd(0,y,x)==x, at
+// compile time). In production the ratios come from the cmap at runtime, so
+// launder them through DoNotOptimize to measure the real dispatch cost.
+static float Launder(float v) {
+  benchmark::DoNotOptimize(v);
+  return v;
+}
+
 // ---------------------------------------------------------------------------
 // BM_QuantizeAC_DCT8: stack-allocated mask (old) vs static const (new).
 // ---------------------------------------------------------------------------
@@ -291,8 +300,8 @@ HWY_NOINLINE void CflBoth_Old_Impl(benchmark::State& state) {
     coeffs[i] = static_cast<float>(i % 64) / 64.f + 0.1f;
 
   constexpr HWY_CAPPED(float, kDCTBlockSize) d;
-  const auto xf = hwy::HWY_NAMESPACE::Set(d, 0.3f);
-  const auto bf = hwy::HWY_NAMESPACE::Set(d, -0.1f);
+  const auto xf = hwy::HWY_NAMESPACE::Set(d, Launder(0.3f));
+  const auto bf = hwy::HWY_NAMESPACE::Set(d, Launder(-0.1f));
   const size_t sz = kDCTBlockSize;
 
   for (auto _ : state) {
@@ -319,7 +328,7 @@ HWY_NOINLINE void CflBoth_New_Impl(benchmark::State& state) {
     coeffs[i] = static_cast<float>(i % 64) / 64.f + 0.1f;
 
   constexpr HWY_CAPPED(float, kDCTBlockSize) d;
-  const float x_ratio = 0.3f, b_ratio = -0.1f;
+  const float x_ratio = Launder(0.3f), b_ratio = Launder(-0.1f);
   const uint8_t cfl_mask = static_cast<uint8_t>(
       (x_ratio != 0.f ? 1u : 0u) | (b_ratio != 0.f ? 2u : 0u));
   const auto xf = hwy::HWY_NAMESPACE::Set(d, x_ratio);
@@ -354,8 +363,8 @@ HWY_NOINLINE void CflNone_Old_Impl(benchmark::State& state) {
 
   constexpr HWY_CAPPED(float, kDCTBlockSize) d;
   // OLD: both channels always, factors happen to be zero.
-  const auto xf = hwy::HWY_NAMESPACE::Set(d, 0.0f);
-  const auto bf = hwy::HWY_NAMESPACE::Set(d, 0.0f);
+  const auto xf = hwy::HWY_NAMESPACE::Set(d, Launder(0.0f));
+  const auto bf = hwy::HWY_NAMESPACE::Set(d, Launder(0.0f));
   const size_t sz = kDCTBlockSize;
 
   for (auto _ : state) {
@@ -381,7 +390,7 @@ HWY_NOINLINE void CflNone_New_Impl(benchmark::State& state) {
     coeffs[i] = static_cast<float>(i % 64) / 64.f + 0.1f;
 
   // NEW: cfl_mask==0 → skip loop body entirely.
-  const float x_ratio = 0.0f, b_ratio = 0.0f;
+  const float x_ratio = Launder(0.0f), b_ratio = Launder(0.0f);
   const uint8_t cfl_mask = static_cast<uint8_t>(
       (x_ratio != 0.f ? 1u : 0u) | (b_ratio != 0.f ? 2u : 0u));
 
