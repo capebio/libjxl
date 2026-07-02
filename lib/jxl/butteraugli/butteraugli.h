@@ -15,8 +15,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <utility>
-#include <vector>
 
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/status.h"
@@ -162,29 +160,7 @@ struct BlurTemp {
     return true;
   }
 
-  // Convolution kernels are pure functions of sigma; butteraugli cycles a
-  // handful of fixed sigmas per comparison, so cache them per BlurTemp
-  // (single-threaded use) instead of recomputing exp() taps on every Blur.
-  const std::vector<float> *FindKernel(float sigma) const {
-    for (const auto &e : kernel_cache) {
-      if (e.first == sigma) return &e.second;
-    }
-    return nullptr;
-  }
-  const std::vector<float> *AddKernel(float sigma, std::vector<float> kernel) {
-    kernel_cache.emplace_back(sigma, std::move(kernel));
-    return &kernel_cache.back().second;
-  }
-
-  // Scratch strip for the blocked transposed store in ConvolutionWithTranspose.
-  float *GetStrip(size_t n) {
-    if (strip.size() < n) strip.resize(n);
-    return strip.data();
-  }
-
   ImageF transposed_temp;
-  std::vector<std::pair<float, std::vector<float>>> kernel_cache;
-  std::vector<float> strip;
 };
 
 class ButteraugliComparator {

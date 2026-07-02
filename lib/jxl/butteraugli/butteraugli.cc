@@ -5,9 +5,6 @@
 //
 // Author: Jyrki Alakuijala (jyrki.alakuijala@gmail.com)
 //
-// SpeedCodeReview ✓ 2026-07-02 · model=Fable 5 · byte-exact SIMD hot-path pass
-// (native −48..53% / WASM −33..48%, diffmap FNV + score identical, all sizes).
-//
 // The physical architecture of butteraugli is based on the following naming
 // convention:
 //   * Opsin - dynamics of the photosensitive chemicals in the retina
@@ -91,12 +88,6 @@ std::vector<float> ComputeKernel(float sigma) {
 
 void ConvolveBorderColumn(const ImageF& in, const std::vector<float>& kernel,
                           const size_t x, float* BUTTERAUGLI_RESTRICT row_out) {
-// This once-compiled helper is inlined into the per-target convolution, where
-// FMA contraction would otherwise change the historical baseline-ISA rounding
-// of the mul+add chains below. The flag is lexical and survives inlining.
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
   const size_t offset = kernel.size() / 2;
   int minx = x < offset ? 0 : x - offset;
   int maxx = std::min<int>(in.xsize() - 1, x + offset);
@@ -115,14 +106,122 @@ void ConvolveBorderColumn(const ImageF& in, const std::vector<float>& kernel,
   }
 }
 
-// ConvolutionWithTranspose + Blur are defined after the HWY_EXPORT table at the
-// bottom of this file: the convolution body moved to the per-target section
-// (ConvolutionWithTransposeHwy) — SIMD along x with a strip-blocked transposed
-// store — and Blur additionally caches ComputeKernel results per BlurTemp.
-// Outputs are bit-identical to the previous scalar forms.
+// Computes a horizontal convolution and transposes the result.
 Status ConvolutionWithTranspose(const ImageF& in,
                                 const std::vector<float>& kernel,
-                                BlurTemp* temp, ImageF* BUTTERAUGLI_RESTRICT out);
+                                ImageF* BUTTERAUGLI_RESTRICT out) {
+  JXL_ENSURE(out->xsize() == in.ysize());
+  JXL_ENSURE(out->ysize() == in.xsize());
+  const size_t len = kernel.size();
+  const size_t offset = len / 2;
+  float weight_no_border = 0.0f;
+  for (size_t j = 0; j < len; ++j) {
+    weight_no_border += kernel[j];
+  }
+  const float scale_no_border = 1.0f / weight_no_border;
+  const size_t border1 = std::min(in.xsize(), offset);
+  const size_t border2 = in.xsize() > offset ? in.xsize() - offset : 0;
+  std::vector<float> scaled_kernel(len / 2 + 1);
+  for (size_t i = 0; i <= len / 2; ++i) {
+    scaled_kernel[i] = kernel[i] * scale_no_border;
+  }
+
+  // middle
+  switch (len) {
+    case 7: {
+      const float sk0 = scaled_kernel[0];
+      const float sk1 = scaled_kernel[1];
+      const float sk2 = scaled_kernel[2];
+      const float sk3 = scaled_kernel[3];
+      for (size_t y = 0; y < in.ysize(); ++y) {
+        const float* BUTTERAUGLI_RESTRICT row_in = in.Row(y) + border1 - offset;
+        for (size_t x = border1; x < border2; ++x, ++row_in) {
+          const float sum0 = (row_in[0] + row_in[6]) * sk0;
+          const float sum1 = (row_in[1] + row_in[5]) * sk1;
+          const float sum2 = (row_in[2] + row_in[4]) * sk2;
+          const float sum = (row_in[3]) * sk3 + sum0 + sum1 + sum2;
+          float* BUTTERAUGLI_RESTRICT row_out = out->Row(x);
+          row_out[y] = sum;
+        }
+      }
+    } break;
+    case 13: {
+      for (size_t y = 0; y < in.ysize(); ++y) {
+        const float* BUTTERAUGLI_RESTRICT row_in = in.Row(y) + border1 - offset;
+        for (size_t x = border1; x < border2; ++x, ++row_in) {
+          float sum0 = (row_in[0] + row_in[12]) * scaled_kernel[0];
+          float sum1 = (row_in[1] + row_in[11]) * scaled_kernel[1];
+          float sum2 = (row_in[2] + row_in[10]) * scaled_kernel[2];
+          float sum3 = (row_in[3] + row_in[9]) * scaled_kernel[3];
+          sum0 += (row_in[4] + row_in[8]) * scaled_kernel[4];
+          sum1 += (row_in[5] + row_in[7]) * scaled_kernel[5];
+          const float sum = (row_in[6]) * scaled_kernel[6];
+          float* BUTTERAUGLI_RESTRICT row_out = out->Row(x);
+          row_out[y] = sum + sum0 + sum1 + sum2 + sum3;
+        }
+      }
+      break;
+    }
+    case 15: {
+      for (size_t y = 0; y < in.ysize(); ++y) {
+        const float* BUTTERAUGLI_RESTRICT row_in = in.Row(y) + border1 - offset;
+        for (size_t x = border1; x < border2; ++x, ++row_in) {
+          float sum0 = (row_in[0] + row_in[14]) * scaled_kernel[0];
+          float sum1 = (row_in[1] + row_in[13]) * scaled_kernel[1];
+          float sum2 = (row_in[2] + row_in[12]) * scaled_kernel[2];
+          float sum3 = (row_in[3] + row_in[11]) * scaled_kernel[3];
+          sum0 += (row_in[4] + row_in[10]) * scaled_kernel[4];
+          sum1 += (row_in[5] + row_in[9]) * scaled_kernel[5];
+          sum2 += (row_in[6] + row_in[8]) * scaled_kernel[6];
+          const float sum = (row_in[7]) * scaled_kernel[7];
+          float* BUTTERAUGLI_RESTRICT row_out = out->Row(x);
+          row_out[y] = sum + sum0 + sum1 + sum2 + sum3;
+        }
+      }
+      break;
+    }
+    case 33: {
+      for (size_t y = 0; y < in.ysize(); ++y) {
+        const float* BUTTERAUGLI_RESTRICT row_in = in.Row(y) + border1 - offset;
+        for (size_t x = border1; x < border2; ++x, ++row_in) {
+          float sum0 = (row_in[0] + row_in[32]) * scaled_kernel[0];
+          float sum1 = (row_in[1] + row_in[31]) * scaled_kernel[1];
+          float sum2 = (row_in[2] + row_in[30]) * scaled_kernel[2];
+          float sum3 = (row_in[3] + row_in[29]) * scaled_kernel[3];
+          sum0 += (row_in[4] + row_in[28]) * scaled_kernel[4];
+          sum1 += (row_in[5] + row_in[27]) * scaled_kernel[5];
+          sum2 += (row_in[6] + row_in[26]) * scaled_kernel[6];
+          sum3 += (row_in[7] + row_in[25]) * scaled_kernel[7];
+          sum0 += (row_in[8] + row_in[24]) * scaled_kernel[8];
+          sum1 += (row_in[9] + row_in[23]) * scaled_kernel[9];
+          sum2 += (row_in[10] + row_in[22]) * scaled_kernel[10];
+          sum3 += (row_in[11] + row_in[21]) * scaled_kernel[11];
+          sum0 += (row_in[12] + row_in[20]) * scaled_kernel[12];
+          sum1 += (row_in[13] + row_in[19]) * scaled_kernel[13];
+          sum2 += (row_in[14] + row_in[18]) * scaled_kernel[14];
+          sum3 += (row_in[15] + row_in[17]) * scaled_kernel[15];
+          const float sum = (row_in[16]) * scaled_kernel[16];
+          float* BUTTERAUGLI_RESTRICT row_out = out->Row(x);
+          row_out[y] = sum + sum0 + sum1 + sum2 + sum3;
+        }
+      }
+      break;
+    }
+    default:
+      return JXL_UNREACHABLE("kernel size %d not implemented",
+                             static_cast<int>(len));
+  }
+  // left border
+  for (size_t x = 0; x < border1; ++x) {
+    ConvolveBorderColumn(in, kernel, x, out->Row(x));
+  }
+
+  // right border
+  for (size_t x = border2; x < in.xsize(); ++x) {
+    ConvolveBorderColumn(in, kernel, x, out->Row(x));
+  }
+  return true;
+}
 
 // A blur somewhat similar to a 2D Gaussian blur.
 // See: https://en.wikipedia.org/wiki/Gaussian_blur
@@ -135,7 +234,34 @@ Status ConvolutionWithTranspose(const ImageF& in,
 // optionally use gauss_blur followed by fixup of the borders for large images,
 // or fall back to the previous truncated FIR followed by a transpose.
 Status Blur(const ImageF& in, float sigma, const ButteraugliParams& params,
-            BlurTemp* temp, ImageF* out);
+            BlurTemp* temp, ImageF* out) {
+  std::vector<float> kernel = ComputeKernel(sigma);
+  // Separable5 does an in-place convolution, so this fast path is not safe if
+  // in aliases out.
+  if (kernel.size() == 5 && &in != out) {
+    float sum_weights = 0.0f;
+    for (const float w : kernel) {
+      sum_weights += w;
+    }
+    const float scale = 1.0f / sum_weights;
+    const float w0 = kernel[2] * scale;
+    const float w1 = kernel[1] * scale;
+    const float w2 = kernel[0] * scale;
+    const WeightsSeparable5 weights = {
+        {HWY_REP4(w0), HWY_REP4(w1), HWY_REP4(w2)},
+        {HWY_REP4(w0), HWY_REP4(w1), HWY_REP4(w2)},
+    };
+    JXL_RETURN_IF_ERROR(
+        Separable5(in, Rect(in), weights, /*pool=*/nullptr, out));
+    return true;
+  }
+
+  ImageF* temp_t;
+  JXL_RETURN_IF_ERROR(temp->GetTransposed(in, &temp_t));
+  JXL_RETURN_IF_ERROR(ConvolutionWithTranspose(in, kernel, temp_t));
+  JXL_RETURN_IF_ERROR(ConvolutionWithTranspose(*temp_t, kernel, out));
+  return true;
+}
 
 // Allows PaddedMaltaUnit to call either function via overloading.
 struct MaltaTagLF {};
@@ -192,253 +318,6 @@ HWY_INLINE V AmplifyRangeAroundZero(const D d, const double kw, const V x) {
   const auto w = Set(d, kw);
   return IfThenElse(Gt(x, w), Add(x, w),
                     IfThenElse(Lt(x, Neg(w)), Sub(x, w), Add(x, x)));
-}
-
-// Horizontal convolution of one row over [0, mid), vectorized along x.
-// Tap pairing and accumulation order replicate the scalar reference
-// expression-for-expression (same contraction opportunities), so each output
-// is bit-identical to the previous scalar middle loop; the scalar tails below
-// ARE the original loop bodies.
-static void HConvRow7(const float* BUTTERAUGLI_RESTRICT row_in,
-                      float* BUTTERAUGLI_RESTRICT row_out, const size_t mid,
-                      const float* BUTTERAUGLI_RESTRICT sk) {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
-  const HWY_FULL(float) df;
-  const size_t NL = Lanes(df);
-  const auto k0 = Set(df, sk[0]);
-  const auto k1 = Set(df, sk[1]);
-  const auto k2 = Set(df, sk[2]);
-  const auto k3 = Set(df, sk[3]);
-  size_t i = 0;
-  const float* BUTTERAUGLI_RESTRICT rin = row_in;
-  for (; i + NL <= mid; i += NL, rin += NL) {
-    const auto s0 = Mul(Add(LoadU(df, rin + 0), LoadU(df, rin + 6)), k0);
-    const auto s1 = Mul(Add(LoadU(df, rin + 1), LoadU(df, rin + 5)), k1);
-    const auto s2 = Mul(Add(LoadU(df, rin + 2), LoadU(df, rin + 4)), k2);
-    const auto sum = Add(Add(Add(Mul(LoadU(df, rin + 3), k3), s0), s1), s2);
-    StoreU(sum, df, row_out + i);
-  }
-  for (; i < mid; ++i, ++rin) {
-    const float sum0 = (rin[0] + rin[6]) * sk[0];
-    const float sum1 = (rin[1] + rin[5]) * sk[1];
-    const float sum2 = (rin[2] + rin[4]) * sk[2];
-    const float sum = (rin[3]) * sk[3] + sum0 + sum1 + sum2;
-    row_out[i] = sum;
-  }
-}
-
-static void HConvRow13(const float* BUTTERAUGLI_RESTRICT row_in,
-                       float* BUTTERAUGLI_RESTRICT row_out, const size_t mid,
-                       const float* BUTTERAUGLI_RESTRICT sk) {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
-  const HWY_FULL(float) df;
-  const size_t NL = Lanes(df);
-  const auto k0 = Set(df, sk[0]);
-  const auto k1 = Set(df, sk[1]);
-  const auto k2 = Set(df, sk[2]);
-  const auto k3 = Set(df, sk[3]);
-  const auto k4 = Set(df, sk[4]);
-  const auto k5 = Set(df, sk[5]);
-  const auto k6 = Set(df, sk[6]);
-  size_t i = 0;
-  const float* BUTTERAUGLI_RESTRICT rin = row_in;
-  for (; i + NL <= mid; i += NL, rin += NL) {
-    auto s0 = Mul(Add(LoadU(df, rin + 0), LoadU(df, rin + 12)), k0);
-    auto s1 = Mul(Add(LoadU(df, rin + 1), LoadU(df, rin + 11)), k1);
-    const auto s2 = Mul(Add(LoadU(df, rin + 2), LoadU(df, rin + 10)), k2);
-    const auto s3 = Mul(Add(LoadU(df, rin + 3), LoadU(df, rin + 9)), k3);
-    s0 = Add(Mul(Add(LoadU(df, rin + 4), LoadU(df, rin + 8)), k4), s0);
-    s1 = Add(Mul(Add(LoadU(df, rin + 5), LoadU(df, rin + 7)), k5), s1);
-    const auto c = Mul(LoadU(df, rin + 6), k6);
-    StoreU(Add(Add(Add(Add(c, s0), s1), s2), s3), df, row_out + i);
-  }
-  for (; i < mid; ++i, ++rin) {
-    float sum0 = (rin[0] + rin[12]) * sk[0];
-    float sum1 = (rin[1] + rin[11]) * sk[1];
-    float sum2 = (rin[2] + rin[10]) * sk[2];
-    float sum3 = (rin[3] + rin[9]) * sk[3];
-    sum0 += (rin[4] + rin[8]) * sk[4];
-    sum1 += (rin[5] + rin[7]) * sk[5];
-    const float sum = (rin[6]) * sk[6];
-    row_out[i] = sum + sum0 + sum1 + sum2 + sum3;
-  }
-}
-
-static void HConvRow15(const float* BUTTERAUGLI_RESTRICT row_in,
-                       float* BUTTERAUGLI_RESTRICT row_out, const size_t mid,
-                       const float* BUTTERAUGLI_RESTRICT sk) {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
-  const HWY_FULL(float) df;
-  const size_t NL = Lanes(df);
-  const auto k0 = Set(df, sk[0]);
-  const auto k1 = Set(df, sk[1]);
-  const auto k2 = Set(df, sk[2]);
-  const auto k3 = Set(df, sk[3]);
-  const auto k4 = Set(df, sk[4]);
-  const auto k5 = Set(df, sk[5]);
-  const auto k6 = Set(df, sk[6]);
-  const auto k7 = Set(df, sk[7]);
-  size_t i = 0;
-  const float* BUTTERAUGLI_RESTRICT rin = row_in;
-  for (; i + NL <= mid; i += NL, rin += NL) {
-    auto s0 = Mul(Add(LoadU(df, rin + 0), LoadU(df, rin + 14)), k0);
-    auto s1 = Mul(Add(LoadU(df, rin + 1), LoadU(df, rin + 13)), k1);
-    auto s2 = Mul(Add(LoadU(df, rin + 2), LoadU(df, rin + 12)), k2);
-    const auto s3 = Mul(Add(LoadU(df, rin + 3), LoadU(df, rin + 11)), k3);
-    s0 = Add(Mul(Add(LoadU(df, rin + 4), LoadU(df, rin + 10)), k4), s0);
-    s1 = Add(Mul(Add(LoadU(df, rin + 5), LoadU(df, rin + 9)), k5), s1);
-    s2 = Add(Mul(Add(LoadU(df, rin + 6), LoadU(df, rin + 8)), k6), s2);
-    const auto c = Mul(LoadU(df, rin + 7), k7);
-    StoreU(Add(Add(Add(Add(c, s0), s1), s2), s3), df, row_out + i);
-  }
-  for (; i < mid; ++i, ++rin) {
-    float sum0 = (rin[0] + rin[14]) * sk[0];
-    float sum1 = (rin[1] + rin[13]) * sk[1];
-    float sum2 = (rin[2] + rin[12]) * sk[2];
-    float sum3 = (rin[3] + rin[11]) * sk[3];
-    sum0 += (rin[4] + rin[10]) * sk[4];
-    sum1 += (rin[5] + rin[9]) * sk[5];
-    sum2 += (rin[6] + rin[8]) * sk[6];
-    const float sum = (rin[7]) * sk[7];
-    row_out[i] = sum + sum0 + sum1 + sum2 + sum3;
-  }
-}
-
-static void HConvRow33(const float* BUTTERAUGLI_RESTRICT row_in,
-                       float* BUTTERAUGLI_RESTRICT row_out, const size_t mid,
-                       const float* BUTTERAUGLI_RESTRICT sk) {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
-  const HWY_FULL(float) df;
-  const size_t NL = Lanes(df);
-  size_t i = 0;
-  const float* BUTTERAUGLI_RESTRICT rin = row_in;
-  for (; i + NL <= mid; i += NL, rin += NL) {
-    auto s0 = Mul(Add(LoadU(df, rin + 0), LoadU(df, rin + 32)), Set(df, sk[0]));
-    auto s1 = Mul(Add(LoadU(df, rin + 1), LoadU(df, rin + 31)), Set(df, sk[1]));
-    auto s2 = Mul(Add(LoadU(df, rin + 2), LoadU(df, rin + 30)), Set(df, sk[2]));
-    auto s3 = Mul(Add(LoadU(df, rin + 3), LoadU(df, rin + 29)), Set(df, sk[3]));
-    s0 = Add(Mul(Add(LoadU(df, rin + 4), LoadU(df, rin + 28)), Set(df, sk[4])), s0);
-    s1 = Add(Mul(Add(LoadU(df, rin + 5), LoadU(df, rin + 27)), Set(df, sk[5])), s1);
-    s2 = Add(Mul(Add(LoadU(df, rin + 6), LoadU(df, rin + 26)), Set(df, sk[6])), s2);
-    s3 = Add(Mul(Add(LoadU(df, rin + 7), LoadU(df, rin + 25)), Set(df, sk[7])), s3);
-    s0 = Add(Mul(Add(LoadU(df, rin + 8), LoadU(df, rin + 24)), Set(df, sk[8])), s0);
-    s1 = Add(Mul(Add(LoadU(df, rin + 9), LoadU(df, rin + 23)), Set(df, sk[9])), s1);
-    s2 = Add(Mul(Add(LoadU(df, rin + 10), LoadU(df, rin + 22)), Set(df, sk[10])), s2);
-    s3 = Add(Mul(Add(LoadU(df, rin + 11), LoadU(df, rin + 21)), Set(df, sk[11])), s3);
-    s0 = Add(Mul(Add(LoadU(df, rin + 12), LoadU(df, rin + 20)), Set(df, sk[12])), s0);
-    s1 = Add(Mul(Add(LoadU(df, rin + 13), LoadU(df, rin + 19)), Set(df, sk[13])), s1);
-    s2 = Add(Mul(Add(LoadU(df, rin + 14), LoadU(df, rin + 18)), Set(df, sk[14])), s2);
-    s3 = Add(Mul(Add(LoadU(df, rin + 15), LoadU(df, rin + 17)), Set(df, sk[15])), s3);
-    const auto c = Mul(LoadU(df, rin + 16), Set(df, sk[16]));
-    StoreU(Add(Add(Add(Add(c, s0), s1), s2), s3), df, row_out + i);
-  }
-  for (; i < mid; ++i, ++rin) {
-    float sum0 = (rin[0] + rin[32]) * sk[0];
-    float sum1 = (rin[1] + rin[31]) * sk[1];
-    float sum2 = (rin[2] + rin[30]) * sk[2];
-    float sum3 = (rin[3] + rin[29]) * sk[3];
-    sum0 += (rin[4] + rin[28]) * sk[4];
-    sum1 += (rin[5] + rin[27]) * sk[5];
-    sum2 += (rin[6] + rin[26]) * sk[6];
-    sum3 += (rin[7] + rin[25]) * sk[7];
-    sum0 += (rin[8] + rin[24]) * sk[8];
-    sum1 += (rin[9] + rin[23]) * sk[9];
-    sum2 += (rin[10] + rin[22]) * sk[10];
-    sum3 += (rin[11] + rin[21]) * sk[11];
-    sum0 += (rin[12] + rin[20]) * sk[12];
-    sum1 += (rin[13] + rin[19]) * sk[13];
-    sum2 += (rin[14] + rin[18]) * sk[14];
-    sum3 += (rin[15] + rin[17]) * sk[15];
-    const float sum = (rin[16]) * sk[16];
-    row_out[i] = sum + sum0 + sum1 + sum2 + sum3;
-  }
-}
-
-// Computes a horizontal convolution and transposes the result. SIMD along x;
-// the transposed store goes through an L1-resident strip so each output row
-// receives contiguous runs of `by` floats per block instead of one float per
-// visit. Outputs are bit-identical to the scalar reference.
-Status ConvolutionWithTransposeHwy(const ImageF& in,
-                                   const std::vector<float>& kernel,
-                                   BlurTemp* blur_temp,
-                                   ImageF* BUTTERAUGLI_RESTRICT out) {
-  JXL_ENSURE(out->xsize() == in.ysize());
-  JXL_ENSURE(out->ysize() == in.xsize());
-  const size_t len = kernel.size();
-  const size_t offset = len / 2;
-  float weight_no_border = 0.0f;
-  for (size_t j = 0; j < len; ++j) {
-    weight_no_border += kernel[j];
-  }
-  const float scale_no_border = 1.0f / weight_no_border;
-  const size_t border1 = std::min(in.xsize(), offset);
-  const size_t border2 = in.xsize() > offset ? in.xsize() - offset : 0;
-  float scaled_kernel[17];  // largest butteraugli kernel is 33 taps
-  JXL_ENSURE(len / 2 + 1 <= 17);
-  for (size_t i = 0; i <= len / 2; ++i) {
-    scaled_kernel[i] = kernel[i] * scale_no_border;
-  }
-
-  const size_t mid = border2 > border1 ? border2 - border1 : 0;
-  if (mid > 0) {
-    constexpr size_t kBlockRows = 8;
-    float* BUTTERAUGLI_RESTRICT strip = blur_temp->GetStrip(kBlockRows * mid);
-    for (size_t y0 = 0; y0 < in.ysize(); y0 += kBlockRows) {
-      const size_t by = std::min(kBlockRows, in.ysize() - y0);
-      for (size_t k = 0; k < by; ++k) {
-        const float* BUTTERAUGLI_RESTRICT row_in =
-            in.Row(y0 + k) + border1 - offset;
-        float* BUTTERAUGLI_RESTRICT srow = strip + k * mid;
-        switch (len) {
-          case 7:
-            HConvRow7(row_in, srow, mid, scaled_kernel);
-            break;
-          case 13:
-            HConvRow13(row_in, srow, mid, scaled_kernel);
-            break;
-          case 15:
-            HConvRow15(row_in, srow, mid, scaled_kernel);
-            break;
-          case 33:
-            HConvRow33(row_in, srow, mid, scaled_kernel);
-            break;
-          default:
-            return JXL_UNREACHABLE("kernel size %d not implemented",
-                                   static_cast<int>(len));
-        }
-      }
-      // Blocked transposed copy: strip reads stay within a small window; each
-      // out row takes `by` contiguous floats per block (was 1 float/visit).
-      constexpr size_t kSwath = 64;
-      for (size_t xb = 0; xb < mid; xb += kSwath) {
-        const size_t bx = std::min(kSwath, mid - xb);
-        for (size_t j = 0; j < bx; ++j) {
-          float* BUTTERAUGLI_RESTRICT row_out = out->Row(border1 + xb + j) + y0;
-          const float* BUTTERAUGLI_RESTRICT s = strip + xb + j;
-          for (size_t k = 0; k < by; ++k) {
-            row_out[k] = s[k * mid];
-          }
-        }
-      }
-    }
-  }
-  // left border
-  for (size_t x = 0; x < border1; ++x) {
-    ConvolveBorderColumn(in, kernel, x, out->Row(x));
-  }
-  // right border
-  for (size_t x = border2; x < in.xsize(); ++x) {
-    ConvolveBorderColumn(in, kernel, x, out->Row(x));
-  }
-  return true;
 }
 
 // XybLowFreqToVals converts from low-frequency XYB space to the 'vals' space.
@@ -1124,93 +1003,40 @@ static Status MaltaDiffMapT(const Tag tag, const ImageF& lum0,
   const float norm2_0gt1 = w_pre0gt1 * norm1;
   const float norm2_0lt1 = w_pre0lt1 * norm1;
 
-  // Vectorized diff precompute. The primary objective is plain f32 element
-  // math. The secondary half-open objectives run in f64 with the sign of row0
-  // folded into a flipped row1 (r1p): the branch arithmetic is a bitwise-equal
-  // reformulation (add/sub of exact negations), evaluated masked and applied
-  // unconditionally — a zero adjustment reproduces the untouched bit pattern.
-  // The scalar source has no mul+add contraction opportunity, so Mul/Add/Div/
-  // Sub (never MulAdd) keep this bit-identical to the previous per-pixel loop.
-  {
-    const HWY_FULL(float) df32;
-    const HWY_FULL(double) dd;
-    const hwy::HWY_NAMESPACE::Rebind<float, decltype(dd)> dfh;
-    const float norm1f = static_cast<float>(norm1);
-    const size_t NF = Lanes(df32);
-    const size_t ND = Lanes(dd);
-    for (size_t y = 0; y < ysize_; ++y) {
-      const float* HWY_RESTRICT row0 = lum0.ConstRow(y);
-      const float* HWY_RESTRICT row1 = lum1.ConstRow(y);
-      float* HWY_RESTRICT row_diffs = diffs->Row(y);
-      const size_t nv = xsize_ - (xsize_ % NF);
+  for (size_t y = 0; y < ysize_; ++y) {
+    const float* HWY_RESTRICT row0 = lum0.ConstRow(y);
+    const float* HWY_RESTRICT row1 = lum1.ConstRow(y);
+    float* HWY_RESTRICT row_diffs = diffs->Row(y);
+    for (size_t x = 0; x < xsize_; ++x) {
+      const float absval = 0.5f * (std::abs(row0[x]) + std::abs(row1[x]));
+      const float diff = row0[x] - row1[x];
+      const float scaler = norm2_0gt1 / (static_cast<float>(norm1) + absval);
+
       // Primary symmetric quadratic objective.
-      for (size_t x = 0; x < nv; x += NF) {
-        const auto v0 = LoadU(df32, row0 + x);
-        const auto v1 = LoadU(df32, row1 + x);
-        const auto absval = Mul(Set(df32, 0.5f), Add(Abs(v0), Abs(v1)));
-        const auto scaler =
-            Div(Set(df32, norm2_0gt1), Add(Set(df32, norm1f), absval));
-        StoreU(Mul(scaler, Sub(v0, v1)), df32, row_diffs + x);
-      }
+      row_diffs[x] = scaler * diff;
+
+      const float scaler2 = norm2_0lt1 / (static_cast<float>(norm1) + absval);
+      const double fabs0 = std::fabs(row0[x]);
+
       // Secondary half-open quadratic objectives.
-      for (size_t x = 0; x < nv; x += ND) {
-        const auto v0f = LoadU(dfh, row0 + x);
-        const auto v1f = LoadU(dfh, row1 + x);
-        const auto absvf = Mul(Set(dfh, 0.5f), Add(Abs(v0f), Abs(v1f)));
-        const auto s2f =
-            Div(Set(dfh, norm2_0lt1), Add(Set(dfh, norm1f), absvf));
-        const auto s2 = PromoteTo(dd, s2f);
-        const auto r0 = PromoteTo(dd, v0f);
-        const auto r1 = PromoteTo(dd, v1f);
-        const auto fabs0 = Abs(r0);
-        const auto too_small = Mul(Set(dd, 0.55), fabs0);
-        const auto too_big = Mul(Set(dd, 1.05), fabs0);
-        const auto neg = Lt(r0, Zero(dd));
-        const auto r1p = IfThenElse(neg, Neg(r1), r1);
-        const auto impact_small = Mul(s2, Sub(too_small, r1p));
-        const auto impact_big = Mul(s2, Sub(r1p, too_big));
-        const auto m_small = Lt(r1p, too_small);
-        const auto m_big = Gt(r1p, too_big);
-        const auto inner = IfThenElse(m_small, impact_small,
-                                      IfThenElseZero(m_big, Neg(impact_big)));
-        const auto adj = IfThenElse(neg, Neg(inner), inner);
-        const auto rd = PromoteTo(dd, LoadU(dfh, row_diffs + x));
-        // Untouched lanes must keep their exact stored bits (a -0.0f would be
-        // flipped to +0.0f by an unconditional rd + (+0.0) round-trip).
-        const auto res = IfThenElse(Or(m_small, m_big), Add(rd, adj), rd);
-        StoreU(DemoteTo(dfh, res), dfh, row_diffs + x);
-      }
-      for (size_t x = nv; x < xsize_; ++x) {
-        const float absval = 0.5f * (std::abs(row0[x]) + std::abs(row1[x]));
-        const float diff = row0[x] - row1[x];
-        const float scaler = norm2_0gt1 / (static_cast<float>(norm1) + absval);
+      const double too_small = 0.55 * fabs0;
+      const double too_big = 1.05 * fabs0;
 
-        // Primary symmetric quadratic objective.
-        row_diffs[x] = scaler * diff;
-
-        const float scaler2 = norm2_0lt1 / (static_cast<float>(norm1) + absval);
-        const double fabs0 = std::fabs(row0[x]);
-
-        // Secondary half-open quadratic objectives.
-        const double too_small = 0.55 * fabs0;
-        const double too_big = 1.05 * fabs0;
-
-        if (row0[x] < 0) {
-          if (row1[x] > -too_small) {
-            double impact = scaler2 * (row1[x] + too_small);
-            row_diffs[x] -= impact;
-          } else if (row1[x] < -too_big) {
-            double impact = scaler2 * (-row1[x] - too_big);
-            row_diffs[x] += impact;
-          }
-        } else {
-          if (row1[x] < too_small) {
-            double impact = scaler2 * (too_small - row1[x]);
-            row_diffs[x] += impact;
-          } else if (row1[x] > too_big) {
-            double impact = scaler2 * (row1[x] - too_big);
-            row_diffs[x] -= impact;
-          }
+      if (row0[x] < 0) {
+        if (row1[x] > -too_small) {
+          double impact = scaler2 * (row1[x] + too_small);
+          row_diffs[x] -= impact;
+        } else if (row1[x] < -too_big) {
+          double impact = scaler2 * (-row1[x] - too_big);
+          row_diffs[x] += impact;
+        }
+      } else {
+        if (row1[x] < too_small) {
+          double impact = scaler2 * (too_small - row1[x]);
+          row_diffs[x] += impact;
+        } else if (row1[x] > too_big) {
+          double impact = scaler2 * (row1[x] - too_big);
+          row_diffs[x] -= impact;
         }
       }
     }
@@ -1291,10 +1117,7 @@ void CombineChannelsForMasking(const ImageF* hf, const ImageF* uhf,
       0.4f,
       0.4f,
   };
-  // Left as a scalar map: this TU is compiled per-Highway-target, so the
-  // compiler already auto-vectorizes (and FMA-contracts) this loop for the
-  // dispatched target. A hand-written SIMD form can't reproduce the compiler's
-  // exact contraction operand choice bit-for-bit, so it is not worth the risk.
+  // Silly and unoptimized approach here. TODO(jyrki): rework this.
   for (size_t y = 0; y < hf[0].ysize(); ++y) {
     const float* BUTTERAUGLI_RESTRICT row_y_hf = hf[1].Row(y);
     const float* BUTTERAUGLI_RESTRICT row_y_uhf = uhf[1].Row(y);
@@ -1315,22 +1138,11 @@ void DiffPrecompute(const ImageF& xyb, float mul, float bias_arg, ImageF* out) {
   const size_t ysize = xyb.ysize();
   const float bias = mul * bias_arg;
   const float sqrt_bias = std::sqrt(bias);
-  const HWY_FULL(float) df;
-  const size_t NL = Lanes(df);
-  const auto vmul = Set(df, mul);
-  const auto vbias = Set(df, bias);
-  const auto vsqrt_bias = Set(df, sqrt_bias);
   for (size_t y = 0; y < ysize; ++y) {
     const float* BUTTERAUGLI_RESTRICT row_in = xyb.Row(y);
     float* BUTTERAUGLI_RESTRICT row_out = out->Row(y);
-    size_t x = 0;
-    // kBias makes sqrt behave more linearly. MulAdd mirrors the contraction
-    // the compiler applies to the scalar mul*|v|+bias below on FMA targets.
-    for (; x + NL <= xsize; x += NL) {
-      const auto v = MulAdd(vmul, Abs(LoadU(df, row_in + x)), vbias);
-      StoreU(Sub(Sqrt(v), vsqrt_bias), df, row_out + x);
-    }
-    for (; x < xsize; ++x) {
+    for (size_t x = 0; x < xsize; ++x) {
+      // kBias makes sqrt behave more linearly.
       row_out[x] = std::sqrt(mul * std::abs(row_in[x]) + bias) - sqrt_bias;
     }
   }
@@ -1357,101 +1169,42 @@ void StoreMin3(const float v, float& min0, float& min1, float& min2) {
   }
 }
 
-// Sorted-insert of v into the ascending triple (min0, min1, min2), keeping the
-// three smallest values. Produces exactly the values StoreMin3 keeps (the three
-// smallest of the candidate multiset are order-independent), lane-parallel.
-template <class V>
-BUTTERAUGLI_INLINE void InsertMin3(const V v, V& min0, V& min1, V& min2) {
-  const V t0b = Max(min0, v);
-  min0 = Min(min0, v);
-  const V t1b = Max(min1, t0b);
-  min1 = Min(min1, t0b);
-  min2 = Min(min2, t1b);
-}
-
-// Scalar reference pixel (original FuzzyErosion body) for borders and tails.
-static void FuzzyErosionScalarPx(const ImageF& from, const size_t x,
-                                 const size_t y, const size_t xsize,
-                                 const size_t ysize,
-                                 float* BUTTERAUGLI_RESTRICT row_out) {
-  static const int kStep = 3;
-  float min0 = from.Row(y)[x];
-  float min1 = 2 * min0;
-  float min2 = min1;
-  if (x >= kStep) {
-    StoreMin3(from.Row(y)[x - kStep], min0, min1, min2);
-    if (y >= kStep) {
-      StoreMin3(from.Row(y - kStep)[x - kStep], min0, min1, min2);
-    }
-    if (y < ysize - kStep) {
-      StoreMin3(from.Row(y + kStep)[x - kStep], min0, min1, min2);
-    }
-  }
-  if (x < xsize - kStep) {
-    StoreMin3(from.Row(y)[x + kStep], min0, min1, min2);
-    if (y >= kStep) {
-      StoreMin3(from.Row(y - kStep)[x + kStep], min0, min1, min2);
-    }
-    if (y < ysize - kStep) {
-      StoreMin3(from.Row(y + kStep)[x + kStep], min0, min1, min2);
-    }
-  }
-  if (y >= kStep) {
-    StoreMin3(from.Row(y - kStep)[x], min0, min1, min2);
-  }
-  if (y < ysize - kStep) {
-    StoreMin3(from.Row(y + kStep)[x], min0, min1, min2);
-  }
-  row_out[x] = (0.45f * min0 + 0.3f * min1 + 0.25f * min2);
-}
-
 // Look for smooth areas near the area of degradation.
 // If the areas area generally smooth, don't do masking.
-// Interior pixels (all 8 neighbours present) run lane-parallel through the
-// InsertMin3 network; borders and tails use the original scalar body.
 void FuzzyErosion(const ImageF& from, ImageF* to) {
   const size_t xsize = from.xsize();
   const size_t ysize = from.ysize();
   static const int kStep = 3;
-  const size_t step = static_cast<size_t>(kStep);
-  const HWY_FULL(float) df;
-  const size_t NL = Lanes(df);
-  const auto w0 = Set(df, 0.45f);
-  const auto w1 = Set(df, 0.3f);
-  const auto w2 = Set(df, 0.25f);
   for (size_t y = 0; y < ysize; ++y) {
-    float* BUTTERAUGLI_RESTRICT row_out = to->Row(y);
-    const bool y_interior = y >= step && y + step < ysize;
-    if (!y_interior || xsize <= 2 * step) {
-      for (size_t x = 0; x < xsize; ++x) {
-        FuzzyErosionScalarPx(from, x, y, xsize, ysize, row_out);
+    for (size_t x = 0; x < xsize; ++x) {
+      float min0 = from.Row(y)[x];
+      float min1 = 2 * min0;
+      float min2 = min1;
+      if (x >= kStep) {
+        StoreMin3(from.Row(y)[x - kStep], min0, min1, min2);
+        if (y >= kStep) {
+          StoreMin3(from.Row(y - kStep)[x - kStep], min0, min1, min2);
+        }
+        if (y < ysize - kStep) {
+          StoreMin3(from.Row(y + kStep)[x - kStep], min0, min1, min2);
+        }
       }
-      continue;
-    }
-    const float* BUTTERAUGLI_RESTRICT rm = from.Row(y);
-    const float* BUTTERAUGLI_RESTRICT ru = from.Row(y - step);
-    const float* BUTTERAUGLI_RESTRICT rd = from.Row(y + step);
-    size_t x = 0;
-    for (; x < step; ++x) {
-      FuzzyErosionScalarPx(from, x, y, xsize, ysize, row_out);
-    }
-    for (; x + NL + step <= xsize; x += NL) {
-      auto m0 = LoadU(df, rm + x);
-      auto m1 = Add(m0, m0);
-      auto m2 = m1;
-      InsertMin3(LoadU(df, rm + x - step), m0, m1, m2);
-      InsertMin3(LoadU(df, ru + x - step), m0, m1, m2);
-      InsertMin3(LoadU(df, rd + x - step), m0, m1, m2);
-      InsertMin3(LoadU(df, rm + x + step), m0, m1, m2);
-      InsertMin3(LoadU(df, ru + x + step), m0, m1, m2);
-      InsertMin3(LoadU(df, rd + x + step), m0, m1, m2);
-      InsertMin3(LoadU(df, ru + x), m0, m1, m2);
-      InsertMin3(LoadU(df, rd + x), m0, m1, m2);
-      // MulAdd chain mirrors the contraction of 0.45*m0 + 0.3*m1 + 0.25*m2.
-      StoreU(MulAdd(w2, m2, MulAdd(w0, m0, Mul(w1, m1))), df, row_out + x);
-    }
-    for (; x < xsize; ++x) {
-      FuzzyErosionScalarPx(from, x, y, xsize, ysize, row_out);
+      if (x < xsize - kStep) {
+        StoreMin3(from.Row(y)[x + kStep], min0, min1, min2);
+        if (y >= kStep) {
+          StoreMin3(from.Row(y - kStep)[x + kStep], min0, min1, min2);
+        }
+        if (y < ysize - kStep) {
+          StoreMin3(from.Row(y + kStep)[x + kStep], min0, min1, min2);
+        }
+      }
+      if (y >= kStep) {
+        StoreMin3(from.Row(y - kStep)[x], min0, min1, min2);
+      }
+      if (y < ysize - kStep) {
+        StoreMin3(from.Row(y + kStep)[x], min0, min1, min2);
+      }
+      to->Row(y)[x] = (0.45f * min0 + 0.3f * min1 + 0.25f * min2);
     }
   }
 }
@@ -1483,27 +1236,12 @@ Status Mask(const ImageF& mask0, const ImageF& mask1,
   FuzzyErosion(blurred0, &diff0);
   JXL_RETURN_IF_ERROR(Blur(diff1, kRadius, params, blur_temp, &blurred1));
   for (size_t y = 0; y < ysize; ++y) {
-    memcpy(mask->Row(y), diff0.Row(y), xsize * sizeof(float));
-  }
-  if (diff_ac != nullptr) {
-    static const float kMaskToErrorMul = 10.0;
-    const HWY_FULL(float) df;
-    const size_t NL = Lanes(df);
-    const auto vmul = Set(df, kMaskToErrorMul);
-    for (size_t y = 0; y < ysize; ++y) {
-      const float* BUTTERAUGLI_RESTRICT row_b0 = blurred0.Row(y);
-      const float* BUTTERAUGLI_RESTRICT row_b1 = blurred1.Row(y);
-      float* BUTTERAUGLI_RESTRICT row_ac = diff_ac->Row(y);
-      size_t x = 0;
-      // MulAdd mirrors the contraction of (mul*diff)*diff + acc on FMA targets.
-      for (; x + NL <= xsize; x += NL) {
-        const auto diff = Sub(LoadU(df, row_b0 + x), LoadU(df, row_b1 + x));
-        const auto t = Mul(vmul, diff);
-        StoreU(MulAdd(t, diff, LoadU(df, row_ac + x)), df, row_ac + x);
-      }
-      for (; x < xsize; ++x) {
-        float diff = row_b0[x] - row_b1[x];
-        row_ac[x] += kMaskToErrorMul * diff * diff;
+    for (size_t x = 0; x < xsize; ++x) {
+      mask->Row(y)[x] = diff0.Row(y)[x];
+      if (diff_ac != nullptr) {
+        static const float kMaskToErrorMul = 10.0;
+        float diff = blurred0.Row(y)[x] - blurred1.Row(y)[x];
+        diff_ac->Row(y)[x] += kMaskToErrorMul * diff * diff;
       }
     }
   }
@@ -1549,33 +1287,6 @@ inline float MaskColor(const float color[3], const float mask) {
   return color[0] * mask + color[1] * mask + color[2] * mask;
 }
 
-// f64 lane-parallel forms of MaskY / MaskDcY. MulAdd mirrors the compiler's
-// contraction of (scaler * delta) + offset in the scalar bodies above on FMA
-// targets, so the demoted results are bit-identical.
-template <class DD, class V>
-BUTTERAUGLI_INLINE V MaskYv(const DD dd, const V delta) {
-  static const double offset = 0.829591754942;
-  static const double scaler = 0.451936922203;
-  static const double mul = 2.5485944793;
-  const V c =
-      Div(Set(dd, mul), MulAdd(Set(dd, scaler), delta, Set(dd, offset)));
-  const V retval =
-      Mul(Set(dd, static_cast<double>(kGlobalScale)), Add(Set(dd, 1.0), c));
-  return Mul(retval, retval);
-}
-
-template <class DD, class V>
-BUTTERAUGLI_INLINE V MaskDcYv(const DD dd, const V delta) {
-  static const double offset = 0.20025578522;
-  static const double scaler = 3.87449418804;
-  static const double mul = 0.505054525019;
-  const V c =
-      Div(Set(dd, mul), MulAdd(Set(dd, scaler), delta, Set(dd, offset)));
-  const V retval =
-      Mul(Set(dd, static_cast<double>(kGlobalScale)), Add(Set(dd, 1.0), c));
-  return Mul(retval, retval);
-}
-
 // Diffmap := sqrt of sum{diff images by multiplied by X and Y/B masks}
 Status CombineChannelsToDiffmap(const ImageF& mask,
                                 const Image3F& block_diff_dc,
@@ -1584,31 +1295,18 @@ Status CombineChannelsToDiffmap(const ImageF& mask,
   JXL_ENSURE(SameSize(mask, *result));
   size_t xsize = mask.xsize();
   size_t ysize = mask.ysize();
-  // Left as a scalar map: this TU is compiled per-Highway-target, so the
-  // compiler already auto-vectorizes (MaskY/MaskDcY inline, FMA-contracts) this
-  // loop for the dispatched target. A hand-written SIMD form can't match the
-  // compiler's exact contraction operand choice bit-for-bit — not worth it.
   for (size_t y = 0; y < ysize; ++y) {
-    const float* BUTTERAUGLI_RESTRICT row_mask = mask.Row(y);
-    const float* BUTTERAUGLI_RESTRICT rdc0 = block_diff_dc.PlaneRow(0, y);
-    const float* BUTTERAUGLI_RESTRICT rdc1 = block_diff_dc.PlaneRow(1, y);
-    const float* BUTTERAUGLI_RESTRICT rdc2 = block_diff_dc.PlaneRow(2, y);
-    const float* BUTTERAUGLI_RESTRICT rac0 = block_diff_ac.PlaneRow(0, y);
-    const float* BUTTERAUGLI_RESTRICT rac1 = block_diff_ac.PlaneRow(1, y);
-    const float* BUTTERAUGLI_RESTRICT rac2 = block_diff_ac.PlaneRow(2, y);
     float* BUTTERAUGLI_RESTRICT row_out = result->Row(y);
     for (size_t x = 0; x < xsize; ++x) {
-      float val = row_mask[x];
+      float val = mask.Row(y)[x];
       float maskval = MaskY(val);
       float dc_maskval = MaskDcY(val);
       float diff_dc[3];
       float diff_ac[3];
-      diff_dc[0] = rdc0[x];
-      diff_dc[1] = rdc1[x];
-      diff_dc[2] = rdc2[x];
-      diff_ac[0] = rac0[x];
-      diff_ac[1] = rac1[x];
-      diff_ac[2] = rac2[x];
+      for (int i = 0; i < 3; ++i) {
+        diff_dc[i] = block_diff_dc.PlaneRow(i, y)[x];
+        diff_ac[i] = block_diff_ac.PlaneRow(i, y)[x];
+      }
       diff_ac[0] *= xmul;
       diff_dc[0] *= xmul;
       row_out[x] = std::sqrt(MaskColor(diff_dc, dc_maskval) +
@@ -1952,56 +1650,16 @@ Status ButteraugliDiffmapInPlace(Image3F& image0, Image3F& image1,
 
   // compute final diffmap from mask image and ac and dc diff images
   JXL_ASSIGN_OR_RETURN(diffmap, ImageF::Create(memory_manager, xsize, ysize));
-  {
-    const HWY_FULL(double) dd;
-    const hwy::HWY_NAMESPACE::Rebind<float, decltype(dd)> dfh;
-    const size_t ND = Lanes(dd);
-    for (size_t y = 0; y < ysize; ++y) {
-      const float* row_dc = block_diff_dc.Row(y);
-      const float* row_ac = block_diff_ac.Row(y);
-      const float* row_mask = mask.Row(y);
-      float* row_out = diffmap.Row(y);
-      size_t x = 0;
-      // All-double form of the scalar expression below (dc*MaskDcY + ac*MaskY
-      // contracted via MulAdd on FMA targets, double sqrt, demote on store).
-      for (; x + ND <= xsize; x += ND) {
-        const auto val = PromoteTo(dd, LoadU(dfh, row_mask + x));
-        const auto t = Mul(PromoteTo(dd, LoadU(dfh, row_dc + x)),
-                           MaskDcYv(dd, val));
-        const auto s =
-            MulAdd(PromoteTo(dd, LoadU(dfh, row_ac + x)), MaskYv(dd, val), t);
-        StoreU(DemoteTo(dfh, Sqrt(s)), dfh, row_out + x);
-      }
-      for (; x < xsize; ++x) {
-        const float val = row_mask[x];
-        row_out[x] = sqrt(row_dc[x] * MaskDcY(val) + row_ac[x] * MaskY(val));
-      }
+  for (size_t y = 0; y < ysize; ++y) {
+    const float* row_dc = block_diff_dc.Row(y);
+    const float* row_ac = block_diff_ac.Row(y);
+    float* row_out = diffmap.Row(y);
+    for (size_t x = 0; x < xsize; ++x) {
+      const float val = mask.Row(y)[x];
+      row_out[x] = sqrt(row_dc[x] * MaskDcY(val) + row_ac[x] * MaskY(val));
     }
   }
   return true;
-}
-
-// Max over the diffmap, lane-parallel. Max is exact and order-independent for
-// the finite non-negative values a diffmap holds, so this is bit-identical to
-// the scalar reduction it replaces.
-float DiffmapMaxHwy(const ImageF& diffmap) {
-  const HWY_FULL(float) df;
-  const size_t NL = Lanes(df);
-  const size_t xsize = diffmap.xsize();
-  auto vmax = Zero(df);
-  float retval = 0.0f;
-  for (size_t y = 0; y < diffmap.ysize(); ++y) {
-    const float* BUTTERAUGLI_RESTRICT row = diffmap.ConstRow(y);
-    size_t x = 0;
-    for (; x + NL <= xsize; x += NL) {
-      vmax = Max(vmax, LoadU(df, row + x));
-    }
-    for (; x < xsize; ++x) {
-      retval = std::max(retval, row[x]);
-    }
-  }
-  retval = std::max(retval, GetLane(MaxOfLanes(df, vmax)));
-  return retval;
 }
 
 // NOLINTNEXTLINE(google-readability-namespace-comments)
@@ -2022,49 +1680,6 @@ HWY_EXPORT(MaltaDiffMap);              // Local function.
 HWY_EXPORT(MaltaDiffMapLF);            // Local function.
 HWY_EXPORT(OpsinDynamicsImage);        // Local function.
 HWY_EXPORT(ButteraugliDiffmapInPlace);  // Local function.
-HWY_EXPORT(ConvolutionWithTransposeHwy);  // Local function.
-HWY_EXPORT(DiffmapMaxHwy);                // Local function.
-
-Status ConvolutionWithTranspose(const ImageF& in,
-                                const std::vector<float>& kernel,
-                                BlurTemp* temp,
-                                ImageF* BUTTERAUGLI_RESTRICT out) {
-  return HWY_DYNAMIC_DISPATCH(ConvolutionWithTransposeHwy)(in, kernel, temp,
-                                                           out);
-}
-
-Status Blur(const ImageF& in, float sigma, const ButteraugliParams& params,
-            BlurTemp* temp, ImageF* out) {
-  const std::vector<float>* kernel = temp->FindKernel(sigma);
-  if (kernel == nullptr) {
-    kernel = temp->AddKernel(sigma, ComputeKernel(sigma));
-  }
-  // Separable5 does an in-place convolution, so this fast path is not safe if
-  // in aliases out.
-  if (kernel->size() == 5 && &in != out) {
-    float sum_weights = 0.0f;
-    for (const float w : *kernel) {
-      sum_weights += w;
-    }
-    const float scale = 1.0f / sum_weights;
-    const float w0 = (*kernel)[2] * scale;
-    const float w1 = (*kernel)[1] * scale;
-    const float w2 = (*kernel)[0] * scale;
-    const WeightsSeparable5 weights = {
-        {HWY_REP4(w0), HWY_REP4(w1), HWY_REP4(w2)},
-        {HWY_REP4(w0), HWY_REP4(w1), HWY_REP4(w2)},
-    };
-    JXL_RETURN_IF_ERROR(
-        Separable5(in, Rect(in), weights, /*pool=*/nullptr, out));
-    return true;
-  }
-
-  ImageF* temp_t;
-  JXL_RETURN_IF_ERROR(temp->GetTransposed(in, &temp_t));
-  JXL_RETURN_IF_ERROR(ConvolutionWithTranspose(in, *kernel, temp, temp_t));
-  JXL_RETURN_IF_ERROR(ConvolutionWithTranspose(*temp_t, *kernel, temp, out));
-  return true;
-}
 
 #if BUTTERAUGLI_ENABLE_CHECKS
 
@@ -2120,34 +1735,17 @@ static StatusOr<Image3F> SubSample2x(const Image3F& in) {
   size_t ys = (in.ysize() + 1) / 2;
   JxlMemoryManager* memory_manager = in.memory_manager();
   JXL_ASSIGN_OR_RETURN(Image3F retval, Image3F::Create(memory_manager, xs, ys));
-  // Gather form of the old zero-fill + scatter-accumulate: each output starts
-  // at 0 and receives its 0.25f-scaled contributions in the same scan order
-  // ((y0,x0),(y0,x1),(y1,x0),(y1,x1)), so every value is bit-identical while
-  // rows are visited once with hoisted row pointers.
-  const size_t x_pairs = in.xsize() / 2;
   for (size_t c = 0; c < 3; ++c) {
     for (size_t y = 0; y < ys; ++y) {
-      const float* BUTTERAUGLI_RESTRICT row0 = in.ConstPlaneRow(c, 2 * y);
-      const float* BUTTERAUGLI_RESTRICT row1 =
-          (2 * y + 1 < in.ysize()) ? in.ConstPlaneRow(c, 2 * y + 1) : nullptr;
-      float* BUTTERAUGLI_RESTRICT row_out = retval.PlaneRow(c, y);
-      for (size_t x = 0; x < x_pairs; ++x) {
-        float v = 0.0f;
-        v += 0.25f * row0[2 * x];
-        v += 0.25f * row0[2 * x + 1];
-        if (row1 != nullptr) {
-          v += 0.25f * row1[2 * x];
-          v += 0.25f * row1[2 * x + 1];
-        }
-        row_out[x] = v;
+      for (size_t x = 0; x < xs; ++x) {
+        retval.PlaneRow(c, y)[x] = 0;
       }
-      if (x_pairs < xs) {  // odd input width: single-column contribution
-        float v = 0.0f;
-        v += 0.25f * row0[2 * x_pairs];
-        if (row1 != nullptr) {
-          v += 0.25f * row1[2 * x_pairs];
-        }
-        row_out[x_pairs] = v;
+    }
+  }
+  for (size_t c = 0; c < 3; ++c) {
+    for (size_t y = 0; y < in.ysize(); ++y) {
+      for (size_t x = 0; x < in.xsize(); ++x) {
+        retval.PlaneRow(c, y / 2)[x / 2] += 0.25f * in.PlaneRow(c, y)[x];
       }
     }
     if ((in.xsize() & 1) != 0) {
@@ -2168,16 +1766,13 @@ static StatusOr<Image3F> SubSample2x(const Image3F& in) {
 
 // Supersample src by 2x and add it to dest.
 static void AddSupersampled2x(const ImageF& src, float w, ImageF& dest) {
-  // There will be less errors from the more averaged images.
-  // We take it into account to some extent using a scaler.
-  static const double kHeuristicMixingValue = 0.3;
-  const double mix = 1.0 - kHeuristicMixingValue * w;
   for (size_t y = 0; y < dest.ysize(); ++y) {
-    float* BUTTERAUGLI_RESTRICT row_out = dest.Row(y);
-    const float* BUTTERAUGLI_RESTRICT row_src = src.Row(y / 2);
     for (size_t x = 0; x < dest.xsize(); ++x) {
-      row_out[x] *= mix;
-      row_out[x] += w * row_src[x / 2];
+      // There will be less errors from the more averaged images.
+      // We take it into account to some extent using a scaler.
+      static const double kHeuristicMixingValue = 0.3;
+      dest.Row(y)[x] *= 1.0 - kHeuristicMixingValue * w;
+      dest.Row(y)[x] += w * src.Row(y / 2)[x / 2];
     }
   }
 }
@@ -2358,7 +1953,14 @@ Status ButteraugliComparator::DiffmapPsychoImage(const PsychoImage& pi1,
 
 double ButteraugliScoreFromDiffmap(const ImageF& diffmap,
                                    const ButteraugliParams* params) {
-  return HWY_DYNAMIC_DISPATCH(DiffmapMaxHwy)(diffmap);
+  float retval = 0.0f;
+  for (size_t y = 0; y < diffmap.ysize(); ++y) {
+    const float* BUTTERAUGLI_RESTRICT row = diffmap.ConstRow(y);
+    for (size_t x = 0; x < diffmap.xsize(); ++x) {
+      retval = std::max(retval, row[x]);
+    }
+  }
+  return retval;
 }
 
 Status ButteraugliDiffmap(const Image3F& rgb0, const Image3F& rgb1,
